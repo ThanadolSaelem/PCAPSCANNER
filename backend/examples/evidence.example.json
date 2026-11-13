@@ -1,0 +1,140 @@
+{
+  "schema_version": "1.0",
+  "capture_sha256": "641a9984b7141f2dae32c3f4b3565751f6f06ea1203f740011435007b9fd4f13",
+  "created_at": "2026-11-13T06:03:11.947358Z",
+  "coverage": {
+    "packets_seen": 3,
+    "packets_analyzed": 3,
+    "truncated": false,
+    "parser": "tshark-fields-offline",
+    "warnings": [
+      "Periodic TCP detector skipped: tcp.flags.syn was unavailable in the bounded field output; no connection-start coverage is claimed.",
+      "Full capture coverage is not claimed; only bounded TShark field output was analyzed."
+    ],
+    "stages": [
+      {
+        "name": "tshark",
+        "state": "completed",
+        "detail": "TShark fields were parsed incrementally; full-capture coverage is not claimed."
+      },
+      {
+        "name": "zeek",
+        "state": "skipped",
+        "detail": "Optional Zeek stage is disabled by settings."
+      },
+      {
+        "name": "yara",
+        "state": "skipped",
+        "detail": "YARA integration is unsupported in this offline parser."
+      },
+      {
+        "name": "osint",
+        "state": "skipped",
+        "detail": "OSINT integration is unsupported and no network lookup was performed."
+      }
+    ]
+  },
+  "evidence": [
+    {
+      "evidence_id": "EV-000001",
+      "kind": "flow",
+      "summary": "UDP flow 192.0.2.10 to 192.0.2.53",
+      "packet_refs": [
+        1
+      ],
+      "attributes": {
+        "src": "192.0.2.10",
+        "dst": "192.0.2.53",
+        "protocol": "UDP",
+        "packets": 1,
+        "bytes": 72,
+        "src_port": 53000,
+        "dst_port": 53,
+        "first_seen": 1700000001.001,
+        "last_seen": 1700000001.001
+      }
+    },
+    {
+      "evidence_id": "EV-000002",
+      "kind": "flow",
+      "summary": "UDP flow 192.0.2.10 to 192.0.2.53",
+      "packet_refs": [
+        2
+      ],
+      "attributes": {
+        "src": "192.0.2.10",
+        "dst": "192.0.2.53",
+        "protocol": "UDP",
+        "packets": 1,
+        "bytes": 80,
+        "src_port": 53001,
+        "dst_port": 53,
+        "first_seen": 1700000002.002,
+        "last_seen": 1700000002.002
+      }
+    },
+    {
+      "evidence_id": "EV-000003",
+      "kind": "flow",
+      "summary": "UDP flow 192.0.2.10 to 192.0.2.53",
+      "packet_refs": [
+        3
+      ],
+      "attributes": {
+        "src": "192.0.2.10",
+        "dst": "192.0.2.53",
+        "protocol": "UDP",
+        "packets": 1,
+        "bytes": 72,
+        "src_port": 53002,
+        "dst_port": 53,
+        "first_seen": 1700000003.003,
+        "last_seen": 1700000003.003
+      }
+    },
+    {
+      "evidence_id": "EV-000004",
+      "kind": "dns",
+      "summary": "DNS query example.test",
+      "packet_refs": [
+        1
+      ],
+      "attributes": {
+        "query": "example.test",
+        "src": "192.0.2.10",
+        "dst": "192.0.2.53",
+        "time_epoch": 1700000001.001
+      }
+    },
+    {
+      "evidence_id": "EV-000005",
+      "kind": "dns",
+      "summary": "DNS query missing.example.test",
+      "packet_refs": [
+        2
+      ],
+      "attributes": {
+        "query": "missing.example.test",
+        "rcode": 3,
+        "src": "192.0.2.10",
+        "dst": "192.0.2.53",
+        "time_epoch": 1700000002.002
+      }
+    },
+    {
+      "evidence_id": "EV-000006",
+      "kind": "dns",
+      "summary": "DNS query example.test",
+      "packet_refs": [
+        3
+      ],
+      "attributes": {
+        "query": "example.test",
+        "src": "192.0.2.10",
+        "dst": "192.0.2.53",
+        "time_epoch": 1700000003.003
+      }
+    }
+  ],
+  "findings": []
+}

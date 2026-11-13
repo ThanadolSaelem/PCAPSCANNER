@@ -1,0 +1,390 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+from pydantic import SecretStr, ValidationError
+
+from backend.app.config import AIConfig, AppSettings, load_settings
+from backend.app.llm import generate_summary, list_models
+from backend.app.models import (
+    AISummary,
+    Confidence,
+    Coverage,
+    Evidence,
+    EvidenceBundle,
+    Finding,
+    Stage,
+)
+
+
+ORIGIN = "http://127.0.0.1:11434"
+
+
+def bundle(*, confidence: Confidence = "high") -> EvidenceBundle:
+    return EvidenceBundle(
+        capture_sha256="a" * 64,
+        coverage=Coverage(
+            packets_seen=10,
+            packets_analyzed=10,
+            truncated=False,
+            parser="tshark",
+            warnings=["untrusted warning"],
+            stages=[Stage(name="parse", state="completed", detail="not sent")],
+        ),
+        evidence=[
+            Evidence(
+                evidence_id="EV-000001",
+                kind="flow",
+                summary="RAW PAYLOAD bearer totally-secret; this must never be sent",
+                packet_refs=[1, 2],
+                attributes={
+                    "src_ip": "10.1.2.3",
+                    "dst_ip": "8.8.8.8",
+                    "protocol": "TCP",
+                    "src_port": 1234,
+                    "dst_port": 443,
+                    "packet_count": 2,
+                    "filename": "capture-secret.pcap",
+                    "cookie": "session=secret",
+                },
+            ),
+            Evidence(
+                evidence_id="EV-000002",
+                kind="dns",
+                summary="free text should not leave process",
+                packet_refs=[3],
+                attributes={"domain": "secret.example", "query": "credentials"},
+            ),
+        ],
+        findings=[
+            Finding(
+                finding_id="F-0001",
+                detector="detector-one",
+                title="Suspicious flow",
+                severity="high",
+                confidence=confidence,
+                evidence_ids=["EV-000001"],
+                limitations=["Only deterministic parser fields were used"],
+            )
+        ],
+    )
+
+
+def settings(**kwargs) -> AppSettings:
+    values = {
+        "enabled": True,
+        "provider": "openai_compatible",
+        "base_url": ORIGIN,
+        "allowed_origins": [ORIGIN],
+        "data_boundary": "local",
+        "model": "test-model",
+        "timeout_seconds": 2,
+        "retries": 0,
+    }
+    values.update(kwargs)
+    config = AIConfig(**values)
+    return AppSettings(ai=config)
+
+
+def summary_payload(*, confidence: str = "low", evidence_id: str = "EV-000001") -> dict:
+    return {
+        "summary": "Evidence-only summary",
+        "assessments": [
+            {
+                "finding_id": "F-0001",
+                "interpretation": "The deterministic finding is retained.",
+                "confidence": confidence,
+                "evidence_ids": [evidence_id],
+            }
+        ],
+        "limitations": ["AI interpretation is not proof of compromise"],
+        "recommended_actions": [{"action": "Review the cited flow", "evidence_ids": [evidence_id]}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_disabled_never_calls_transport():
+    called = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(500)
+
+    disabled = AppSettings()
+    result = await generate_summary(bundle(), disabled, transport=httpx.MockTransport(handler))
+    assert result.state == "disabled"
+    assert result.report is None
+    assert called is False
+
+
+def test_settings_defaults_secret_and_nonsecret_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config_path = tmp_path / "ai.yaml"
+    config_path.write_text(
+        """
+ai:
+  enabled: false
+  provider: openai_compatible
+  api_key_env: PCAP_AI_API_KEY
+  timeout_seconds: 12
+storage_max_captures: 7
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PCAP_AI_CONFIG", str(config_path))
+    monkeypatch.setenv("PCAP_API_TOKEN", "top-secret")
+    loaded = load_settings()
+    assert loaded.storage_max_captures == 7
+    assert loaded.api_token == SecretStr("top-secret")
+    assert "top-secret" not in loaded.model_dump_json()
+    assert "api_key_env" in loaded.model_dump_json()
+
+    config_path.write_text("ai:\n  api_key: leaked\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="secret_config_value_forbidden"):
+        load_settings()
+
+
+def test_endpoint_and_origin_policy():
+    with pytest.raises(ValidationError):
+        AIConfig(
+            enabled=True,
+            provider="openai_compatible",
+            base_url="http://127.0.0.1:11434",
+            data_boundary="local",
+            model="m",
+        )
+    with pytest.raises(ValidationError):
+        AIConfig(
+            enabled=True,
+            provider="openai_compatible",
+            base_url="http://10.0.0.1:11434",
+            data_boundary="remote",
+            allowed_origins=["http://10.0.0.1:11434"],
+            model="m",
+        )
+    with pytest.raises(ValidationError):
+        AIConfig(
+            enabled=True,
+            provider="openai_compatible",
+            base_url="https://169.254.169.254/v1",
+            allowed_origins=["https://169.254.169.254"],
+            model="m",
+        )
+    with pytest.raises(ValidationError):
+        AIConfig(
+            enabled=True,
+            provider="openai_compatible",
+            base_url="https://api.example/v1?key=secret",
+            allowed_origins=["https://api.example"],
+            model="m",
+        )
+
+
+@pytest.mark.asyncio
+async def test_redaction_pseudonymization_and_no_raw_capture():
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(summary_payload())}, "finish_reason": "stop"}]})
+
+    result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    prompt = json.dumps(seen[0])
+    assert "RAW PAYLOAD" not in prompt
+    assert "bearer totally-secret" not in prompt
+    assert "capture-secret.pcap" not in prompt
+    assert "session=secret" not in prompt
+    assert "10.1.2.3" not in prompt
+    assert "secret.example" not in prompt
+    assert "id_" in prompt
+    assert "F-0001" in prompt and "EV-000001" in prompt
+
+
+@pytest.mark.asyncio
+async def test_budget_exceeded_has_no_transport_call():
+    called = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(500)
+
+    result = await generate_summary(
+        bundle(),
+        settings(input_max_bytes=100),
+        transport=httpx.MockTransport(handler),
+    )
+    assert result.state == "budget_exceeded"
+    assert result.error_code == "budget_exceeded"
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_fabricated_refs_and_excess_confidence_are_invalid():
+    async def fabricated(request: httpx.Request) -> httpx.Response:
+        payload = summary_payload(evidence_id="EV-999999")
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(fabricated))
+    assert result.state == "invalid_output"
+    assert result.error_code == "invalid_refs"
+
+    async def excessive(request: httpx.Request) -> httpx.Response:
+        payload = summary_payload(confidence="high")
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    result = await generate_summary(
+        bundle(confidence="low"), settings(), transport=httpx.MockTransport(excessive)
+    )
+    assert result.state == "invalid_output"
+    assert result.error_code == "confidence_exceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response, state, error",
+    [
+        ({"error": {"message": "do not expose"}}, "unavailable", "provider_error"),
+        ({"choices": [{"message": {"refusal": "no"}, "finish_reason": "stop"}]}, "refused", "refused"),
+        ({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}, "invalid_output", "output_length"),
+    ],
+)
+async def test_200_error_refusal_and_length(response, state, error):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response)
+
+    result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(handler))
+    assert result.state == state
+    assert result.error_code == error
+    assert result.report is None
+    assert "do not expose" not in json.dumps(result.model_dump())
+
+
+@pytest.mark.asyncio
+async def test_retry_only_429_and_native_chat_shape():
+    attempts = 0
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        requests.append(json.loads(request.content))
+        if attempts == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"}, json={"error": "rate"})
+        return httpx.Response(200, json={"usage": {"total_tokens": 3}, "choices": [{"message": {"content": json.dumps(summary_payload())}, "finish_reason": "stop"}]})
+
+    result = await generate_summary(bundle(), settings(retries=1, token_parameter="max_completion_tokens"), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    assert attempts == 2
+    assert requests[0]["max_completion_tokens"] == 2048
+    assert requests[0]["stream"] is False
+    assert "tools" not in requests[0]
+    assert requests[0]["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_anthropic_native_messages_shape_and_discovery():
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "claude-test", "display_name": "Test"}]})
+        return httpx.Response(200, json={"usage": {"input_tokens": 1}, "stop_reason": "end_turn", "content": [{"type": "text", "text": json.dumps(summary_payload())}]})
+
+    cfg = AIConfig(
+        enabled=True,
+        provider="anthropic",
+        base_url="https://api.anthropic.example",
+        allowed_origins=["https://api.anthropic.example"],
+        model="claude-test",
+        api_key_env="PCAP_AI_KEY_TEST",
+        timeout_seconds=2,
+    )
+    # The key is an environment value, never config-file data.
+    import os
+
+    old = os.environ.get("PCAP_AI_KEY_TEST")
+    os.environ["PCAP_AI_KEY_TEST"] = "test-key"
+    try:
+        app_settings = AppSettings(ai=cfg)
+        result = await generate_summary(bundle(), app_settings, transport=httpx.MockTransport(handler))
+        assert result.state == "completed"
+        discovered = await list_models(app_settings, transport=httpx.MockTransport(handler))
+    finally:
+        if old is None:
+            os.environ.pop("PCAP_AI_KEY_TEST", None)
+        else:
+            os.environ["PCAP_AI_KEY_TEST"] = old
+    assert discovered == [{"id": "claude-test", "display_name": "Test"}]
+    post = next(request for request in requests if request.method == "POST")
+    assert post.url.path == "/v1/messages"
+    assert post.headers["x-api-key"] == "test-key"
+    assert post.headers["anthropic-version"] == "2023-06-01"
+    body = json.loads(post.content)
+    assert body["max_tokens"] == 2048
+    assert "tools" not in body and "stream" not in body
+    assert body["output_config"]["format"]["type"] == "json_schema"
+    assert body["output_config"]["format"]["schema"]["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_fatal_200_error():
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(200, json={"error": {"message": "fatal"}})
+
+    result = await generate_summary(bundle(), settings(retries=2), transport=httpx.MockTransport(handler))
+    assert result.state == "unavailable"
+    assert result.error_code == "provider_error"
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_real_parser_attribute_names_and_v1_paths():
+    from backend.app.llm.providers import _safe_context
+    b = bundle()
+    b.evidence[0].attributes = {"src": "192.0.2.1", "dst": "192.0.2.2", "protocol": "TCP", "packets": 3, "bytes": 240, "dst_port": 443}
+    context = _safe_context(b, b"fixed-test-salt")
+    attrs = context["evidence"][0]["attributes"]
+    assert attrs["packets"] == 3 and attrs["bytes"] == 240
+    assert attrs["src"].startswith("id_") and "192.0.2.1" not in json.dumps(context)
+    assert context["coverage"]["warnings"] == ["untrusted warning"]
+    paths = []
+    async def handler(request):
+        paths.append(request.url.path)
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "test-model"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(summary_payload())}}]})
+    assert (await generate_summary(b, settings(), transport=httpx.MockTransport(handler))).state == "completed"
+    await list_models(settings(), transport=httpx.MockTransport(handler))
+    assert paths == ["/v1/chat/completions", "/v1/models"]
+
+
+@pytest.mark.asyncio
+async def test_total_deadline_cancels_slow_transport():
+    import asyncio
+    async def handler(request):
+        await asyncio.sleep(3)
+        return httpx.Response(200, json={})
+    result = await generate_summary(bundle(), settings(timeout_seconds=1), transport=httpx.MockTransport(handler))
+    assert result.state == "unavailable" and result.error_code == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_output_reserve_prevents_context_overflow():
+    called = False
+    async def handler(request):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+    result = await generate_summary(bundle(), settings(context_window_tokens=2048, max_output_tokens=2048), transport=httpx.MockTransport(handler))
+    assert result.state == "budget_exceeded" and not called

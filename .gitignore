@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.DS_Store
+previews/
+
+# Backend private state and local runtime files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv-backend/
+data/
+*.pcap
+*.pcapng
+*.sqlite3*
+.env.backend
+ai-config.local.yaml

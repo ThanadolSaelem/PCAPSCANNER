@@ -1,0 +1,19 @@
+# Non-secret profile. Set model from this endpoint's live /v1/models catalog.
+schema_version: '1.0'
+enabled: false
+provider: openai_compatible
+base_url: https://api.openai.com/v1
+allowed_origins: [https://api.openai.com]
+data_boundary: remote
+model: null
+api_key_env: PCAP_AI_API_KEY
+timeout_seconds: 60
+retries: 1
+input_max_bytes: 100000
+context_window_tokens: 32768
+max_output_tokens: 2048
+# Select per model: many GPT reasoning models use max_completion_tokens.
+# Compatible Gemini / local models may instead require max_tokens.
+token_parameter: max_completion_tokens
+response_mode: json_schema
+temperature: null

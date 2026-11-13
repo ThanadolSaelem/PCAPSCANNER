@@ -1,0 +1,165 @@
+{
+  "$defs": {
+    "ProviderName": {
+      "enum": [
+        "manus",
+        "openai_compatible",
+        "anthropic"
+      ],
+      "title": "ProviderName",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Non-secret AI provider configuration.",
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "enabled": {
+      "default": false,
+      "title": "Enabled",
+      "type": "boolean"
+    },
+    "provider": {
+      "$ref": "#/$defs/ProviderName",
+      "default": "openai_compatible"
+    },
+    "base_url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Base Url"
+    },
+    "allowed_origins": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 20,
+      "title": "Allowed Origins",
+      "type": "array"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "maxLength": 200,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model"
+    },
+    "api_key_env": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Api Key Env"
+    },
+    "data_boundary": {
+      "default": "remote",
+      "enum": [
+        "local",
+        "remote"
+      ],
+      "title": "Data Boundary",
+      "type": "string"
+    },
+    "timeout_seconds": {
+      "default": 30,
+      "maximum": 120,
+      "minimum": 1,
+      "title": "Timeout Seconds",
+      "type": "integer"
+    },
+    "retries": {
+      "default": 0,
+      "maximum": 2,
+      "minimum": 0,
+      "title": "Retries",
+      "type": "integer"
+    },
+    "input_max_bytes": {
+      "default": 100000,
+      "maximum": 100000,
+      "minimum": 1,
+      "title": "Input Max Bytes",
+      "type": "integer"
+    },
+    "max_output_tokens": {
+      "default": 2048,
+      "maximum": 8192,
+      "minimum": 1,
+      "title": "Max Output Tokens",
+      "type": "integer"
+    },
+    "context_window_tokens": {
+      "default": 16384,
+      "maximum": 2000000,
+      "minimum": 1,
+      "title": "Context Window Tokens",
+      "type": "integer"
+    },
+    "token_parameter": {
+      "default": "max_tokens",
+      "enum": [
+        "max_tokens",
+        "max_completion_tokens"
+      ],
+      "title": "Token Parameter",
+      "type": "string"
+    },
+    "response_mode": {
+      "default": "json_schema",
+      "enum": [
+        "json_schema",
+        "json_object",
+        "text"
+      ],
+      "title": "Response Mode",
+      "type": "string"
+    },
+    "temperature": {
+      "anyOf": [
+        {
+          "maximum": 2,
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Temperature"
+    },
+    "anthropic_version": {
+      "default": "2023-06-01",
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Anthropic Version",
+      "type": "string"
+    }
+  },
+  "title": "AIConfig",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

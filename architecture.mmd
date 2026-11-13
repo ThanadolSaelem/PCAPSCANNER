@@ -1,0 +1,37 @@
+%%{init: {"theme":"dark","themeVariables":{"background":"#111923","primaryColor":"#1b2a36","primaryTextColor":"#e4edf4","primaryBorderColor":"#45c1d0","lineColor":"#55c8d5","secondaryColor":"#202f3c","secondaryTextColor":"#dbe5eb","secondaryBorderColor":"#668091","tertiaryColor":"#26313a","edgeLabelBackground":"#18232f","fontFamily":"Inter, sans-serif"}}}%%
+flowchart TB
+    UI["Analyst Workbench<br/>Upload · Jobs · Findings · Packet / Flow Explorer"]
+    API["API Gateway<br/>Authentication · Validation · Cases · Job status"]
+    META[("Case metadata + audit log")]
+    CAPTURE[("Private capture / artifact storage")]
+    QUEUE["Bounded job queue<br/>Backpressure · explicit busy state"]
+    WORKER["Isolated per-job worker<br/>CPU · RAM · time · packet caps"]
+    PARSE["TShark + Zeek parsing<br/>Protocol logs · flow records"]
+    DETECT["Deterministic detectors<br/>DNS · TLS · beacon · flow · YARA"]
+    EVIDENCE[("Evidence store<br/>Packet refs · provenance · coverage")]
+    REDACT["Evidence minimizer + redactor<br/>No raw PCAP / payload by default"]
+    OSINT["Optional IOC enrichment<br/>Selected indicators · consent"]
+    LLM["Optional LLM endpoint<br/>Local / private default · remote opt-in"]
+    REPORT["Findings + report<br/>Confidence · evidence links · limitations"]
+
+    UI -->|Upload request| API
+    API -->|Validate type, size, quota; hash| CAPTURE
+    API -->|Create case and job| META
+    API -->|Queue job| QUEUE
+    QUEUE --> WORKER
+    WORKER -->|Read-only input · isolated output| CAPTURE
+    WORKER --> PARSE
+    PARSE --> DETECT
+    DETECT -->|Findings + detector provenance| EVIDENCE
+    DETECT -. IOC-only · optional .-> OSINT
+    OSINT -. Provider result / status .-> EVIDENCE
+    DETECT --> REDACT
+    REDACT -. Sanitized structured context .-> LLM
+    LLM -. Narrative cites existing evidence IDs .-> EVIDENCE
+    META --> REPORT
+    EVIDENCE --> REPORT
+    REPORT --> UI
+    API -->|Progress / terminal state| UI
+
+    classDef optional fill:#30291b,stroke:#d9b45b,color:#f1dfad,stroke-dasharray:5 4;
+    class OSINT,LLM optional;

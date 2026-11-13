@@ -1,0 +1,11 @@
+{
+  "routes": [
+    { "path": "/", "title": "Overview" },
+    { "path": "/analyze", "title": "Analyze capture" },
+    { "path": "/jobs", "title": "Analysis jobs" },
+    { "path": "/findings", "title": "Findings" },
+    { "path": "/traffic", "title": "Packet and flow explorer" },
+    { "path": "/reports", "title": "Reports" },
+    { "path": "/architecture", "title": "Architecture" }
+  ]
+}

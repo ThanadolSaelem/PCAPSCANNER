@@ -1,0 +1,20 @@
+# Non-secret PCAPSCANNER AI configuration.
+# Put a real API key only in the environment variable named by api_key_env.
+# For local HTTP, data_boundary and allowed_origins must be explicit.
+schema_version: "1.0"
+enabled: false
+provider: openai_compatible
+base_url: http://127.0.0.1:11434
+allowed_origins:
+  - http://127.0.0.1:11434
+model: null
+api_key_env: null
+data_boundary: local
+timeout_seconds: 30
+retries: 1
+input_max_bytes: 100000
+max_output_tokens: 2048
+context_window_tokens: 16384
+token_parameter: max_tokens
+response_mode: json_schema
+temperature: null

@@ -1,0 +1,77 @@
+name: pcapscanner-backend
+x-service: &service
+  build:
+    context: ..
+    dockerfile: infra/backend.Dockerfile
+  environment: &environment
+    PCAP_API_TOKEN: ${PCAP_API_TOKEN:?Set PCAP_API_TOKEN securely in the environment}
+    PCAP_DATA_DIR: /data
+    PCAP_AI_CONFIG: /config/ai.yaml
+    PCAP_PACKET_LIMIT: ${PCAP_PACKET_LIMIT:-20000}
+    PCAP_PARSER_TIMEOUT_SECONDS: ${PCAP_PARSER_TIMEOUT_SECONDS:-120}
+    PCAP_PARSER_MEMORY_MB: ${PCAP_PARSER_MEMORY_MB:-512}
+    PCAP_QUEUE_LIMIT: ${PCAP_QUEUE_LIMIT:-8}
+    PCAP_RETENTION_HOURS: ${PCAP_RETENTION_HOURS:-24}
+  volumes:
+    - evidence:/data
+    - ${PCAP_CONFIG_PATH:-../backend/examples/ai-config.example.yaml}:/config/ai.yaml:ro
+  read_only: true
+  tmpfs:
+    - /tmp:size=256m,mode=1777
+  user: '10001:10001'
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 128
+  mem_limit: 768m
+  cpus: 1.0
+  restart: unless-stopped
+services:
+  api:
+    <<: *service
+    environment:
+      <<: *environment
+      PCAP_AI_API_KEY: ${PCAP_AI_API_KEY:-}
+      MANUS_API_URL: ${MANUS_API_URL:-}
+      MANUS_API_KEY: ${MANUS_API_KEY:-}
+    volumes:
+      - evidence:/data
+      - raw-captures:/data/captures
+      - ${PCAP_CONFIG_PATH:-../backend/examples/ai-config.example.yaml}:/config/ai.yaml:ro
+    ports:
+      - '127.0.0.1:8000:8000'
+    networks: [gateway]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+  parser:
+    <<: *service
+    command: [python, -m, backend.app.worker]
+    volumes:
+      - evidence:/data
+      - raw-captures:/data/captures
+      - ${PCAP_CONFIG_PATH:-../backend/examples/ai-config.example.yaml}:/config/ai.yaml:ro
+    # Internal Docker network has no external route. No capture replay/probing.
+    networks: [offline]
+    environment:
+      <<: *environment
+      PCAP_API_TOKEN: ''
+  narrator:
+    <<: *service
+    command: [python, -m, backend.app.ai_worker]
+    networks: [gateway]
+    environment:
+      <<: *environment
+      PCAP_API_TOKEN: ''
+      PCAP_AI_API_KEY: ${PCAP_AI_API_KEY:-}
+      # Runtime credentials are optional and are never copied into image/config.
+      MANUS_API_URL: ${MANUS_API_URL:-}
+      MANUS_API_KEY: ${MANUS_API_KEY:-}
+volumes:
+  evidence: {}
+  raw-captures: {}
+networks:
+  offline:
+    internal: true
+  gateway: {}
