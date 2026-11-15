@@ -4,14 +4,27 @@
 
 มี backend code จริงแยกใน `backend/` แล้ว: FastAPI, durable queue, offline TShark และ optional AI adapters. ดู [คู่มือ Backend/AI](backend/README_TH.md) และ [ผลตรวจ](docs/backend-validation.md). หน้า Preview เดิมยังเป็น mockup ไม่ได้เชื่อม live upload หรือ AI endpoint โดยอัตโนมัติ
 
-## เปิดดูในเครื่อง
+## เปิดใช้งานแบบคลิกเดียวบน macOS / Linux Desktop (Live Workbench)
+
+1. ดับเบิลคลิก **`Start PCAPSCANNER.command`** ใน macOS Finder (หรือรัน `./start.sh` / `python -m backend.app.launcher` ใน Terminal)
+   - รอบแรกสคริปต์จะสร้าง `.venv-backend`, ติดตั้ง backend dependencies, build `dist/` ให้อัตโนมัติ, สร้าง Bearer token (`0600`) ใน `~/.pcapscanner/local_token.secret`, สตาร์ท FastAPI + `worker.py` + `ai_worker.py` (และ `Trainer-Pipeline` Tier-1 service ถ้าพบ), แล้วเปิดเว็บพร้อมเชื่อมต่อให้อัตโนมัติบน `http://127.0.0.1:8000`
+2. เลือก **`Data Directory`** หรือ **`Local Capture Folders / Files`** ด้วย **Popup ของ OS File Manager / Finder** ได้จากปุ่ม **`Workspace & Folders`** หรือแท็บ **`Local Server Path (Zero-Copy)`** ในหน้าเว็บทันที (ไม่ต้องพิมพ์ `export PCAP_DATA_DIR=...` หรือ `export PCAP_LOCAL_INGEST_ROOTS=...` เอง)
+3. สำหรับฝั่งเทรนโมเดล Tier-1 (`ET-BERT` + `OpenJev`): ดับเบิลคลิก **`Start Trainer Panel.command`** ใน repo `Trainer-Pipeline`
+
+## เปิดดูแบบ Developer Mode (แยก Dev Server)
 
 ```bash
 pnpm install
 pnpm dev
 ```
 
-เปิดเว็บที่ `http://localhost:3000` หรือเปิด Preview ของ Manus โดยตรง หน้าจอหลักมี Overview, Analyze, Jobs, Findings, Packet Explorer, Reports และ Architecture; ใน Packet Explorer สลับ Packets/Flows, ค้นหา/กรอง แล้วคลิก evidence เพื่อกลับไปยัง inspector ที่ตรงกันได้
+หรือเปิดโหมด dev แบบคำสั่งเดียว (API + Vite HMR):
+
+```bash
+python -m backend.app.launcher --dev
+```
+
+เปิดเว็บที่ `http://localhost:3000` หน้าจอหลักมี Overview, Analyze, Jobs, Findings, Packet Explorer, Reports และ Architecture; ใน Packet Explorer สลับ Packets/Flows, ค้นหา/กรอง แล้วคลิก evidence เพื่อกลับไปยัง inspector ที่ตรงกันได้
 
 ## Interactive architecture
 

@@ -58,6 +58,17 @@ _NUMERIC_KEYS = {
     "port", "count", "length", "bytes", "size", "duration", "latency", "delay",
     "elapsed", "timing", "timestamp", "packets", "retransmissions", "ttl", "status_code",
     "packet_count", "first_seen", "last_seen", "time_epoch", "rcode", "entropy",
+    "rev_packets", "rev_bytes", "io_byte_ratio", "pkt_rate",
+    "ttl_min", "ttl_max", "ttl_distinct_count", "ip_frag_count", "same_src_dst_count",
+    "dst_unique_srcs", "dst_inbound_pkts", "src_unique_dst_ports", "src_unique_dsts",
+    "tcp_flags_mask", "syn_count", "ack_count", "fin_count", "rst_count", "psh_count",
+    "urg_count", "null_flag_count", "xmas_flag_count", "retrans_count", "seq_jump_count",
+    "data_len_sum", "data_len_max", "icmp_type", "icmp_code", "icmp_data_len_sum",
+    "dns_qry_type", "http_uri_max_len", "http_uri_max_entropy",
+    "http_xss_hits", "http_crlf_hits", "http_sqli_hits", "http_shell_hits", "http_host_ip_hits",
+    "telnet_cmd_count", "wlan_deauth_count", "wlan_beacon_count", "wlan_auth_count", "wlan_bssid_count",
+    "arp_conflicts", "arp_replies", "arp_scan_targets", "tls_client_hello_count",
+    "etbert_score", "etbert_confidence", "etbert_entropy",
 }
 _NUMERIC_KEY_RE = re.compile(
     r"^(?:src|dst|source|destination|client|server)?(?:_|$)"
@@ -182,13 +193,37 @@ def _safe_context(bundle: EvidenceBundle, salt: bytes) -> dict[str, Any]:
         }
         for finding in bundle.findings
     ]
-    return {
+    payload: dict[str, Any] = {
         "schema_version": bundle.schema_version,
         "capture_sha256": bundle.capture_sha256,
         "coverage": _safe_coverage(bundle),
         "evidence": evidence,
         "findings": findings,
     }
+    triage = getattr(bundle, "triage", None)
+    if triage is not None:
+        payload["triage_summary"] = {
+            "model": _redact_text(str(triage.model)),
+            "mode": _redact_text(str(triage.mode)),
+            "total_evaluated": triage.total_evaluated,
+            "benign_filtered": triage.benign_filtered,
+            "escalated_count": triage.escalated_count,
+            "uncertain_count": triage.uncertain_count,
+            "reduction_ratio": triage.reduction_ratio,
+            "mean_confidence": triage.mean_confidence,
+            "mean_ppl": triage.mean_ppl,
+            "etbert_scored_count": getattr(triage, "etbert_scored_count", 0),
+            "top_classes": [
+                {
+                    "label": _redact_text(str(item.label)),
+                    "count": item.count,
+                    "avg_confidence": item.avg_confidence,
+                    "escalated": item.escalated,
+                }
+                for item in triage.top_classes
+            ],
+        }
+    return payload
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -549,6 +584,7 @@ def _result(
     warning: str | None = None,
     error_code: str | None = None,
     report: AISummary | None = None,
+    context_reduction: dict[str, int | float] | None = None,
 ) -> AIResult:
     warnings = [warning] if warning else []
     return AIResult(
@@ -562,6 +598,7 @@ def _result(
         report=report,
         warnings=warnings,
         error_code=error_code,
+        context_reduction=context_reduction,
     )
 
 
@@ -580,12 +617,74 @@ async def generate_summary(
         return _result(settings, state="disabled")
     model = config.model
     prompt_sha256: str | None = None
+
+    input_budget = max(0, config.context_window_tokens - config.max_output_tokens - 512)
+    effective_max = min(config.input_max_bytes, input_budget)
+    target_bundle = bundle
+    context_reduction: dict[str, int | float] | None = None
+    triage_cfg = getattr(settings, "triage", None)
+    compact_enabled = bool(getattr(triage_cfg, "compact_for_ai", True))
+
     try:
-        prompt, prompt_sha256, _ = _build_prompt(bundle, config)
+        # Proactively prune high-confidence benign noise on large evidence bundles
+        # when Tier-1 triage is active so the downstream Big LLM stays well within context.
+        bundle_triage = getattr(bundle, "triage", None)
+        if (
+            compact_enabled
+            and effective_max >= 3800
+            and bundle_triage is not None
+            and bundle_triage.benign_filtered > 0
+            and len(bundle.evidence) > 25
+        ):
+            from ..triage import pack_evidence_for_ai
+
+            target_bundle, context_reduction = pack_evidence_for_ai(
+                bundle,
+                max_bytes=effective_max,
+                triage_cfg=triage_cfg,
+            )
+
+        try:
+            prompt, prompt_sha256, _ = _build_prompt(target_bundle, config)
+        except _RequestFailure as initial_failure:
+            if (
+                initial_failure.code == "budget_exceeded"
+                and compact_enabled
+                and effective_max >= 3800
+                and (len(bundle.evidence) > 1 or len(bundle.findings) > 1)
+            ):
+                from ..triage import pack_evidence_for_ai
+
+                retry_budget = max(3400, int(effective_max * 0.65)) if context_reduction is not None else effective_max
+                target_bundle, context_reduction = pack_evidence_for_ai(
+                    bundle,
+                    max_bytes=retry_budget,
+                    triage_cfg=triage_cfg,
+                )
+                prompt, prompt_sha256, _ = _build_prompt(target_bundle, config)
+            else:
+                raise
+
+        if context_reduction is None and getattr(bundle, "triage", None) is not None:
+            context_reduction = {
+                "raw_evidence_count": len(bundle.evidence),
+                "sent_evidence_count": len(target_bundle.evidence),
+                "raw_findings_count": len(bundle.findings),
+                "sent_findings_count": len(target_bundle.findings),
+                "benign_filtered_count": bundle.triage.benign_filtered,  # type: ignore[union-attr]
+                "reduction_pct": round(bundle.triage.reduction_ratio * 100.0, 2),  # type: ignore[union-attr]
+            }
     except _RequestFailure as failure:
         state = "budget_exceeded" if failure.code == "budget_exceeded" else "unavailable"
-        return _result(settings, state=state, model=model, prompt_sha256=prompt_sha256, error_code=failure.code,
-                       warning="AI processing did not produce a report; deterministic findings retained")
+        return _result(
+            settings,
+            state=state,
+            model=model,
+            prompt_sha256=prompt_sha256,
+            error_code=failure.code,
+            context_reduction=context_reduction,
+            warning="AI processing did not produce a report; deterministic findings retained",
+        )
     try:
         runtime = _runtime(settings)
         body = _request_body(runtime, config, prompt)
@@ -593,24 +692,69 @@ async def generate_summary(
             response, usage = await _post_json(runtime, config, body, transport=transport)
         text, refusal, incomplete = _extract_text(response, runtime.route)
         if refusal:
-            return _result(settings, state="refused", model=model, prompt_sha256=prompt_sha256, usage=usage,
-                           error_code="refused", warning="Provider refused the requested summary; deterministic findings retained")
+            return _result(
+                settings,
+                state="refused",
+                model=model,
+                prompt_sha256=prompt_sha256,
+                usage=usage,
+                error_code="refused",
+                context_reduction=context_reduction,
+                warning="Provider refused the requested summary; deterministic findings retained",
+            )
         if incomplete:
-            return _result(settings, state="invalid_output", model=model, prompt_sha256=prompt_sha256, usage=usage,
-                           error_code="output_length", warning="Provider output was incomplete; deterministic findings retained")
+            return _result(
+                settings,
+                state="invalid_output",
+                model=model,
+                prompt_sha256=prompt_sha256,
+                usage=usage,
+                error_code="output_length",
+                context_reduction=context_reduction,
+                warning="Provider output was incomplete; deterministic findings retained",
+            )
         report = _redact_summary(_parse_summary(text))
-        _validate_grounding(report, bundle)
-        return _result(settings, state="completed", model=model, prompt_sha256=prompt_sha256, usage=usage, report=report)
+        _validate_grounding(report, target_bundle)
+        return _result(
+            settings,
+            state="completed",
+            model=model,
+            prompt_sha256=prompt_sha256,
+            usage=usage,
+            report=report,
+            context_reduction=context_reduction,
+        )
     except _RequestFailure as failure:
         state = "invalid_output" if failure.code in {"invalid_output", "malformed_output", "invalid_refs", "confidence_exceeded", "missing_finding"} else "unavailable"
-        return _result(settings, state=state, model=model, prompt_sha256=prompt_sha256, error_code=failure.code,
-                       warning="AI processing did not produce a report; deterministic findings retained")
+        return _result(
+            settings,
+            state=state,
+            model=model,
+            prompt_sha256=prompt_sha256,
+            error_code=failure.code,
+            context_reduction=context_reduction,
+            warning="AI processing did not produce a report; deterministic findings retained",
+        )
     except TimeoutError:
-        return _result(settings, state="unavailable", model=model, prompt_sha256=prompt_sha256,
-                       error_code="timeout", warning="AI total deadline exceeded; deterministic findings retained")
+        return _result(
+            settings,
+            state="unavailable",
+            model=model,
+            prompt_sha256=prompt_sha256,
+            error_code="timeout",
+            context_reduction=context_reduction,
+            warning="AI total deadline exceeded; deterministic findings retained",
+        )
     except (httpx.HTTPError, ValidationError, ValueError, TypeError):
-        return _result(settings, state="unavailable", model=model, prompt_sha256=prompt_sha256,
-                       error_code="internal_error", warning="AI processing did not produce a report; deterministic findings retained")
+        return _result(
+            settings,
+            state="unavailable",
+            model=model,
+            prompt_sha256=prompt_sha256,
+            error_code="internal_error",
+            context_reduction=context_reduction,
+            warning="AI processing did not produce a report; deterministic findings retained",
+        )
 
 
 async def _get_json(

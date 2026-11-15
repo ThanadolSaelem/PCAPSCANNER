@@ -211,3 +211,136 @@ def test_capture_hash_is_supplied_not_recomputed(tmp_path, monkeypatch) -> None:
     assert bundle.capture_sha256 == supplied
     # The implementation must not hash or upload the capture as part of parsing.
     assert hashlib.sha256(capture.read_bytes()).hexdigest() != supplied
+
+
+def test_extended_l2_l7_telemetry_sanitized_http_wlan_and_limits(monkeypatch) -> None:
+    def ext_row(frame: int, overrides: dict[int, str]) -> bytes:
+        cols = [""] * len(pipeline.EXTENDED_FIELD_NAMES)
+        cols[0] = str(frame)
+        cols[1] = f"1700000000.{frame:03d}"
+        cols[2] = "180"
+        for idx, val in overrides.items():
+            cols[idx] = val
+        return "\t".join(cols).encode()
+
+    acc = pipeline._Accumulator(packet_limit=500, flow_limit=100, streaming_eviction=True)
+    # 1. HTTP injection attempt with IP literal Host -> raw URI/Host MUST NEVER be stored
+    acc.add_line(
+        ext_row(
+            1,
+            {
+                3: "192.0.2.50",
+                4: "198.51.100.80",
+                7: "51000",
+                8: "80",
+                11: "6",
+                23: "GET",
+                24: "64",
+                27: "0x018",
+                30: "96",
+                34: "200",
+                35: "/search?q=<script>alert(1)</script>",
+                36: "198.51.100.80",
+            },
+        )
+    )
+    # Reverse TCP flow for bidirectional io_byte_ratio
+    acc.add_line(
+        ext_row(
+            2,
+            {
+                2: "540",
+                3: "198.51.100.80",
+                4: "192.0.2.50",
+                7: "80",
+                8: "51000",
+                11: "6",
+                24: "128",
+                27: "0x010",
+                30: "480",
+            },
+        )
+    )
+    # 2. Same src==dst Land / Null / Xmas TCP probes + retransmission + fragmentation
+    acc.add_line(
+        ext_row(
+            3,
+            {
+                3: "192.0.2.77",
+                4: "192.0.2.77",
+                7: "1234",
+                8: "22",
+                11: "6",
+                24: "32",
+                25: "1",
+                27: "0x000",
+                28: "1",
+            },
+        )
+    )
+    # 3. 802.11 WLAN deauth frame
+    acc.add_line(
+        ext_row(
+            4,
+            {
+                2: "64",
+                38: "0x0c",
+                39: "aa:bb:cc:dd:ee:01",
+                40: "11:22:33:44:55:66",
+                41: "ff:ff:ff:ff:ff:ff",
+            },
+        )
+    )
+    # 4. ARP Who-Has sweep across 6 targets
+    for i in range(6):
+        acc.add_line(
+            ext_row(
+                10 + i,
+                {
+                    2: "60",
+                    16: "10:20:30:40:50:60",
+                    17: "ff:ff:ff:ff:ff:ff",
+                    18: "1",
+                    19: "192.0.2.99",
+                    20: "10:20:30:40:50:60",
+                    42: f"192.0.2.{10 + i}",
+                },
+            )
+        )
+
+    bundle = pipeline._build_bundle(
+        acc,
+        capture_sha256=HASH,
+        parser_state="completed",
+        parser_detail="extended metadata test",
+        zeek_stage=pipeline._stage("zeek", "skipped", "disabled"),
+    )
+
+    serialized = bundle.model_dump_json()
+    assert "<script>" not in serialized
+    assert "http_path" not in serialized
+
+    http_evs = [e for e in bundle.evidence if e.kind == "http"]
+    assert len(http_evs) == 1
+    assert http_evs[0].attributes["http_xss_hits"] == 1
+    assert http_evs[0].attributes["http_host_ip_hits"] == 1
+    assert http_evs[0].attributes["http_uri_max_len"] > 10
+    assert http_evs[0].attributes["rev_packets"] == 1
+    assert http_evs[0].attributes["rev_bytes"] == 540
+    assert 0.2 <= float(http_evs[0].attributes["io_byte_ratio"]) <= 0.3
+
+    wlan_evs = [e for e in bundle.evidence if e.kind == "wlan"]
+    assert len(wlan_evs) == 1
+    assert wlan_evs[0].attributes["wlan_deauth_count"] == 1
+    assert wlan_evs[0].attributes["wlan_bssid_count"] == 1
+
+    arp_evs = [e for e in bundle.evidence if e.kind == "arp" and e.attributes.get("arp_scan_targets") == 6]
+    assert len(arp_evs) == 1
+
+    for ev in bundle.evidence:
+        assert len(ev.attributes) <= 40
+
+    monkeypatch.setattr(pipeline.sys, "platform", "darwin")
+    hook = pipeline._child_limits(512, 10.0)
+    hook()
+

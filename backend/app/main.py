@@ -4,19 +4,132 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
+import sqlite3
 import uuid
-from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
+
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import ValidationError
-from .config import AppSettings, load_settings
-from .models import AnalysisRequest, EvidenceBundle, AIResult, ProblemDetails
-from .store import Store, StoreError
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
-PCAP_MAGIC = {b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a"}
+from .config import AppSettings, load_settings
+from .models import (
+    AIResult,
+    AnalysisRequest,
+    ChunkUploadInitRequest,
+    EvidenceBundle,
+    LocalCaptureRequest,
+    NativePickRequest,
+    ProblemDetails,
+    WorkspaceUpdateRequest,
+)
+from .picker import (
+    PickerError,
+    detect_picker_backend,
+    is_loopback_client,
+    is_native_picker_enabled,
+    pick_native_path,
+    resolve_workspace_config_path,
+    truthy_env,
+    update_workspace_config,
+)
+from .store import ACTIVE, Store, StoreError
+from .system import build_capabilities_payload, probe_capabilities, recommended_chunk_size_bytes
+from .triage import bundle_to_triage_jsonl
+
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("image/svg+xml", ".svg")
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+PCAP_MAGIC = {
+    b"\xd4\xc3\xb2\xa1",
+    b"\xa1\xb2\xc3\xd4",
+    b"\x4d\x3c\xb2\xa1",
+    b"\xa1\xb2\x3c\x4d",
+    b"\x0a\x0d\x0d\x0a",
+}
+ALLOWED_CAPTURE_CONTENT_TYPES = {
+    "application/vnd.tcpdump.pcap",
+    "application/x-pcap",
+    "application/x-pcapng",
+    "application/octet-stream",
+    "text/csv",
+    "application/csv",
+    "text/tab-separated-values",
+}
+LOCAL_CAPTURE_EXTENSIONS = {".pcap", ".pcapng", ".cap", ".csv", ".tsv"}
+MAX_SINGLE_CHUNK_BYTES = 64 * 1024 * 1024
+HASH_STREAM_BLOCK_BYTES = 4 * 1024 * 1024
+
+
+def _looks_like_csv_header(prefix: bytes) -> bool:
+    sample = prefix[:512].lstrip(b"\xef\xbb\xbf")
+    if not sample or b"\x00" in sample:
+        return False
+    text = sample.decode("utf-8", errors="ignore").lower()
+    first_line = text.splitlines()[0] if text else ""
+    has_time = "time" in first_line
+    has_src = ("source" in first_line) or ("src" in first_line)
+    has_dst = ("destination" in first_line) or ("dst" in first_line)
+    return has_time and has_src and has_dst
+
+
+def _detect_capture_format(prefix: bytes) -> str | None:
+    if len(prefix) >= 4 and bytes(prefix[:4]) in PCAP_MAGIC:
+        return "pcapng" if bytes(prefix[:4]) == b"\x0a\x0d\x0d\x0a" else "pcap"
+    if _looks_like_csv_header(prefix):
+        first = prefix[:512].decode("utf-8", errors="ignore").splitlines()[0]
+        return "tsv" if first.count("\t") >= first.count(",") else "csv"
+    return None
+
+
+def _hash_and_peek_file(path: Path) -> tuple[str, int, bytes]:
+    digest = hashlib.sha256()
+    total = 0
+    prefix = bytearray()
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(HASH_STREAM_BLOCK_BYTES)
+            if not block:
+                break
+            if len(prefix) < 512:
+                prefix.extend(block[: 512 - len(prefix)])
+            digest.update(block)
+            total += len(block)
+    return digest.hexdigest(), total, bytes(prefix)
+
+
+def _allowed_roots(cfg: AppSettings) -> list[Path]:
+    roots: list[Path] = []
+    for raw in getattr(cfg, "local_ingest_roots", []) or []:
+        if not raw or "\x00" in raw:
+            continue
+        resolved = Path(raw).expanduser().resolve()
+        if resolved.is_dir():
+            roots.append(resolved)
+    return roots
+
+
+def _resolve_local_file(raw_path: str, roots: list[Path]) -> Path:
+    if not roots:
+        raise HTTPException(403, "local_ingest_disabled")
+    if not raw_path or "\x00" in raw_path:
+        raise HTTPException(400, "invalid_local_path")
+    target = Path(raw_path).expanduser().resolve()
+    if not any(target.is_relative_to(root) for root in roots):
+        raise HTTPException(403, "local_path_not_allowlisted")
+    if not target.is_file():
+        raise HTTPException(404, "local_file_not_found")
+    if target.suffix.lower() not in LOCAL_CAPTURE_EXTENSIONS:
+        raise HTTPException(415, "unsupported_capture_extension")
+    return target
 
 
 def profile_hash(settings: AppSettings) -> str:
@@ -24,13 +137,23 @@ def profile_hash(settings: AppSettings) -> str:
 
 
 def problem(status: int, code: str, request_id: str | None = None, headers=None):
-    return JSONResponse(status_code=status, media_type="application/problem+json", headers=headers,
-        content={"type": "urn:pcapscanner:problem:" + code, "title": code.replace("_", " "),
-                 "status": status, "code": code, "request_id": request_id or uuid.uuid4().hex})
+    return JSONResponse(
+        status_code=status,
+        media_type="application/problem+json",
+        headers=headers,
+        content={
+            "type": "urn:pcapscanner:problem:" + code,
+            "title": code.replace("_", " "),
+            "status": status,
+            "code": code,
+            "request_id": request_id or uuid.uuid4().hex,
+        },
+    )
 
 
 class BoundaryMiddleware:
     """Authenticate before reading bodies; bound JSON even without Content-Length."""
+
     def __init__(self, app, settings: AppSettings):
         self.app, self.settings = app, settings
 
@@ -51,7 +174,11 @@ class BoundaryMiddleware:
                 authorized = False
             if not authorized:
                 return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
-        if scope["method"] in ("POST", "PUT", "PATCH") and scope["path"] != "/api/v1/captures":
+
+        is_binary_upload = scope["path"] == "/api/v1/captures" or (
+            scope["path"].startswith("/api/v1/captures/uploads/") and scope["path"].endswith("/chunk")
+        )
+        if scope["method"] in ("POST", "PUT", "PATCH") and not is_binary_upload:
             data = bytearray()
             while True:
                 msg = await receive()
@@ -64,36 +191,146 @@ class BoundaryMiddleware:
                     break
             consumed = False
             original_receive = receive
+
             async def final_receive():
                 nonlocal consumed
                 if not consumed:
                     consumed = True
                     return {"type": "http.request", "body": bytes(data), "more_body": False}
                 return await original_receive()
+
             receive = final_receive
+
         async def secured_send(message):
             if message["type"] == "http.response.start":
                 message["headers"] = list(message.get("headers", [])) + [
-                    (b"x-request-id", rid.encode()), (b"cache-control", b"no-store"),
-                    (b"x-content-type-options", b"nosniff")]
+                    (b"x-request-id", rid.encode()),
+                    (b"cache-control", b"no-store"),
+                    (b"x-content-type-options", b"nosniff"),
+                ]
             await send(message)
+
         await self.app(scope, receive, secured_send)
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
-    cfg = settings or load_settings()
-    store = Store(cfg.data_dir, queue_limit=cfg.queue_limit, storage_max_bytes=cfg.storage_max_bytes,
-                  storage_max_captures=cfg.storage_max_captures)
-    app = FastAPI(title="PCAPSCANNER Backend", version="1.0.0",
-        description="Single-tenant evidence-first offline capture API. Bearer token required for /api/v1/*. AI is optional and advisory.")
+    initial_cfg = settings or load_settings()
+    initial_store = Store(
+        initial_cfg.data_dir,
+        queue_limit=initial_cfg.queue_limit,
+        storage_max_bytes=initial_cfg.storage_max_bytes,
+        storage_max_captures=initial_cfg.storage_max_captures,
+        disk_reserve_bytes=getattr(initial_cfg, "disk_reserve_bytes", 256 * 1024 * 1024),
+    )
+    app = FastAPI(
+        title="PCAPSCANNER Backend",
+        version="1.1.0",
+        description="Single-tenant evidence-first offline capture API. Bearer token required for /api/v1/*. AI is optional and advisory.",
+    )
     app.openapi_version = "3.1.0"
-    app.state.settings, app.state.store = cfg, store
-    app.add_middleware(BoundaryMiddleware, settings=cfg)
+    app.state.settings, app.state.store = initial_cfg, initial_store
+    app.add_middleware(BoundaryMiddleware, settings=initial_cfg)
+
+    def _cfg() -> AppSettings:
+        return app.state.settings
+
+    def _store() -> Store:
+        return app.state.store
+
+    def _workspace_state() -> dict[str, object]:
+        cfg_now = _cfg()
+        ws_path = resolve_workspace_config_path()
+        picker_backend = detect_picker_backend() if is_native_picker_enabled() else None
+        return {
+            "data_dir": str(Path(cfg_now.data_dir).expanduser().resolve()),
+            "local_ingest_roots": [str(r) for r in _allowed_roots(cfg_now)],
+            "resource_mode": str(getattr(cfg_now, "resource_mode", "auto")),
+            "native_picker_available": bool(picker_backend is not None),
+            "picker_backend": picker_backend,
+            "persisted": bool(ws_path is not None),
+            "workspace_config_path": str(ws_path) if ws_path else None,
+        }
+
+    def _normalize_existing_roots(raw_roots: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_roots:
+            if not raw or "\x00" in raw:
+                raise HTTPException(400, "invalid_local_path")
+            resolved = Path(raw).expanduser().resolve()
+            if not resolved.is_dir():
+                raise HTTPException(400, "local_root_not_found")
+            key = str(resolved)
+            if key not in seen:
+                seen.add(key)
+                normalized.append(key)
+            if len(normalized) > 20:
+                raise HTTPException(400, "too_many_local_roots")
+        return normalized
+
+    def _apply_workspace_mutation(
+        *,
+        new_data_dir: str | None = None,
+        new_roots: list[str] | None = None,
+        new_resource_mode: str | None = None,
+    ) -> dict[str, object]:
+        cfg_now = _cfg()
+        store_now = _store()
+        update_fields: dict[str, object] = {}
+        next_store = store_now
+
+        if new_data_dir is not None:
+            if not new_data_dir or "\x00" in new_data_dir:
+                raise HTTPException(400, "invalid_data_dir")
+            target_dir = Path(new_data_dir).expanduser().resolve()
+            if target_dir.exists() and not target_dir.is_dir():
+                raise HTTPException(400, "invalid_data_dir")
+            if target_dir != store_now.root:
+                active_jobs = [j for j in store_now.jobs(50) if j.get("state") in ACTIVE]
+                if active_jobs:
+                    raise HTTPException(409, "active_jobs_in_progress")
+                try:
+                    next_store = Store(
+                        target_dir,
+                        queue_limit=cfg_now.queue_limit,
+                        storage_max_bytes=cfg_now.storage_max_bytes,
+                        storage_max_captures=cfg_now.storage_max_captures,
+                        disk_reserve_bytes=getattr(cfg_now, "disk_reserve_bytes", 256 * 1024 * 1024),
+                    )
+                except (OSError, sqlite3.Error) as exc:
+                    raise HTTPException(400, "invalid_data_dir") from exc
+            update_fields["data_dir"] = target_dir
+
+        if new_roots is not None:
+            update_fields["local_ingest_roots"] = _normalize_existing_roots(new_roots)
+
+        if new_resource_mode is not None:
+            update_fields["resource_mode"] = new_resource_mode
+
+        if update_fields:
+            updated_cfg = cfg_now.model_copy(update=update_fields)
+            app.state.settings = updated_cfg
+            app.state.store = next_store
+            ws_path = resolve_workspace_config_path()
+            if ws_path is not None:
+                update_workspace_config(
+                    path=ws_path,
+                    data_dir=str(updated_cfg.data_dir),
+                    local_ingest_roots=list(updated_cfg.local_ingest_roots),
+                    resource_mode=str(updated_cfg.resource_mode),
+                    prefer_workspace=True,
+                )
+
+        return _workspace_state()
 
     @app.exception_handler(StoreError)
     async def store_error(request, exc):
-        return problem(exc.status, exc.code, request.state.request_id,
-                       {"Retry-After": "5"} if exc.status == 429 else None)
+        return problem(
+            exc.status,
+            exc.code,
+            request.state.request_id,
+            {"Retry-After": "5"} if exc.status == 429 else None,
+        )
 
     @app.exception_handler(HTTPException)
     async def http_error(request, exc):
@@ -106,121 +343,465 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     @app.get("/health", tags=["Health"])
     def health():
-        return {"status": "ok", "api_version": "1.0", "authentication_configured": bool(cfg.api_token)}
+        return {"status": "ok", "api_version": "1.1", "authentication_configured": bool(_cfg().api_token)}
 
-    @app.post("/api/v1/captures", status_code=201, tags=["Captures"], openapi_extra={"requestBody": {
-        "required": True, "content": {"application/vnd.tcpdump.pcap": {"schema": {"type": "string", "format": "binary"}}}}})
+    @app.get("/api/v1/system/capabilities", tags=["System"])
+    def capabilities():
+        return build_capabilities_payload(_cfg())
+
+    @app.get("/api/v1/system/workspace", tags=["System"])
+    def get_workspace():
+        return _workspace_state()
+
+    @app.put("/api/v1/system/workspace", tags=["System"])
+    def update_workspace(body: WorkspaceUpdateRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "workspace_mutation_loopback_only")
+
+        cfg_now = _cfg()
+        next_roots: list[str] | None = None
+        if body.local_ingest_roots is not None:
+            next_roots = list(body.local_ingest_roots)
+        elif body.add_local_ingest_root is not None or body.remove_local_ingest_root is not None:
+            current_roots = list(cfg_now.local_ingest_roots or [])
+            if body.add_local_ingest_root is not None:
+                current_roots.append(body.add_local_ingest_root)
+            if body.remove_local_ingest_root is not None:
+                rm_resolved = str(Path(body.remove_local_ingest_root).expanduser().resolve())
+                current_roots = [
+                    r for r in current_roots if str(Path(r).expanduser().resolve()) != rm_resolved
+                ]
+            next_roots = current_roots
+
+        return _apply_workspace_mutation(
+            new_data_dir=body.data_dir,
+            new_roots=next_roots,
+            new_resource_mode=body.resource_mode,
+        )
+
+    @app.post("/api/v1/system/pick-path", tags=["System"])
+    async def pick_path_native(body: NativePickRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host):
+            raise HTTPException(403, "picker_loopback_only")
+
+        cfg_now = _cfg()
+        existing_roots = _allowed_roots(cfg_now)
+        if body.purpose == "data_dir":
+            init_dir = Path(cfg_now.data_dir).expanduser()
+            if not init_dir.is_dir():
+                init_dir = Path.home()
+        else:
+            init_dir = existing_roots[0] if existing_roots else (Path.home() / "Downloads")
+            if not init_dir.is_dir():
+                init_dir = Path.home()
+
+        try:
+            picked = await run_in_threadpool(pick_native_path, body.purpose, initial_dir=init_dir)
+        except PickerError as exc:
+            raise HTTPException(exc.status, exc.code) from exc
+
+        if picked is None:
+            return {
+                "cancelled": True,
+                "purpose": body.purpose,
+                "selected_path": None,
+                "workspace": _workspace_state(),
+            }
+
+        if body.purpose == "data_dir":
+            ws_state = _apply_workspace_mutation(new_data_dir=str(picked))
+            return {
+                "cancelled": False,
+                "purpose": "data_dir",
+                "selected_path": str(picked),
+                "workspace": ws_state,
+            }
+
+        if body.purpose == "capture_root":
+            merged_roots = list(cfg_now.local_ingest_roots or []) + [str(picked)]
+            ws_state = _apply_workspace_mutation(new_roots=merged_roots)
+            return {
+                "cancelled": False,
+                "purpose": "capture_root",
+                "selected_path": str(picked),
+                "workspace": ws_state,
+            }
+
+        # capture_file: validate capture extension & auto-allow its parent directory for zero-copy ingest
+        if not picked.is_file():
+            raise HTTPException(404, "local_file_not_found")
+        if picked.suffix.lower() not in LOCAL_CAPTURE_EXTENSIONS:
+            raise HTTPException(415, "unsupported_capture_extension")
+        merged_roots = list(cfg_now.local_ingest_roots or []) + [str(picked.parent)]
+        ws_state = _apply_workspace_mutation(new_roots=merged_roots)
+        return {
+            "cancelled": False,
+            "purpose": "capture_file",
+            "selected_path": str(picked),
+            "filename": picked.name,
+            "size_bytes": picked.stat().st_size,
+            "workspace": ws_state,
+        }
+
+    @app.post(
+        "/api/v1/captures",
+        status_code=201,
+        tags=["Captures"],
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {"application/vnd.tcpdump.pcap": {"schema": {"type": "string", "format": "binary"}}},
+            }
+        },
+    )
     async def upload(request: Request):
-        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip()
-        if content_type not in ("application/vnd.tcpdump.pcap", "application/x-pcap", "application/x-pcapng", "application/octet-stream"):
+        cfg_now, store_now = _cfg(), _store()
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type not in ALLOWED_CAPTURE_CONTENT_TYPES:
             raise HTTPException(415, "unsupported_capture_content_type")
         length = request.headers.get("content-length")
+        declared_size: int | None = None
+        upload_limit = cfg_now.upload_max_bytes
         if length:
             try:
-                size = int(length)
-                if size < 0:
+                declared_size = int(length)
+                if declared_size < 0:
                     raise ValueError()
             except ValueError:
                 raise HTTPException(400, "invalid_content_length")
-            if size > cfg.upload_max_bytes:
+            if upload_limit > 0 and declared_size > upload_limit:
                 raise HTTPException(413, "capture_too_large")
-        cid = store.reserve_capture(cfg.upload_max_bytes)
-        path, digest, total, prefix = store.capture_path(cid), hashlib.sha256(), 0, bytearray()
+
+        raw_name = request.headers.get("x-capture-filename", "").strip()
+        clean_name = Path(raw_name).name[:255] if raw_name else None
+        reserve_bytes = declared_size if declared_size is not None else (upload_limit if upload_limit > 0 else 0)
+        cid = store_now.reserve_capture(reserve_bytes, filename=clean_name)
+        path, digest, total, prefix = store_now.capture_path(cid, "pcap"), hashlib.sha256(), 0, bytearray()
         try:
             with open(path, "xb") as f:
                 os.chmod(path, 0o600)
                 async for chunk in request.stream():
                     total += len(chunk)
-                    if total > cfg.upload_max_bytes:
+                    if upload_limit > 0 and total > upload_limit:
                         raise HTTPException(413, "capture_too_large")
-                    if len(prefix) < 28:
-                        prefix.extend(chunk[:28 - len(prefix)])
-                    if len(prefix) >= 4 and bytes(prefix[:4]) not in PCAP_MAGIC:
-                        raise HTTPException(400, "invalid_capture_magic")
+                    if len(prefix) < 512:
+                        prefix.extend(chunk[: 512 - len(prefix)])
+                    if len(prefix) >= 4:
+                        head4 = bytes(prefix[:4])
+                        if head4 not in PCAP_MAGIC and not _looks_like_csv_header(bytes(prefix)):
+                            if b"\n" in prefix or len(prefix) >= 256:
+                                raise HTTPException(400, "invalid_capture_magic")
                     digest.update(chunk)
                     f.write(chunk)
-            minimum = 28 if bytes(prefix[:4]) == b"\x0a\x0d\x0d\x0a" else 24
-            if total < minimum or bytes(prefix[:4]) not in PCAP_MAGIC:
+            fmt = _detect_capture_format(bytes(prefix))
+            if fmt is None:
                 raise HTTPException(400, "invalid_capture_header")
-            store.finish_capture(cid, total, digest.hexdigest())
+            if fmt in ("pcap", "pcapng"):
+                minimum = 28 if fmt == "pcapng" else 24
+                if total < minimum:
+                    raise HTTPException(400, "invalid_capture_header")
+            else:
+                if total < 12:
+                    raise HTTPException(400, "invalid_capture_header")
+                csv_dest = store_now.capture_path(cid, "csv")
+                os.replace(path, csv_dest)
+                os.chmod(csv_dest, 0o600)
+            store_now.finish_capture(cid, total, digest.hexdigest(), fmt=fmt)
         except BaseException:
-            store.abort_capture(cid)
+            store_now.abort_capture(cid)
             raise
-        return {"capture_id": cid, "sha256": digest.hexdigest(), "size_bytes": total,
-                "validation": "header_only_full_validation_in_worker"}
+        return {
+            "capture_id": cid,
+            "sha256": digest.hexdigest(),
+            "size_bytes": total,
+            "format": fmt,
+            "filename": clean_name,
+            "validation": "header_only_full_validation_in_worker",
+        }
+
+    @app.post("/api/v1/captures/uploads", status_code=201, tags=["Captures"])
+    def init_chunked_upload(body: ChunkUploadInitRequest):
+        cfg_now, store_now = _cfg(), _store()
+        if cfg_now.upload_max_bytes > 0 and body.total_bytes > cfg_now.upload_max_bytes:
+            raise HTTPException(413, "capture_too_large")
+        caps = probe_capabilities(cfg_now.data_dir)
+        chunk_size = recommended_chunk_size_bytes(caps)
+        ext = Path(body.filename).suffix.lower().lstrip(".")
+        fmt = ext if ext in ("pcap", "pcapng", "cap", "csv", "tsv") else (
+            body.format_hint if body.format_hint != "auto" else "pcap"
+        )
+        cid = store_now.init_chunk_upload(body.filename, body.total_bytes, fmt=fmt)
+        return {
+            "upload_id": cid,
+            "capture_id": cid,
+            "chunk_size_bytes": chunk_size,
+            "offset": 0,
+            "unlimited": cfg_now.upload_max_bytes == 0,
+        }
+
+    @app.get("/api/v1/captures/uploads/{upload_id}", tags=["Captures"])
+    def upload_status(upload_id: str):
+        row = _store().pending_upload(upload_id)
+        return {
+            "upload_id": upload_id,
+            "capture_id": upload_id,
+            "offset": row["bytes_received"],
+            "expected_bytes": row["expected_bytes"],
+            "filename": row["filename"],
+        }
+
+    @app.put("/api/v1/captures/uploads/{upload_id}/chunk", tags=["Captures"])
+    async def put_upload_chunk(upload_id: str, request: Request, offset: Annotated[int, Query(ge=0)] = 0):
+        cfg_now, store_now = _cfg(), _store()
+        pending = store_now.pending_upload(upload_id)
+        buf = bytearray()
+        async for part in request.stream():
+            buf.extend(part)
+            if len(buf) > MAX_SINGLE_CHUNK_BYTES:
+                raise HTTPException(413, "chunk_too_large")
+        if not buf:
+            raise HTTPException(400, "empty_chunk")
+        if cfg_now.upload_max_bytes > 0 and offset + len(buf) > cfg_now.upload_max_bytes:
+            raise HTTPException(413, "capture_too_large")
+        if offset == 0 and len(buf) >= 4:
+            head4 = bytes(buf[:4])
+            if head4 not in PCAP_MAGIC and not _looks_like_csv_header(bytes(buf[:512])):
+                if b"\n" in buf[:512] or len(buf) >= 256:
+                    raise HTTPException(400, "invalid_capture_magic")
+        received = await run_in_threadpool(store_now.append_upload_chunk, upload_id, offset, bytes(buf))
+        return {
+            "upload_id": upload_id,
+            "offset": received,
+            "received_bytes": received,
+            "expected_bytes": pending["expected_bytes"],
+        }
+
+    @app.post("/api/v1/captures/uploads/{upload_id}/complete", tags=["Captures"])
+    async def finish_chunked_upload(upload_id: str):
+        store_now = _store()
+        store_now.pending_upload(upload_id)
+        part = store_now.upload_part_path(upload_id)
+        if not part.is_file():
+            raise HTTPException(404, "upload_not_found")
+        sha256, total, prefix = await run_in_threadpool(_hash_and_peek_file, part)
+        fmt = _detect_capture_format(prefix)
+        if fmt is None:
+            store_now.abort_capture(upload_id)
+            raise HTTPException(400, "invalid_capture_header")
+        minimum = 28 if fmt == "pcapng" else (24 if fmt == "pcap" else 12)
+        if total < minimum:
+            store_now.abort_capture(upload_id)
+            raise HTTPException(400, "invalid_capture_header")
+        row = store_now.complete_chunk_upload(upload_id, total, sha256, fmt)
+        return {
+            "capture_id": row["id"],
+            "sha256": sha256,
+            "size_bytes": total,
+            "format": fmt,
+            "filename": row["filename"],
+            "validation": "header_only_full_validation_in_worker",
+        }
+
+    @app.delete("/api/v1/captures/uploads/{upload_id}", status_code=204, tags=["Captures"])
+    def abort_chunked_upload(upload_id: str):
+        _store().abort_capture(upload_id)
+        return JSONResponse(status_code=204, content=None)
+
+    @app.get("/api/v1/captures/local/browse", tags=["Captures"])
+    def browse_local_captures():
+        roots = _allowed_roots(_cfg())
+        files: list[dict[str, object]] = []
+        if roots:
+            for root in roots:
+                try:
+                    entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
+                except OSError:
+                    continue
+                for entry in entries:
+                    if len(files) >= 200:
+                        break
+                    if entry.is_file() and entry.suffix.lower() in LOCAL_CAPTURE_EXTENSIONS:
+                        try:
+                            st = entry.stat()
+                        except OSError:
+                            continue
+                        files.append(
+                            {
+                                "name": entry.name,
+                                "path": str(entry),
+                                "size_bytes": st.st_size,
+                                "format": entry.suffix.lower().lstrip("."),
+                                "modified_at": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+                            }
+                        )
+        return {
+            "enabled": len(roots) > 0,
+            "roots": [str(r) for r in roots],
+            "files": files,
+        }
+
+    @app.post("/api/v1/captures/local", status_code=201, tags=["Captures"])
+    async def register_local_capture(body: LocalCaptureRequest):
+        roots = _allowed_roots(_cfg())
+        target = _resolve_local_file(body.path, roots)
+        sha256, total, prefix = await run_in_threadpool(_hash_and_peek_file, target)
+        fmt = _detect_capture_format(prefix)
+        if fmt is None:
+            raise HTTPException(400, "invalid_capture_header")
+        minimum = 28 if fmt == "pcapng" else (24 if fmt == "pcap" else 12)
+        if total < minimum:
+            raise HTTPException(400, "invalid_capture_header")
+        row = _store().register_local_capture(target, target.name, fmt, total, sha256)
+        return {
+            "capture_id": row["id"],
+            "sha256": sha256,
+            "size_bytes": total,
+            "format": fmt,
+            "filename": row["filename"],
+            "source_kind": "local",
+            "validation": "zero_copy_local_reference",
+        }
 
     @app.post("/api/v1/analyses", status_code=202, tags=["Analyses"])
     def analyze(body: AnalysisRequest, idempotency_key: Annotated[str | None, Header(max_length=128)] = None):
-        if body.ai_enabled and not cfg.ai.enabled:
+        cfg_now = _cfg()
+        if body.ai_enabled and not cfg_now.ai.enabled:
             raise HTTPException(409, "ai_disabled_by_operator")
-        if body.ai_enabled and not cfg.ai.model:
+        if body.ai_enabled and not cfg_now.ai.model:
             raise HTTPException(409, "ai_model_not_configured")
-        return store.create_job(body, profile_hash(cfg), idempotency_key)
+        return _store().create_job(body, profile_hash(cfg_now), idempotency_key)
 
     @app.get("/api/v1/analyses", tags=["Analyses"])
     def list_jobs(limit: Annotated[int, Query(ge=1, le=100)] = 50):
-        return {"items": store.jobs(limit)}
+        return {"items": _store().jobs(limit)}
 
     @app.get("/api/v1/analyses/{analysis_id}", tags=["Analyses"])
     def job(analysis_id: str):
-        return store.job(analysis_id)
+        return _store().job(analysis_id)
 
     @app.post("/api/v1/analyses/{analysis_id}/cancel", tags=["Analyses"])
     def cancel(analysis_id: str):
-        return store.cancel(analysis_id)
+        return _store().cancel(analysis_id)
 
     @app.get("/api/v1/analyses/{analysis_id}/evidence", tags=["Evidence"], response_model=EvidenceBundle)
     def evidence(analysis_id: str):
-        row = store.job(analysis_id, internal=True)
+        row = _store().job(analysis_id, internal=True)
         if not row["evidence"]:
             raise HTTPException(409, "evidence_not_ready")
         return EvidenceBundle.model_validate_json(row["evidence"])
 
-    @app.get("/api/v1/analyses/{analysis_id}/report", tags=["Reports"])
-    def report(analysis_id: str):
-        row = store.job(analysis_id, internal=True)
+    @app.get("/api/v1/analyses/{analysis_id}/triage.jsonl", tags=["Evidence"])
+    def triage_jsonl(analysis_id: str):
+        row = _store().job(analysis_id, internal=True)
         if not row["evidence"]:
             raise HTTPException(409, "evidence_not_ready")
         bundle = EvidenceBundle.model_validate_json(row["evidence"])
-        return {"analysis_id": analysis_id, "status": row["state"], "evidence": bundle.model_dump(mode="json"),
-                "ai": json.loads(row["ai_result"]) if row["ai_result"] else {"state": "pending"},
-                "disclaimer": "Detector findings are candidates. AI is advisory; missing findings do not certify safety."}
+        payload = bundle_to_triage_jsonl(bundle, _cfg().triage)
+        return PlainTextResponse(
+            content=payload,
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="triage-{analysis_id[:8]}.jsonl"'},
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/report", tags=["Reports"])
+    def report(analysis_id: str):
+        store_now = _store()
+        row = store_now.job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        meta = store_now.job(analysis_id)
+        return {
+            "analysis_id": analysis_id,
+            "status": row["state"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "resource_mode": meta.get("resource_mode", "auto"),
+            "capture_filename": meta.get("capture_filename"),
+            "capture_size_bytes": meta.get("capture_size_bytes"),
+            "capture_format": meta.get("capture_format"),
+            "evidence": bundle.model_dump(mode="json"),
+            "ai": json.loads(row["ai_result"]) if row["ai_result"] else {"state": "pending"},
+            "disclaimer": "Detector findings are candidates. AI is advisory; missing findings do not certify safety.",
+        }
 
     @app.get("/api/v1/ai/config", tags=["AI"])
     def ai_config():
         # AIConfig stores only secret ENV references, never values.
-        return {"configuration": cfg.ai.model_dump(mode="json"), "policy_hash": profile_hash(cfg),
-                "editable": "server_config_file_and_environment_only"}
+        cfg_now = _cfg()
+        return {
+            "configuration": cfg_now.ai.model_dump(mode="json"),
+            "triage": cfg_now.triage.model_dump(mode="json"),
+            "policy_hash": profile_hash(cfg_now),
+            "editable": "server_config_file_and_environment_only",
+        }
 
     @app.get("/api/v1/ai/config/schema", tags=["AI"])
     def ai_schema():
-        result = cfg.ai.__class__.model_json_schema()
+        result = _cfg().ai.__class__.model_json_schema()
         result["$schema"] = "https://json-schema.org/draft/2020-12/schema"
         return result
 
     @app.get("/api/v1/ai/models", tags=["AI"])
     async def ai_models():
         from .llm import list_models
+
+        cfg_now = _cfg()
         try:
-            items = await list_models(cfg)
-            return {"state": "disabled" if not cfg.ai.enabled else ("completed" if items else "unavailable_or_empty"),
-                    "items": items, "warning": None if items else "No catalog returned; this does not prove the provider has no models"}
+            items = await list_models(cfg_now)
+            return {
+                "state": "disabled" if not cfg_now.ai.enabled else ("completed" if items else "unavailable_or_empty"),
+                "items": items,
+                "warning": None if items else "No catalog returned; this does not prove the provider has no models",
+            }
         except Exception:
             raise HTTPException(502, "ai_model_discovery_unavailable")
 
+    ui_dist_dir = (REPO_ROOT / "dist").resolve()
+    ui_index_file = ui_dist_dir / "index.html"
+    if truthy_env(os.environ.get("PCAP_SERVE_UI")) and ui_index_file.is_file():
+
+        @app.get("/", include_in_schema=False)
+        def serve_ui_root():
+            return FileResponse(ui_index_file)
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def serve_ui_spa(full_path: str):
+            clean = full_path.lstrip("/")
+            if clean == "api" or clean.startswith("api/"):
+                raise HTTPException(404, "not_found")
+            if clean:
+                candidate = (ui_dist_dir / clean).resolve()
+                if not candidate.is_relative_to(ui_dist_dir):
+                    raise HTTPException(404, "not_found")
+                if candidate.is_file():
+                    return FileResponse(candidate)
+                if clean.startswith("assets/"):
+                    raise HTTPException(404, "asset_not_found")
+            return FileResponse(ui_index_file)
+
     original_openapi = app.openapi
+
     def secured_openapi():
         schema = original_openapi()
-        schema.setdefault("components", {}).setdefault("securitySchemes", {})["OperatorBearer"] = {"type": "http", "scheme": "bearer"}
+        schema.setdefault("components", {}).setdefault("securitySchemes", {})["OperatorBearer"] = {
+            "type": "http",
+            "scheme": "bearer",
+        }
         schema["components"].setdefault("schemas", {})["ProblemDetails"] = ProblemDetails.model_json_schema()
         for path, methods in schema["paths"].items():
             if path.startswith("/api/"):
                 for method, operation in methods.items():
                     if method in ("get", "post", "put", "delete", "patch"):
                         operation["security"] = [{"OperatorBearer": []}]
-                        for status in (400, 401, 404, 409, 413, 415, 422, 429, 502, 503, 507):
-                            operation["responses"][str(status)] = {"description": "Stable Problem Details error code; no sensitive input echo",
-                                "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/ProblemDetails"}}}}
+                        for status in (400, 401, 403, 404, 409, 413, 415, 422, 429, 502, 503, 507):
+                            operation["responses"][str(status)] = {
+                                "description": "Stable Problem Details error code; no sensitive input echo",
+                                "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/ProblemDetails"}}},
+                            }
         return schema
+
     app.openapi = secured_openapi
     return app
