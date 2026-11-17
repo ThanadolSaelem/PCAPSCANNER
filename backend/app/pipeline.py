@@ -85,7 +85,6 @@ EXTENDED_FIELD_NAMES: tuple[str, ...] = FIELD_NAMES + (
     "tcp.analysis.retransmission",
     "tcp.seq",
     "data.len",
-    "icmp.data_len",
     "icmp.code",
     "dns.qry.type",
     "http.response.code",
@@ -926,21 +925,20 @@ def _parse_packet(parts: Sequence[str]) -> _Packet | None:
     tcp_retrans = bool(_parse_bool(parts[28])) if len(parts) > 28 else False
     tcp_seq = _parse_int(parts[29], minimum=0, maximum=4_294_967_295) if len(parts) > 29 else None
     data_len = _parse_int(parts[30], minimum=0, maximum=1_000_000_000) if len(parts) > 30 else None
-    icmp_data_len = _parse_int(parts[31], minimum=0, maximum=1_000_000_000) if len(parts) > 31 else None
-    icmp_code = _parse_int(parts[32], minimum=0, maximum=255) if len(parts) > 32 else None
-    dns_qry_type = _parse_int(parts[33], minimum=0, maximum=65535) if len(parts) > 33 else None
-    http_resp_code = _parse_int(parts[34], minimum=100, maximum=599) if len(parts) > 34 else None
+    icmp_code = _parse_int(parts[31], minimum=0, maximum=255) if len(parts) > 31 else None
+    dns_qry_type = _parse_int(parts[32], minimum=0, maximum=65535) if len(parts) > 32 else None
+    http_resp_code = _parse_int(parts[33], minimum=100, maximum=599) if len(parts) > 33 else None
 
-    uri_raw = parts[35] if len(parts) > 35 else ""
-    host_raw = parts[36] if len(parts) > 36 else ""
+    uri_raw = parts[34] if len(parts) > 34 else ""
+    host_raw = parts[35] if len(parts) > 35 else ""
     uri_len, uri_ent, xss_m, crlf_m, sqli_m, shell_m, host_is_ip = _sanitize_http_markers(uri_raw, host_raw)
 
-    telnet_cmd_seen = bool(len(parts) > 37 and parts[37].strip())
-    wlan_subtype = _parse_hex_or_int(parts[38], minimum=0, maximum=255) if len(parts) > 38 else None
-    wlan_bssid = _safe_text(parts[39].strip().lower(), max_length=64) if len(parts) > 39 and parts[39].strip() else None
-    wlan_sa = _safe_text(parts[40].strip().lower(), max_length=64) if len(parts) > 40 and parts[40].strip() else None
-    wlan_da = _safe_text(parts[41].strip().lower(), max_length=64) if len(parts) > 41 and parts[41].strip() else None
-    arp_dst_ip = _parse_ip(parts[42]) if len(parts) > 42 else None
+    telnet_cmd_seen = bool(len(parts) > 36 and parts[36].strip())
+    wlan_subtype = _parse_hex_or_int(parts[37], minimum=0, maximum=255) if len(parts) > 37 else None
+    wlan_bssid = _safe_text(parts[38].strip().lower(), max_length=64) if len(parts) > 38 and parts[38].strip() else None
+    wlan_sa = _safe_text(parts[39].strip().lower(), max_length=64) if len(parts) > 39 and parts[39].strip() else None
+    wlan_da = _safe_text(parts[40].strip().lower(), max_length=64) if len(parts) > 40 and parts[40].strip() else None
+    arp_dst_ip = _parse_ip(parts[41]) if len(parts) > 41 else None
 
     if proto is None:
         if icmp_type is not None:
@@ -953,6 +951,10 @@ def _parse_packet(parts: Sequence[str]) -> _Packet | None:
             proto = "WLAN"
             src = src or wlan_sa or eth_src or wlan_bssid
             dst = dst or wlan_da or wlan_bssid or eth_dst or "Broadcast"
+
+    # TShark has no portable icmp.data_len field. For ICMPv4, use the
+    # supported generic data.len field when the ICMP dissector exposes it.
+    icmp_data_len = data_len if proto == 1 else None
 
     return _Packet(
         frame=frame,

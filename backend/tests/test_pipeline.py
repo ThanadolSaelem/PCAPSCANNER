@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import textwrap
 import time
 from types import SimpleNamespace
@@ -219,6 +220,43 @@ def test_capture_hash_is_supplied_not_recomputed(tmp_path, monkeypatch) -> None:
     assert hashlib.sha256(capture.read_bytes()).hexdigest() != supplied
 
 
+def test_auto_tshark_extended_allowlist_runs_with_installed_cli(tmp_path) -> None:
+    tshark = shutil.which("tshark")
+    if tshark is None:
+        pytest.skip("TShark is not installed in this environment")
+    assert "icmp.data_len" not in pipeline.EXTENDED_FIELD_NAMES
+    capture = write_synthetic_pcap(tmp_path / "auto-fields.pcap")
+    limits = pipeline._get_limits(
+        settings(resource_mode="auto", packet_limit=20, data_dir=str(tmp_path))
+    )
+    command = pipeline._build_streaming_command(tshark, capture, limits)
+    result = subprocess.run(command, capture_output=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+
+
+def test_extended_icmp_mapping_uses_supported_data_len_field() -> None:
+    parts = [""] * len(pipeline.EXTENDED_FIELD_NAMES)
+    parts[0] = "1"
+    parts[1] = "1700000000.001"
+    parts[2] = "84"
+    parts[11] = "1"
+    parts[21] = "8"
+    parts[30] = "16"
+    parts[31] = "0"
+    parts[32] = "1"
+    parts[33] = "200"
+
+    packet = pipeline._parse_packet(parts)
+
+    assert packet is not None
+    assert packet.proto == 1
+    assert packet.icmp_type == 8
+    assert packet.icmp_data_len == 16
+    assert packet.icmp_code == 0
+    assert packet.dns_qry_type == 1
+    assert packet.http_response_code == 200
+
+
 def test_extended_l2_l7_telemetry_sanitized_http_wlan_and_limits(monkeypatch) -> None:
     def ext_row(frame: int, overrides: dict[int, str]) -> bytes:
         cols = [""] * len(pipeline.EXTENDED_FIELD_NAMES)
@@ -244,9 +282,9 @@ def test_extended_l2_l7_telemetry_sanitized_http_wlan_and_limits(monkeypatch) ->
                 24: "64",
                 27: "0x018",
                 30: "96",
-                34: "200",
-                35: "/search?q=<script>alert(1)</script>",
-                36: "198.51.100.80",
+                33: "200",
+                34: "/search?q=<script>alert(1)</script>",
+                35: "198.51.100.80",
             },
         )
     )
@@ -290,10 +328,10 @@ def test_extended_l2_l7_telemetry_sanitized_http_wlan_and_limits(monkeypatch) ->
             4,
             {
                 2: "64",
-                38: "0x0c",
-                39: "aa:bb:cc:dd:ee:01",
-                40: "11:22:33:44:55:66",
-                41: "ff:ff:ff:ff:ff:ff",
+                37: "0x0c",
+                38: "aa:bb:cc:dd:ee:01",
+                39: "11:22:33:44:55:66",
+                40: "ff:ff:ff:ff:ff:ff",
             },
         )
     )
@@ -309,7 +347,7 @@ def test_extended_l2_l7_telemetry_sanitized_http_wlan_and_limits(monkeypatch) ->
                     18: "1",
                     19: "192.0.2.99",
                     20: "10:20:30:40:50:60",
-                    42: f"192.0.2.{10 + i}",
+                    41: f"192.0.2.{10 + i}",
                 },
             )
         )
