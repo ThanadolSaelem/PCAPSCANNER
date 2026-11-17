@@ -275,3 +275,111 @@ class ProblemDetails(Contract):
     status: int = Field(ge=400, le=599)
     code: str
     request_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+# Cases contain bounded analyst metadata only; capture bytes and packet payloads are never stored here.
+CaseStatus = Literal["open", "in_progress", "resolved", "closed"]
+CaseSeverity = Literal["info", "low", "medium", "high", "critical"]
+CaseTag = Annotated[str, Field(min_length=1, max_length=64)]
+
+
+class CaseCreateRequest(Contract):
+    title: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=4000)
+    status: CaseStatus = "open"
+    severity: CaseSeverity = "info"
+    tags: list[CaseTag] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def normalize_case_fields(self):
+        self.title = self.title.strip()
+        if not self.title:
+            raise ValueError("title must not be blank")
+        self.description = self.description.strip()
+        normalized = [tag.strip() for tag in self.tags]
+        if any(not tag for tag in normalized):
+            raise ValueError("tags must not be blank")
+        if len({tag.casefold() for tag in normalized}) != len(normalized):
+            raise ValueError("tags must be unique")
+        self.tags = normalized
+        return self
+
+
+class CasePatchRequest(Contract):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    description: str | None = Field(default=None, max_length=4000)
+    status: CaseStatus | None = None
+    severity: CaseSeverity | None = None
+    tags: list[CaseTag] | None = Field(default=None, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_case_patch(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one field is required")
+        if any(getattr(self, name) is None for name in self.model_fields_set):
+            raise ValueError("case fields cannot be null")
+        if self.title is not None:
+            self.title = self.title.strip()
+            if not self.title:
+                raise ValueError("title must not be blank")
+        if self.description is not None:
+            self.description = self.description.strip()
+        if self.tags is not None:
+            normalized = [tag.strip() for tag in self.tags]
+            if any(not tag for tag in normalized):
+                raise ValueError("tags must not be blank")
+            if len({tag.casefold() for tag in normalized}) != len(normalized):
+                raise ValueError("tags must be unique")
+            self.tags = normalized
+        return self
+
+
+class CaseAnalysisLinkRequest(Contract):
+    analysis_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class CaseNoteCreateRequest(Contract):
+    note: str = Field(min_length=1, max_length=4000)
+
+    @model_validator(mode="after")
+    def normalize_note(self):
+        self.note = self.note.strip()
+        if not self.note:
+            raise ValueError("note must not be blank")
+        return self
+
+
+class CaseSummary(Contract):
+    id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    title: str = Field(max_length=160)
+    description: str = Field(max_length=4000)
+    status: CaseStatus
+    severity: CaseSeverity
+    tags: list[CaseTag] = Field(max_length=20)
+    created_at: str = Field(max_length=40)
+    updated_at: str = Field(max_length=40)
+    analysis_count: int = Field(ge=0, le=100)
+    note_count: int = Field(ge=0, le=100)
+
+
+class CaseAnalysis(Contract):
+    analysis_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    capture_filename: str | None = Field(default=None, max_length=255)
+    state: str = Field(max_length=32)
+    linked_at: str = Field(max_length=40)
+
+
+class CaseNote(Contract):
+    id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    note: str = Field(max_length=4000)
+    created_at: str = Field(max_length=40)
+
+
+class CaseDetail(CaseSummary):
+    analyses: list[CaseAnalysis] = Field(max_length=100)
+    notes: list[CaseNote] = Field(max_length=100)
+
+
+class CaseListResponse(Contract):
+    items: list[CaseSummary] = Field(max_length=100)
+    total: int = Field(ge=0)

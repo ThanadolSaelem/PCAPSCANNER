@@ -358,6 +358,58 @@ export interface JobSummary {
   triage_summary?: Tier1Summary | null;
 }
 
+export type InvestigationSeverity = "info" | "low" | "medium" | "high" | "critical";
+export type InvestigationStatus = "open" | "in_progress" | "resolved" | "closed";
+
+export interface CaseAnalysisLink {
+  analysis_id: string;
+  capture_filename: string | null;
+  state: JobSummary["state"];
+  linked_at: string;
+}
+
+export interface CaseNote {
+  id: string;
+  note: string;
+  created_at: string;
+}
+
+export interface InvestigationCase {
+  id: string;
+  title: string;
+  description: string;
+  status: InvestigationStatus;
+  severity: InvestigationSeverity;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+  analysis_count: number;
+  note_count: number;
+  analyses?: CaseAnalysisLink[];
+  notes?: CaseNote[];
+}
+
+export interface CaseListResponse {
+  items: InvestigationCase[];
+  total: number;
+}
+
+export interface CaseCreatePayload {
+  title: string;
+  description?: string;
+  status?: InvestigationStatus;
+  severity?: InvestigationSeverity;
+  tags?: string[];
+}
+
+export interface CaseUpdatePayload {
+  title?: string;
+  description?: string;
+  severity?: InvestigationSeverity;
+  status?: InvestigationStatus;
+  tags?: string[];
+}
+
 export interface BackendReport {
   analysis_id: string;
   status: JobSummary["state"];
@@ -840,6 +892,69 @@ export class PcapApiClient {
 
   getReport(analysisId: string): Promise<BackendReport> {
     return this.requestJson<BackendReport>(`/api/v1/analyses/${analysisId}/report`);
+  }
+
+  listCases(params: { limit?: number; offset?: number; search?: string } = {}): Promise<CaseListResponse> {
+    const query = new URLSearchParams({
+      limit: String(Math.max(1, Math.min(100, Math.trunc(params.limit ?? 50)))),
+      offset: String(Math.max(0, Math.min(10_000, Math.trunc(params.offset ?? 0)))),
+    });
+    if (params.search?.trim()) query.set("search", params.search.trim().slice(0, 120));
+    return this.requestJson<CaseListResponse>(`/api/v1/cases?${query.toString()}`);
+  }
+
+  getCase(caseId: string): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}`);
+  }
+
+  createCase(payload: CaseCreatePayload): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>("/api/v1/cases", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  updateCase(caseId: string, payload: CaseUpdatePayload): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  deleteCase(caseId: string): Promise<void> {
+    return this.requestJson<void>(`/api/v1/cases/${encodeURIComponent(caseId)}`, { method: "DELETE" });
+  }
+
+  linkCaseAnalysis(caseId: string, analysisId: string): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}/analyses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ analysis_id: analysisId }),
+    });
+  }
+
+  unlinkCaseAnalysis(caseId: string, analysisId: string): Promise<void> {
+    return this.requestJson<void>(
+      `/api/v1/cases/${encodeURIComponent(caseId)}/analyses/${encodeURIComponent(analysisId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  addCaseNote(caseId: string, note: string): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}/notes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    });
+  }
+
+  deleteCaseNote(caseId: string, noteId: string): Promise<void> {
+    return this.requestJson<void>(
+      `/api/v1/cases/${encodeURIComponent(caseId)}/notes/${encodeURIComponent(noteId)}`,
+      { method: "DELETE" },
+    );
   }
 
   getOSINTCapabilities(): Promise<OSINTCapabilities> {

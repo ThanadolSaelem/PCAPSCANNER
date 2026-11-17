@@ -19,7 +19,7 @@ from typing import Annotated
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from .config import AppSettings, load_settings
@@ -28,6 +28,12 @@ from .models import (
     AIResult,
     BatchResponse,
     AnalysisRequest,
+    CaseAnalysisLinkRequest,
+    CaseCreateRequest,
+    CaseDetail,
+    CaseListResponse,
+    CaseNoteCreateRequest,
+    CasePatchRequest,
     ChunkUploadInitRequest,
     EvidenceBundle,
     GroundedChatRequest,
@@ -882,6 +888,49 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "source_kind": "local",
             "validation": "zero_copy_local_reference",
         }
+
+    @app.get("/api/v1/cases", tags=["Cases"], response_model=CaseListResponse)
+    def list_cases(
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+        search: Annotated[str, Query(max_length=120)] = "",
+    ):
+        return _store().cases(limit=limit, offset=offset, search=search)
+
+    @app.post("/api/v1/cases", status_code=201, tags=["Cases"], response_model=CaseDetail)
+    def create_case(body: CaseCreateRequest):
+        return _store().create_case(body.model_dump())
+
+    @app.get("/api/v1/cases/{case_id}", tags=["Cases"], response_model=CaseDetail)
+    def get_case(case_id: str):
+        return _store().case(case_id)
+
+    @app.patch("/api/v1/cases/{case_id}", tags=["Cases"], response_model=CaseDetail)
+    def patch_case(case_id: str, body: CasePatchRequest):
+        return _store().update_case(case_id, body.model_dump(exclude_unset=True))
+
+    @app.delete("/api/v1/cases/{case_id}", status_code=204, tags=["Cases"])
+    def delete_case(case_id: str):
+        _store().delete_case(case_id)
+        return Response(status_code=204)
+
+    @app.post("/api/v1/cases/{case_id}/analyses", tags=["Cases"], response_model=CaseDetail)
+    def link_case_analysis(case_id: str, body: CaseAnalysisLinkRequest):
+        return _store().link_case_analysis(case_id, body.analysis_id)
+
+    @app.delete("/api/v1/cases/{case_id}/analyses/{analysis_id}", status_code=204, tags=["Cases"])
+    def unlink_case_analysis(case_id: str, analysis_id: str):
+        _store().unlink_case_analysis(case_id, analysis_id)
+        return Response(status_code=204)
+
+    @app.post("/api/v1/cases/{case_id}/notes", tags=["Cases"], response_model=CaseDetail)
+    def create_case_note(case_id: str, body: CaseNoteCreateRequest):
+        return _store().create_case_note(case_id, body.note)
+
+    @app.delete("/api/v1/cases/{case_id}/notes/{note_id}", status_code=204, tags=["Cases"])
+    def delete_case_note(case_id: str, note_id: str):
+        _store().delete_case_note(case_id, note_id)
+        return Response(status_code=204)
 
     @app.post("/api/v1/analyses", status_code=202, tags=["Analyses"])
     def analyze(body: AnalysisRequest, idempotency_key: Annotated[str | None, Header(max_length=128)] = None):

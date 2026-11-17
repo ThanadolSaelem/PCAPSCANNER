@@ -30,14 +30,14 @@ PCAP-Hunter มี provider enrichment สำหรับ VirusTotal, AbuseIPDB,
 
 ### UI, cases และ exports
 
-PCAP-Hunter มี interactive dashboard/cross-filters, persistent cases/tags/notes, และ exports อย่าง PDF, CSV/JSON, STIX, Navigator และ CEF [5] [11]. PCAPSCANNER มี API-backed report/traffic/findings views, basic filters, job history, JSON/Markdown/Triage JSONL และ worktree นี้เพิ่ม authenticated local metadata-only STIX 2.1 export. STIX นี้ยังไม่ใช่ frozen/versioned investigation snapshot; shared dashboard filter state, full case management and remaining export formats are missing.
+PCAP-Hunter มี interactive dashboard/cross-filters, persistent cases/tags/notes, และ exports อย่าง PDF, CSV/JSON, STIX, Navigator และ CEF [5] [11]. PCAPSCANNER มี API-backed report/traffic/findings views, shared findings/traffic filters, job history, JSON/Markdown/Triage JSONL และ authenticated local metadata-only STIX 2.1 export; เพิ่ม Cases SQLite/API/UI สำหรับ 4-state status, severity, tags, bounded search, analyst notes และ analysis links พร้อม auth/caps/cascade tests แล้ว. STIX ยังไม่ใช่ frozen/versioned investigation snapshot; capped aggregate charts, local IOC search/correlation และ PDF/CSV/CEF/Navigator exports ยังขาด.
 
 ## Roadmap ที่ควรตามลำดับ
 
 1. Finish fast-flux/NXDOMAIN-ratio and Zeek/TShark correlation; validate DNS/TLS/beacon thresholds against reviewed benign/malicious corpora and add broader TLS/certificate/ATT&CK candidates.
 2. Add local IOC/GeoIP correlation, PTR and WHOIS/RDAP workflows; add provider cache/key-rotation operations and verify live account behavior.
 3. Complete local YARA artifact inventory/review with opaque IDs and authenticated bounded downloads; keep payload bytes and paths out of AI context.
-4. Complete cases and shared dashboard/cross-filters; make STIX an immutable versioned snapshot and add the remaining export formats.
+4. Cases baseline และ shared findings/traffic cross-filters เสร็จใน source; ต่อ capped dashboard charts/local IOC search; ทำ STIX ให้เป็น immutable versioned snapshot และเพิ่ม PDF/CSV/CEF/Navigator formats.
 5. Validate chat against supported providers' refusal, timeout, token and JSON-schema behaviors without sending real capture data during tests.
 
 ## References

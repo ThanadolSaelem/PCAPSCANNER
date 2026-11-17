@@ -15,6 +15,7 @@ import type {
 import { ApiProblemError, PcapApiClient, normalizeBaseUrl } from "./api/client";
 import ArchitectureExplorer from "./components/ArchitectureExplorer";
 import BatchIntakePanel from "./components/BatchIntakePanel";
+import CasesPage from "./components/CasesPage";
 import OSINTPanel from "./components/OSINTPanel";
 import type {
   WorkspaceFinding,
@@ -40,7 +41,7 @@ import type { CaptureHeaderInspection } from "./utils/localAnalyzer";
 import { analyzeLocalCsvFile, inspectCaptureFile } from "./utils/localAnalyzer";
 import { resolveBatchLimits } from "./utils/batchLimits";
 
-type Screen = "overview" | "analyze" | "jobs" | "findings" | "traffic" | "reports" | "architecture";
+type Screen = "overview" | "analyze" | "jobs" | "findings" | "traffic" | "cases" | "reports" | "architecture";
 type IconName =
   | "grid"
   | "upload"
@@ -78,6 +79,7 @@ const PATHS: Record<Screen, string> = {
   jobs: "/jobs",
   findings: "/findings",
   traffic: "/traffic",
+  cases: "/cases",
   reports: "/reports",
   architecture: "/architecture",
 };
@@ -122,6 +124,7 @@ const NAV_GROUPS: { group: string; items: { id: Screen; label: string; icon: Ico
     items: [
       { id: "findings", label: "Findings", icon: "alert" },
       { id: "traffic", label: "Packet explorer", icon: "packets" },
+      { id: "cases", label: "Investigation cases", icon: "report" },
     ],
   },
   {
@@ -1101,6 +1104,8 @@ function App() {
               report={activeReport}
               severityFilter={severityFilter}
               setSeverityFilter={setSeverityFilter}
+              protocolFilter={protocolFilter}
+              packetSearch={packetSearch}
               selectedFinding={selectedFinding}
               setSelectedFinding={setSelectedFindingId}
               onOpenEvidence={openEvidence}
@@ -1110,6 +1115,8 @@ function App() {
           {screen === "traffic" && (
             <TrafficPage
               report={activeReport}
+              severityFilter={severityFilter}
+              setSeverityFilter={setSeverityFilter}
               protocolFilter={protocolFilter}
               setProtocolFilter={setProtocolFilter}
               packetSearch={packetSearch}
@@ -1135,6 +1142,15 @@ function App() {
               }}
               onNavigate={navigate}
               onOpenEvidence={openEvidence}
+            />
+          )}
+
+          {screen === "cases" && (
+            <CasesPage
+              apiClient={api}
+              connected={connectionStatus === "connected"}
+              jobs={jobs}
+              onOpenAnalysis={(id) => void loadBackendReport(id, "reports")}
             />
           )}
 
@@ -2740,6 +2756,8 @@ function FindingsPage({
   report,
   severityFilter,
   setSeverityFilter,
+  protocolFilter,
+  packetSearch,
   selectedFinding,
   setSelectedFinding,
   onOpenEvidence,
@@ -2747,6 +2765,8 @@ function FindingsPage({
   report: WorkspaceReport;
   severityFilter: "all" | Severity;
   setSeverityFilter: (value: "all" | Severity) => void;
+  protocolFilter: string;
+  packetSearch: string;
   selectedFinding: WorkspaceFinding | null;
   setSelectedFinding: (id: string) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
@@ -2756,10 +2776,18 @@ function FindingsPage({
   const lowCount = report.findings.filter((f) => f.severity === "low").length;
   const doneStages = report.stages.filter((s) => s.status === "done").length;
 
-  const filtered =
-    severityFilter === "all"
-      ? report.findings
-      : report.findings.filter((f) => f.severity === severityFilter);
+  const evidenceById = new Map((report.rawBundle?.evidence ?? []).map((item) => [item.evidence_id, item]));
+  const query = packetSearch.trim().toLowerCase();
+  const filtered = report.findings.filter((finding) => {
+    if (severityFilter !== "all" && finding.severity !== severityFilter) return false;
+    const cited = finding.evidence.map((id) => evidenceById.get(id)).filter((item) => item !== undefined);
+    if (protocolFilter !== "All protocols" && !cited.some((item) => String(item.attributes.protocol ?? "").toLowerCase() === protocolFilter.toLowerCase())) return false;
+    if (query) {
+      const text = `${finding.id} ${finding.title} ${finding.category} ${finding.destination} ${finding.summary} ${finding.why} ${finding.evidence.join(" ")} ${cited.map((item) => item.summary).join(" ")}`.toLowerCase();
+      if (!text.includes(query)) return false;
+    }
+    return true;
+  });
 
   return (
     <>
@@ -2836,6 +2864,7 @@ function FindingsPage({
                   onChange={(event) => setSeverityFilter(event.target.value as "all" | Severity)}
                 >
                   <option value="all">All severity</option>
+                  <option value="critical">Critical</option>
                   <option value="high">High</option>
                   <option value="medium">Medium</option>
                   <option value="low">Low</option>
@@ -2952,6 +2981,8 @@ function FindingsPage({
 
 function TrafficPage({
   report,
+  severityFilter,
+  setSeverityFilter,
   protocolFilter,
   setProtocolFilter,
   packetSearch,
@@ -2962,6 +2993,8 @@ function TrafficPage({
   onOpenEvidence,
 }: {
   report: WorkspaceReport;
+  severityFilter: "all" | Severity;
+  setSeverityFilter: (value: "all" | Severity) => void;
   protocolFilter: string;
   setProtocolFilter: (value: string) => void;
   packetSearch: string;
@@ -2996,9 +3029,15 @@ function TrafficPage({
     return ["All protocols", ...Array.from(set).sort()];
   }, [report.packets, report.flows]);
 
+  const severityEvidence = useMemo(() => {
+    if (severityFilter === "all") return null;
+    return new Set(report.findings.filter((finding) => finding.severity === severityFilter).flatMap((finding) => finding.evidence));
+  }, [report.findings, severityFilter]);
+
   const visiblePackets = useMemo(
     () =>
       report.packets.filter((packet) => {
+        if (severityEvidence && (!packet.evidence || !severityEvidence.has(packet.evidence))) return false;
         const matchesProtocol = protocolFilter === "All protocols" || packet.protocol === protocolFilter;
         const query = packetSearch.toLowerCase().trim();
         const matchesSearch =
@@ -3008,12 +3047,13 @@ function TrafficPage({
             .includes(query);
         return matchesProtocol && matchesSearch;
       }),
-    [report.packets, protocolFilter, packetSearch],
+    [report.packets, protocolFilter, packetSearch, severityEvidence],
   );
 
   const visibleFlows = useMemo(
     () =>
       report.flows.filter((flow) => {
+        if (severityEvidence && !severityEvidence.has(flow.evidence)) return false;
         const matchesProtocol = protocolFilter === "All protocols" || flow.protocol === protocolFilter;
         const query = packetSearch.toLowerCase().trim();
         const matchesSearch =
@@ -3023,7 +3063,7 @@ function TrafficPage({
             .includes(query);
         return matchesProtocol && matchesSearch;
       }),
-    [report.flows, protocolFilter, packetSearch],
+    [report.flows, protocolFilter, packetSearch, severityEvidence],
   );
 
   const selectedPacket: WorkspacePacket | null =
@@ -3129,6 +3169,13 @@ function TrafficPage({
                 aria-label={trafficView === "packets" ? "ค้นหา packet" : "ค้นหา flow"}
               />
             </div>
+            <select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value as "all" | Severity)} aria-label="กรองตาม severity ที่เชื่อมกับ findings">
+              <option value="all">All severity</option>
+              <option value="critical">Critical findings</option>
+              <option value="high">High findings</option>
+              <option value="medium">Medium findings</option>
+              <option value="low">Low findings</option>
+            </select>
             <select value={protocolFilter} onChange={(event) => setProtocolFilter(event.target.value)} aria-label="กรอง protocol">
               {protocolOptions.map((proto) => (
                 <option key={proto} value={proto}>

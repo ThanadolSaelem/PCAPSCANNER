@@ -129,6 +129,30 @@ class Store:
               PRIMARY KEY(batch_id, item_index)
             );
             CREATE INDEX IF NOT EXISTS batch_items_job ON batch_items(job_id);
+            CREATE TABLE IF NOT EXISTS cases (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL,
+              severity TEXT NOT NULL,
+              tags TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS case_analyses (
+              case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              analysis_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              linked_at TEXT NOT NULL,
+              PRIMARY KEY(case_id, analysis_id)
+            );
+            CREATE INDEX IF NOT EXISTS case_analyses_analysis ON case_analyses(analysis_id);
+            CREATE TABLE IF NOT EXISTS case_notes (
+              id TEXT PRIMARY KEY,
+              case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              note TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS case_notes_case ON case_notes(case_id, created_at, id);
             """)
             self._migrate_columns(db)
         os.chmod(self.path, 0o600)
@@ -1204,3 +1228,211 @@ class Store:
             )
             db.execute("PRAGMA incremental_vacuum(100)")
         return count
+
+    CASE_TOTAL_LIMIT = 5000
+    CASE_ANALYSIS_LIMIT = 100
+    CASE_NOTE_LIMIT = 100
+    CASE_STATUSES = {"open", "in_progress", "resolved", "closed"}
+    CASE_SEVERITIES = {"info", "low", "medium", "high", "critical"}
+
+    @staticmethod
+    def _validate_case_id(case_id: str, *, field: str = "case_id") -> None:
+        if not isinstance(case_id, str) or re.fullmatch(r"[0-9a-f]{32}", case_id) is None:
+            raise StoreError("invalid_" + field, 400)
+
+    @classmethod
+    def _validate_case_fields(cls, values: dict, *, require_title: bool = True) -> dict:
+        title = values.get("title")
+        description = values.get("description", "")
+        status = values.get("status", "open")
+        severity = values.get("severity", "info")
+        tags = values.get("tags", [])
+        if require_title and (not isinstance(title, str) or not title.strip() or len(title.strip()) > 160):
+            raise StoreError("invalid_case_title", 400)
+        if title is not None and (not isinstance(title, str) or not title.strip() or len(title.strip()) > 160):
+            raise StoreError("invalid_case_title", 400)
+        if not isinstance(description, str) or len(description.strip()) > 4000:
+            raise StoreError("invalid_case_description", 400)
+        if status not in cls.CASE_STATUSES:
+            raise StoreError("invalid_case_status", 400)
+        if severity not in cls.CASE_SEVERITIES:
+            raise StoreError("invalid_case_severity", 400)
+        if not isinstance(tags, list) or len(tags) > 20:
+            raise StoreError("invalid_case_tags", 400)
+        normalized = []
+        for tag in tags:
+            if not isinstance(tag, str) or not tag.strip() or len(tag.strip()) > 64:
+                raise StoreError("invalid_case_tags", 400)
+            normalized.append(tag.strip())
+        if len({tag.casefold() for tag in normalized}) != len(normalized):
+            raise StoreError("invalid_case_tags", 400)
+        return {
+            "title": title.strip() if isinstance(title, str) else title,
+            "description": description.strip(),
+            "status": status,
+            "severity": severity,
+            "tags": normalized,
+        }
+
+    @staticmethod
+    def _case_summary(row) -> dict:
+        try:
+            tags = json.loads(row["tags"])
+        except (TypeError, ValueError):
+            tags = []
+        if not isinstance(tags, list):
+            tags = []
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "description": row["description"],
+            "status": row["status"],
+            "severity": row["severity"],
+            "tags": tags[:20],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "analysis_count": int(row["analysis_count"]),
+            "note_count": int(row["note_count"]),
+        }
+
+    @staticmethod
+    def _case_summary_query():
+        return """SELECT c.*,
+                    (SELECT COUNT(*) FROM case_analyses ca WHERE ca.case_id=c.id) AS analysis_count,
+                    (SELECT COUNT(*) FROM case_notes cn WHERE cn.case_id=c.id) AS note_count
+                  FROM cases c"""
+
+    def cases(self, *, limit: int = 20, offset: int = 0, search: str = "") -> dict:
+        if not isinstance(limit, int) or not 1 <= limit <= 100 or not isinstance(offset, int) or not 0 <= offset <= 1_000_000:
+            raise StoreError("invalid_case_pagination", 400)
+        if not isinstance(search, str) or len(search) > 120:
+            raise StoreError("invalid_case_search", 400)
+        needle = search.strip()
+        where = " WHERE (?='' OR instr(lower(c.title),lower(?))>0 OR instr(lower(c.description),lower(?))>0 OR instr(lower(c.tags),lower(?))>0)"
+        search_params = (needle, needle, needle, needle)
+        with self.connection() as db:
+            total = int(db.execute("SELECT COUNT(*) FROM cases c" + where, search_params).fetchone()[0])
+            rows = db.execute(
+                self._case_summary_query() + where + " ORDER BY c.created_at DESC, c.id ASC LIMIT ? OFFSET ?",
+                (*search_params, limit, offset),
+            ).fetchall()
+        return {"items": [self._case_summary(row) for row in rows], "total": total}
+
+    def case(self, case_id: str) -> dict:
+        self._validate_case_id(case_id)
+        with self.connection() as db:
+            row = db.execute(self._case_summary_query() + " WHERE c.id=?", (case_id,)).fetchone()
+            if row is None:
+                raise StoreError("case_not_found", 404)
+            summary = self._case_summary(row)
+            analyses = db.execute(
+                """SELECT ca.analysis_id, c.filename AS capture_filename, j.state, ca.linked_at
+                   FROM case_analyses ca JOIN jobs j ON j.id=ca.analysis_id
+                   LEFT JOIN captures c ON c.id=j.capture_id
+                   WHERE ca.case_id=? ORDER BY ca.linked_at ASC, ca.analysis_id ASC LIMIT ?""",
+                (case_id, self.CASE_ANALYSIS_LIMIT),
+            ).fetchall()
+            notes = db.execute(
+                "SELECT id,note,created_at FROM case_notes WHERE case_id=? ORDER BY created_at ASC,id ASC LIMIT ?",
+                (case_id, self.CASE_NOTE_LIMIT),
+            ).fetchall()
+        summary["analyses"] = [dict(item) for item in analyses]
+        summary["notes"] = [dict(item) for item in notes]
+        return summary
+
+    def create_case(self, values: dict) -> dict:
+        fields = self._validate_case_fields(values)
+        case_id, now = uuid.uuid4().hex, utcnow()
+        with self.connection(write=True) as db:
+            if int(db.execute("SELECT COUNT(*) FROM cases").fetchone()[0]) >= self.CASE_TOTAL_LIMIT:
+                raise StoreError("case_storage_limit", 429)
+            db.execute(
+                "INSERT INTO cases(id,title,description,status,severity,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (case_id, fields["title"], fields["description"], fields["status"], fields["severity"],
+                 json.dumps(fields["tags"], ensure_ascii=False, separators=(",", ":")), now, now),
+            )
+        return self.case(case_id)
+
+    def update_case(self, case_id: str, values: dict) -> dict:
+        self._validate_case_id(case_id)
+        if not isinstance(values, dict) or not values or set(values) - {"title", "description", "status", "severity", "tags"}:
+            raise StoreError("invalid_case_update", 400)
+        if any(value is None for value in values.values()):
+            raise StoreError("invalid_case_update", 400)
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+            if row is None:
+                raise StoreError("case_not_found", 404)
+            try:
+                existing_tags = json.loads(row["tags"])
+            except (TypeError, ValueError):
+                existing_tags = []
+            merged = {
+                "title": row["title"], "description": row["description"], "status": row["status"],
+                "severity": row["severity"], "tags": existing_tags,
+            }
+            merged.update(values)
+            fields = self._validate_case_fields(merged)
+            db.execute(
+                "UPDATE cases SET title=?,description=?,status=?,severity=?,tags=?,updated_at=? WHERE id=?",
+                (fields["title"], fields["description"], fields["status"], fields["severity"],
+                 json.dumps(fields["tags"], ensure_ascii=False, separators=(",", ":")), utcnow(), case_id),
+            )
+        return self.case(case_id)
+
+    def delete_case(self, case_id: str) -> None:
+        self._validate_case_id(case_id)
+        with self.connection(write=True) as db:
+            cursor = db.execute("DELETE FROM cases WHERE id=?", (case_id,))
+            if cursor.rowcount != 1:
+                raise StoreError("case_not_found", 404)
+
+    def link_case_analysis(self, case_id: str, analysis_id: str) -> dict:
+        self._validate_case_id(case_id)
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            if not db.execute("SELECT 1 FROM jobs WHERE id=?", (analysis_id,)).fetchone():
+                raise StoreError("job_not_found", 404)
+            if db.execute("SELECT 1 FROM case_analyses WHERE case_id=? AND analysis_id=?", (case_id, analysis_id)).fetchone():
+                raise StoreError("case_analysis_exists", 409)
+            count = int(db.execute("SELECT COUNT(*) FROM case_analyses WHERE case_id=?", (case_id,)).fetchone()[0])
+            if count >= self.CASE_ANALYSIS_LIMIT:
+                raise StoreError("case_analysis_limit", 429)
+            db.execute("INSERT INTO case_analyses(case_id,analysis_id,linked_at) VALUES(?,?,?)", (case_id, analysis_id, utcnow()))
+        return self.case(case_id)
+
+    def unlink_case_analysis(self, case_id: str, analysis_id: str) -> None:
+        self._validate_case_id(case_id)
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            cursor = db.execute("DELETE FROM case_analyses WHERE case_id=? AND analysis_id=?", (case_id, analysis_id))
+            if cursor.rowcount != 1:
+                raise StoreError("case_analysis_not_found", 404)
+
+    def create_case_note(self, case_id: str, note: str) -> dict:
+        self._validate_case_id(case_id)
+        if not isinstance(note, str) or not note.strip() or len(note.strip()) > 4000:
+            raise StoreError("invalid_case_note", 400)
+        note_id, now = uuid.uuid4().hex, utcnow()
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            count = int(db.execute("SELECT COUNT(*) FROM case_notes WHERE case_id=?", (case_id,)).fetchone()[0])
+            if count >= self.CASE_NOTE_LIMIT:
+                raise StoreError("case_note_limit", 429)
+            db.execute("INSERT INTO case_notes(id,case_id,note,created_at) VALUES(?,?,?,?)", (note_id, case_id, note.strip(), now))
+        return self.case(case_id)
+
+    def delete_case_note(self, case_id: str, note_id: str) -> None:
+        self._validate_case_id(case_id)
+        self._validate_case_id(note_id, field="note_id")
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            cursor = db.execute("DELETE FROM case_notes WHERE case_id=? AND id=?", (case_id, note_id))
+            if cursor.rowcount != 1:
+                raise StoreError("case_note_not_found", 404)

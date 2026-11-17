@@ -1062,3 +1062,60 @@ px; }
   .osint-evidence-links { grid-column: 2 / -1; }
   .osint-candidate-head, .osint-results-head { align-items: flex-start; flex-direction: column; }
 }
+
+
+/* Backend-backed investigation cases */
+.cases-page { min-width: 0; }
+.cases-layout { display: grid; grid-template-columns: minmax(260px, 330px) minmax(0, 1fr); gap: 14px; align-items: start; }
+.cases-list-panel, .cases-detail-panel { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(155deg, rgba(27,40,52,.93), rgba(19,29,39,.96)); box-shadow: var(--shadow); }
+.cases-list-panel { position: sticky; top: 78px; overflow: hidden; }
+.cases-search { display: grid; gap: 6px; padding: 13px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.cases-search input, .cases-form input, .cases-form select, .cases-form textarea, .cases-link-controls select, .cases-note-form textarea { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line-2); border-radius: 7px; color: var(--ink); background: #111b25; }
+.cases-form textarea, .cases-note-form textarea { resize: vertical; }
+.cases-list-scroll { max-height: min(70vh, 760px); overflow: auto; padding: 7px; }
+.case-list-item { width: 100%; display: grid; gap: 7px; margin: 0 0 6px; padding: 11px; border: 1px solid transparent; border-radius: 8px; color: var(--ink); background: transparent; text-align: left; }
+.case-list-item:hover { border-color: var(--line-2); background: rgba(255,255,255,.025); }
+.case-list-item.selected { border-color: rgba(50,189,209,.32); background: rgba(50,189,209,.07); box-shadow: inset 2px 0 var(--cyan); }
+.case-list-title { min-width: 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.case-list-title strong { min-width: 0; overflow-wrap: anywhere; }
+.case-list-item > small { color: var(--muted); font-size: 10px; }
+.cases-pagination { display: flex; align-items: center; justify-content: space-between; gap: 7px; padding: 9px 11px; border-top: 1px solid var(--line); }
+.cases-pagination > span { color: var(--muted); font: 9px var(--mono); }
+.cases-pagination .secondary-button { min-height: 27px; padding: 0 8px; font-size: 9px; }
+.case-state { flex: none; padding: 2px 7px; border: 1px solid var(--line-2); border-radius: 10px; color: var(--muted); font: 9px var(--mono); text-transform: uppercase; }
+.case-state-open { border-color: rgba(229,184,92,.35); color: #f1d38f; background: rgba(229,184,92,.08); }
+.case-state-in_progress { border-color: rgba(50,189,209,.32); color: #8ddbe4; background: rgba(50,189,209,.07); }
+.case-state-resolved { border-color: rgba(111,207,151,.3); color: #9fdbb4; background: rgba(111,207,151,.07); }
+.case-state-closed { border-color: rgba(126,145,158,.3); color: #adbbc4; background: rgba(126,145,158,.07); }
+.case-tags { display: flex; gap: 5px; flex-wrap: wrap; }
+.case-tags span { padding: 2px 6px; border: 1px solid rgba(50,189,209,.17); border-radius: 10px; color: var(--cyan-2); background: rgba(50,189,209,.06); font-size: 9px; }
+.cases-detail-panel { padding: 16px; }
+.cases-form { display: grid; gap: 12px; }
+.cases-form-heading, .cases-subheading { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.cases-form-heading h2, .cases-subheading h3 { margin: 3px 0 0; }
+.cases-form > label, .cases-fields-row label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
+.cases-fields-row { display: grid; grid-template-columns: minmax(105px,.8fr) minmax(105px,.8fr) minmax(0,1.6fr); gap: 10px; }
+.cases-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.cases-error { margin-bottom: 12px; padding: 9px 12px; border: 1px solid rgba(236,121,121,.35); border-radius: 7px; color: #f3a2a2; background: rgba(236,121,121,.08); overflow-wrap: anywhere; }
+.cases-subsection { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.cases-subheading h3 { font-size: 13px; }
+.cases-subheading p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
+.cases-subheading > span { min-width: 24px; padding: 2px 7px; border-radius: 12px; color: var(--cyan-2); background: var(--cyan-soft); font: 10px var(--mono); text-align: center; }
+.cases-link-controls { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; margin: 12px 0; }
+.cases-linked-list, .cases-notes-list { display: grid; gap: 7px; }
+.cases-linked-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: rgba(13,22,30,.5); }
+.case-analysis-open { min-width: 0; display: grid; gap: 3px; border: 0; color: var(--ink); background: transparent; text-align: left; }
+.case-analysis-open strong { overflow-wrap: anywhere; }
+.case-analysis-open small { color: var(--muted); }
+.cases-note-form { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: end; gap: 8px; margin: 12px 0; }
+.case-note { padding: 10px 11px; border: 1px solid var(--line); border-radius: 7px; background: rgba(13,22,30,.5); }
+.case-note-meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+.case-note p { margin: 7px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cases-empty { padding: 20px 12px; color: var(--muted); text-align: center; }
+.cases-detail-empty { min-height: 300px; display: grid; place-content: center; gap: 7px; }
+.cases-detail-empty strong { color: var(--ink-2); }
+.cases-detail-empty span { color: var(--muted); }
+.danger-button { min-height: 33px; padding: 0 11px; border: 1px solid rgba(236,121,121,.38); border-radius: 7px; color: #efaaaa; background: rgba(236,121,121,.08); }
+.danger-button:hover { background: rgba(236,121,121,.15); }
+@media (max-width: 900px) { .cases-layout { grid-template-columns: minmax(0,1fr); } .cases-list-panel { position: static; } .cases-list-scroll { max-height: 260px; } }
+@media (max-width: 560px) { .cases-detail-panel { padding: 12px; } .cases-fields-row, .cases-note-form { grid-template-columns: 1fr; } .cases-linked-row { align-items: flex-start; flex-direction: column; } .cases-actions > button { flex: 1 1 auto; } }
