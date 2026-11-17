@@ -215,6 +215,7 @@ class TriageConfig(BaseModel):
     etbert_enabled: bool = False
     etbert_endpoint_url: str | None = None
     data_boundary: DataBoundary = "local"
+    allowed_origins: list[str] = Field(default_factory=list, max_length=20)
     model_name: str = Field(default="openjev-cal-tier1", min_length=1, max_length=120)
     etbert_model_name: str = Field(default="etbert-l7-datagram", min_length=1, max_length=120)
     high_confidence_threshold: float = Field(default=0.90, ge=0.5, le=0.999)
@@ -223,12 +224,24 @@ class TriageConfig(BaseModel):
     timeout_seconds: int = Field(default=10, ge=1, le=60)
     etbert_timeout_seconds: int = Field(default=8, ge=1, le=60)
 
+    @field_validator("allowed_origins")
+    @classmethod
+    def validate_triage_origins(cls, value: list[str]) -> list[str]:
+        checked = [_validate_origin(origin) for origin in value]
+        if len(set(checked)) != len(checked):
+            raise ValueError("duplicate_triage_allowed_origin")
+        return checked
+
     @model_validator(mode="after")
     def validate_triage_endpoint(self) -> "TriageConfig":
         if self.endpoint_url is not None:
             _validate_endpoint(self.endpoint_url, data_boundary=self.data_boundary)
+            if _origin(self.endpoint_url) not in self.allowed_origins:
+                raise ValueError("triage_endpoint_origin_not_allowed")
         if self.etbert_endpoint_url is not None:
             _validate_endpoint(self.etbert_endpoint_url, data_boundary=self.data_boundary)
+            if _origin(self.etbert_endpoint_url) not in self.allowed_origins:
+                raise ValueError("triage_endpoint_origin_not_allowed")
         if self.low_confidence_threshold >= self.high_confidence_threshold:
             raise ValueError("triage_thresholds_invalid")
         return self
@@ -249,15 +262,49 @@ class AppSettings(BaseModel):
     storage_max_captures: int = Field(default=500, ge=1)
     api_json_max_bytes: int = Field(default=1024 * 1024, ge=1)
     queue_limit: int = Field(default=8, ge=1)
+    batch_max_files: int = Field(default=8, ge=1, le=64)
+    batch_max_total_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1, le=100 * 1024 * 1024 * 1024)
+    batch_admission_concurrency: int = Field(default=2, ge=1, le=8)
     packet_limit: int = Field(default=20_000, ge=0)
     flow_limit: int = Field(default=5_000, ge=1)
     parser_timeout_seconds: int = Field(default=120, ge=1)
     parser_memory_mb: int = Field(default=512, ge=1)
     zeek_enabled: bool = False
+    zeek_max_rows: int = Field(default=2_000, ge=1, le=10_000)
+    zeek_max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
+    zeek_timeout_seconds: int = Field(default=45, ge=1, le=120)
+    zeek_memory_mb: int = Field(default=256, ge=128, le=512)
+    yara_enabled: bool = False
+    yara_rules_dir: Path | None = None
+    yara_max_rules_files: int = Field(default=64, ge=1, le=256)
+    yara_max_rules_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    yara_max_objects: int = Field(default=100, ge=1, le=500)
+    yara_max_object_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=128 * 1024 * 1024)
+    yara_max_total_bytes: int = Field(default=64 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
+    yara_max_matches: int = Field(default=200, ge=1, le=2_000)
+    yara_max_output_bytes: int = Field(default=1024 * 1024, ge=64 * 1024, le=16 * 1024 * 1024)
+    yara_timeout_seconds: int = Field(default=30, ge=1, le=120)
+    yara_memory_mb: int = Field(default=256, ge=128, le=512)
     retention_hours: int = Field(default=24, ge=1)
     local_ingest_roots: list[str] = Field(default_factory=list, max_length=20)
     ai: AIConfig = Field(default_factory=AIConfig)
     triage: TriageConfig = Field(default_factory=TriageConfig)
+
+    @model_validator(mode="after")
+    def validate_yara_caps(self) -> "AppSettings":
+        if self.yara_max_object_bytes > self.yara_max_total_bytes:
+            raise ValueError("yara_object_limit_exceeds_total")
+        # Rules, temporary carved objects, scan-list and result output share one
+        # per-analysis /tmp directory. Keep headroom below the Compose tmpfs cap.
+        if (
+            self.yara_max_total_bytes
+            + self.yara_max_rules_bytes
+            + self.yara_max_output_bytes
+            + 4 * 1024 * 1024
+            > 224 * 1024 * 1024
+        ):
+            raise ValueError("yara_scratch_budget_exceeds_limit")
+        return self
 
 
 _SECRET_CONFIG_KEYS = {
@@ -337,12 +384,30 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_DISK_RESERVE_BYTES": ("disk_reserve_bytes", "int"),
         "PCAP_STORAGE_MAX_CAPTURES": ("storage_max_captures", "int"),
         "PCAP_API_JSON_MAX_BYTES": ("api_json_max_bytes", "int"),
-        "PCAP_QUEUE_LIMIT": ("queue_limit", "int"),
+  "PCAP_QUEUE_LIMIT": ("queue_limit", "int"),
+        "PCAP_BATCH_MAX_FILES": ("batch_max_files", "int"),
+        "PCAP_BATCH_MAX_TOTAL_BYTES": ("batch_max_total_bytes", "int"),
+        "PCAP_BATCH_ADMISSION_CONCURRENCY": ("batch_admission_concurrency", "int"),
         "PCAP_PACKET_LIMIT": ("packet_limit", "int"),
         "PCAP_FLOW_LIMIT": ("flow_limit", "int"),
         "PCAP_PARSER_TIMEOUT_SECONDS": ("parser_timeout_seconds", "int"),
         "PCAP_PARSER_MEMORY_MB": ("parser_memory_mb", "int"),
         "PCAP_ZEEK_ENABLED": ("zeek_enabled", "bool"),
+        "PCAP_ZEEK_MAX_ROWS": ("zeek_max_rows", "int"),
+        "PCAP_ZEEK_MAX_OUTPUT_BYTES": ("zeek_max_output_bytes", "int"),
+        "PCAP_ZEEK_TIMEOUT_SECONDS": ("zeek_timeout_seconds", "int"),
+        "PCAP_ZEEK_MEMORY_MB": ("zeek_memory_mb", "int"),
+        "PCAP_YARA_ENABLED": ("yara_enabled", "bool"),
+        "PCAP_YARA_RULES_DIR": ("yara_rules_dir", "str"),
+        "PCAP_YARA_MAX_RULES_FILES": ("yara_max_rules_files", "int"),
+        "PCAP_YARA_MAX_RULES_BYTES": ("yara_max_rules_bytes", "int"),
+        "PCAP_YARA_MAX_OBJECTS": ("yara_max_objects", "int"),
+        "PCAP_YARA_MAX_OBJECT_BYTES": ("yara_max_object_bytes", "int"),
+        "PCAP_YARA_MAX_TOTAL_BYTES": ("yara_max_total_bytes", "int"),
+        "PCAP_YARA_MAX_MATCHES": ("yara_max_matches", "int"),
+        "PCAP_YARA_MAX_OUTPUT_BYTES": ("yara_max_output_bytes", "int"),
+        "PCAP_YARA_TIMEOUT_SECONDS": ("yara_timeout_seconds", "int"),
+        "PCAP_YARA_MEMORY_MB": ("yara_memory_mb", "int"),
         "PCAP_RETENTION_HOURS": ("retention_hours", "int"),
         "PCAP_LOCAL_INGEST_ROOTS": ("local_ingest_roots", "list"),
     }
@@ -371,6 +436,7 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_TRIAGE_ETBERT_MODEL": ("etbert_model_name", "str"),
         "PCAP_TRIAGE_ETBERT_TIMEOUT_SECONDS": ("etbert_timeout_seconds", "int"),
         "PCAP_TRIAGE_DATA_BOUNDARY": ("data_boundary", "str"),
+        "PCAP_TRIAGE_ALLOWED_ORIGINS": ("allowed_origins", "list"),
         "PCAP_TRIAGE_MODEL": ("model_name", "str"),
         "PCAP_TRIAGE_HIGH_CONF": ("high_confidence_threshold", "float"),
         "PCAP_TRIAGE_LOW_CONF": ("low_confidence_threshold", "float"),
@@ -503,4 +569,3 @@ def load_settings() -> AppSettings:
 
 
 __all__ = ["AIConfig", "AppSettings", "ProviderName", "TriageConfig", "load_settings"]
-

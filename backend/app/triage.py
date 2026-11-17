@@ -20,12 +20,52 @@ import json
 import math
 import re
 import secrets
+import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .etbert_bridge import score_with_etbert_http
+from .http_transport import post_json_bounded
+
+
+class _BoundedJsonResponse:
+    status = 200
+
+    def __init__(self, value: Any) -> None:
+        self._raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+
+    def read(self, limit: int = -1) -> bytes:
+        return self._raw if limit < 0 else self._raw[:limit]
+
+    def __enter__(self) -> "_BoundedJsonResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def urlopen(
+    request: Request,
+    timeout: float = 10.0,
+    *,
+    deadline_monotonic: float | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> _BoundedJsonResponse:
+    """Compatibility adapter backed by a no-proxy, no-redirect bounded client."""
+    raw = request.data or b"{}"
+    payload = json.loads(raw.decode("utf-8"))
+    result = post_json_bounded(
+        request.full_url,
+        payload,
+        timeout_seconds=timeout,
+        deadline_monotonic=deadline_monotonic,
+        cancellation_check=cancellation_check,
+    )
+    if result is None:
+        raise OSError("provider_unavailable")
+    return _BoundedJsonResponse(result)
 
 
 TRAFFIC_CLASSES: tuple[str, ...] = (
@@ -145,6 +185,15 @@ def _attr_int(attrs: dict[str, Any], key: str, default: int = 0) -> int:
 def _attr_str(attrs: dict[str, Any], key: str, default: str = "") -> str:
     raw = attrs.get(key)
     return str(raw) if raw is not None else default
+
+
+def _cancel_requested(check: Callable[[], bool] | None) -> bool:
+    if check is None:
+        return False
+    try:
+        return bool(check())
+    except Exception:
+        return True
 
 
 def _entropy(value: str) -> float:
@@ -274,15 +323,14 @@ def _compact_flow_state(
     if attrs.get("intervals"):
         extras.append(f"intervals={str(attrs['intervals'])[:48]}")
 
-    # Sanitized HTTP & Telnet
+    # HTTP request targets may contain credentials, tokens, or user identifiers.
+    # Never send raw paths/queries to a remote classifier; retain only a safe verb category.
     if attrs.get("http_method") or attrs.get("http_path"):
-        extras.append(f"http={_attr_str(attrs, 'http_method')} {_attr_str(attrs, 'http_path')[:48]}".strip())
+        method = _attr_str(attrs, "http_method").upper()
+        known_methods = {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE"}
+        extras.append(f"http_method={method if method in known_methods else 'OTHER'}")
     if attrs.get("http_status_codes"):
         extras.append(f"http_code={attrs['http_status_codes']}")
-    if _attr_int(attrs, "http_uri_max_len", 0) > 0:
-        extras.append(f"uri_len={_attr_int(attrs, 'http_uri_max_len')}")
-    if _attr_float(attrs, "http_uri_max_entropy", 0.0) > 0:
-        extras.append(f"uri_ent={_attr_float(attrs, 'http_uri_max_entropy'):.2f}")
     for key, tag in (
         ("http_xss_hits", "xss"),
         ("http_crlf_hits", "crlf"),
@@ -533,6 +581,12 @@ def _anonymize_compact_state(text: str, salt: str) -> str:
     """Replace concrete network identifiers and secrets with per-call pseudonyms."""
     body = text.split(" ", 1)[-1] if " " in text else text
 
+    # These counters are derived from HTTP request targets (URI contents). They
+    # remain available in local compact state/scoring, but never enter a remote
+    # classifier's projection.
+    body = re.sub(r"(?<!\S)(?:xss|crlf|sqli|shell|host_ip)=\S+", "", body)
+    body = " ".join(body.split())
+
     def _tag(prefix: str, value: str) -> str:
         digest = hashlib.sha256(f"{salt}:{value.lower()}".encode("utf-8")).hexdigest()[:8]
         return f"{prefix}_{digest}"
@@ -557,15 +611,26 @@ def _call_openjev_systemone_http(
     model_name: str,
     timeout_seconds: float,
     *,
+    allow_network: bool = False,
     high_threshold: float = 0.90,
     low_threshold: float = 0.35,
+    deadline_monotonic: float | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> list[TriageDecision] | None:
     """Upstream OpenJev `/v1/systemone` state-question endpoint client."""
+    if not allow_network:
+        return None
     ephemeral_salt = secrets.token_hex(16)
     updated: list[TriageDecision] = list(decisions)
     per_req_timeout = max(1.0, min(timeout_seconds, 5.0))
+    now = time.monotonic()
+    operation_deadline = now + max(1.0, min(float(timeout_seconds), 60.0))
+    if deadline_monotonic is not None:
+        operation_deadline = min(operation_deadline, deadline_monotonic)
     succeeded = 0
     for idx, prev in enumerate(decisions[:128]):
+        if time.monotonic() >= operation_deadline or _cancel_requested(cancellation_check):
+            break
         pseudo_id = hashlib.sha256(f"{ephemeral_salt}:{prev.evidence_id}".encode()).hexdigest()[:12]
         anon_state = pseudo_id + " " + _anonymize_compact_state(prev.compact_text, ephemeral_salt)
         body = {
@@ -586,7 +651,15 @@ def _call_openjev_systemone_http(
             method="POST",
         )
         try:
-            with urlopen(request, timeout=per_req_timeout) as resp:
+            remaining = operation_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with urlopen(
+                request,
+                timeout=min(per_req_timeout, remaining),
+                deadline_monotonic=operation_deadline,
+                cancellation_check=cancellation_check,
+            ) as resp:
                 if getattr(resp, "status", 200) != 200:
                     if idx == 0:
                         return None
@@ -648,22 +721,30 @@ def _call_openjev_http(
     model_name: str,
     timeout_seconds: float,
     *,
+    allow_network: bool = False,
     high_threshold: float = 0.90,
     low_threshold: float = 0.35,
+    deadline_monotonic: float | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> list[TriageDecision] | None:
     """Optional call to a user-hosted OpenJev /v1/systemone or batch `/classify` server.
 
     Sends ONLY compact anonymized flow states (no raw IPs/MACs/payloads/secrets).
     Returns updated decisions on valid JSON response, or None to fall back cleanly.
     """
+    if not allow_network:
+        return None
     if endpoint_url.rstrip("/").endswith("/v1/systemone"):
         return _call_openjev_systemone_http(
             decisions,
             endpoint_url,
             model_name,
             timeout_seconds,
+            allow_network=allow_network,
             high_threshold=high_threshold,
             low_threshold=low_threshold,
+            deadline_monotonic=deadline_monotonic,
+            cancellation_check=cancellation_check,
         )
 
     ephemeral_salt = secrets.token_hex(16)
@@ -687,7 +768,17 @@ def _call_openjev_http(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=max(1.0, timeout_seconds)) as resp:
+        deadline = (
+            deadline_monotonic
+            if deadline_monotonic is not None
+            else time.monotonic() + max(1.0, min(timeout_seconds, 60.0))
+        )
+        with urlopen(
+            request,
+            timeout=max(1.0, min(timeout_seconds, 60.0)),
+            deadline_monotonic=deadline,
+            cancellation_check=cancellation_check,
+        ) as resp:
             if getattr(resp, "status", 200) != 200:
                 return None
             raw = resp.read(2 * 1024 * 1024)
@@ -729,8 +820,14 @@ def _call_openjev_http(
         return None
 
 
-def classify_bundle(bundle: Any, triage_cfg: Any = None) -> TriageReport:
-    """Classify all evidence records in an EvidenceBundle with Tier-1 gating."""
+def classify_bundle(
+    bundle: Any,
+    triage_cfg: Any = None,
+    *,
+    allow_network: bool = False,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> TriageReport:
+    """Classify evidence locally unless the caller supplies explicit network consent."""
     enabled = bool(getattr(triage_cfg, "enabled", True)) if triage_cfg is not None else True
     mode = str(getattr(triage_cfg, "mode", "heuristic_calibrated")) if triage_cfg is not None else "heuristic_calibrated"
     model_name = str(getattr(triage_cfg, "model_name", "openjev-cal-tier1")) if triage_cfg is not None else "openjev-cal-tier1"
@@ -742,6 +839,22 @@ def classify_bundle(bundle: Any, triage_cfg: Any = None) -> TriageReport:
     etbert_url = getattr(triage_cfg, "etbert_endpoint_url", None) if triage_cfg is not None else None
     etbert_model = str(getattr(triage_cfg, "etbert_model_name", "etbert-l7-datagram")) if triage_cfg is not None else "etbert-l7-datagram"
     etbert_timeout = float(getattr(triage_cfg, "etbert_timeout_seconds", 8.0)) if triage_cfg is not None else 8.0
+    network_requested = bool(
+        enabled
+        and (
+            (endpoint_url and mode in ("http_openjev", "hybrid", "etbert_openjev"))
+            or (etbert_enabled and etbert_url)
+        )
+    )
+    if network_requested and not allow_network:
+        mode = "heuristic_calibrated(consent_required)"
+
+    # One absolute budget covers the opted-in ET-BERT and OpenJev requests for
+    # this analysis; each classifier may impose a shorter configured timeout.
+    network_deadline = None
+    if allow_network and network_requested:
+        network_budget = max(1.0, min(max(timeout_s, etbert_timeout), 60.0))
+        network_deadline = time.monotonic() + network_budget
 
     evidence_list = list(getattr(bundle, "evidence", []) or [])
     findings_list = list(getattr(bundle, "findings", []) or [])
@@ -761,12 +874,15 @@ def classify_bundle(bundle: Any, triage_cfg: Any = None) -> TriageReport:
             ports_by_src.setdefault(str(src), set()).add(dp)
 
     etbert_scores: dict[str, dict[str, Any]] = {}
-    if enabled and etbert_enabled and etbert_url and evidence_list:
+    if enabled and allow_network and etbert_enabled and etbert_url and evidence_list:
         etbert_scores = score_with_etbert_http(
             evidence_list,
             endpoint_url=str(etbert_url),
             model_name=etbert_model,
             timeout_seconds=etbert_timeout,
+            allow_network=allow_network,
+            deadline_monotonic=network_deadline,
+            cancellation_check=cancellation_check,
         )
 
     decisions: list[TriageDecision] = []
@@ -787,14 +903,17 @@ def classify_bundle(bundle: Any, triage_cfg: Any = None) -> TriageReport:
                 )
             )
 
-        if endpoint_url and mode in ("http_openjev", "hybrid", "etbert_openjev") and decisions:
+        if allow_network and endpoint_url and mode in ("http_openjev", "hybrid", "etbert_openjev") and decisions:
             http_updated = _call_openjev_http(
                 decisions,
                 str(endpoint_url),
                 model_name,
                 timeout_s,
+                allow_network=allow_network,
                 high_threshold=high_t,
                 low_threshold=low_t,
+                deadline_monotonic=network_deadline,
+                cancellation_check=cancellation_check,
             )
             if http_updated is not None:
                 decisions = http_updated

@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat
 import textwrap
+import time
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from backend.app import pipeline
+from backend.app.config import AppSettings, _env_overlay
+from backend.app.llm.providers import _safe_context
+from backend.app.zeek import parse_zeek_logs
 from backend.app.pipeline import PipelineError, analyze_capture
 from backend.tests.fixtures import write_synthetic_pcap
 
@@ -344,3 +350,146 @@ def test_extended_l2_l7_telemetry_sanitized_http_wlan_and_limits(monkeypatch) ->
     hook = pipeline._child_limits(512, 10.0)
     hook()
 
+
+def test_zeek_ascii_normalization_is_allowlisted_and_provenanced(tmp_path) -> None:
+    ascii_log = (
+        r"#separator \x09" + "\n"
+        "#set_separator ,\n"
+        "#empty_field (empty)\n"
+        "#unset_field -\n"
+        "#path conn\n"
+        "#fields\tts\tuid\tid.orig_h\tid.orig_p\tid.resp_h\tid.resp_p\tproto\tservice\tconn_state\tduration\torig_bytes\tresp_bytes\torig_pkts\tresp_pkts\turi\n"
+        "#types\ttime\tstring\taddr\tport\taddr\tport\tstring\tstring\tstring\tinterval\tcount\tcount\tcount\tcount\tstring\n"
+        "1700000000.125\tCabc123\t192.0.2.10\t51515\t198.51.100.8\t443\ttcp\tssl\tSF\t1.5\t100\t900\t3\t4\t/secret/path?token=do-not-retain\n"
+    )
+    (tmp_path / "conn.log").write_text(ascii_log, encoding="utf-8")
+    (tmp_path / "http.log").write_text(
+        "GET /private/path?session=secret Cookie: do-not-retain\n",
+        encoding="utf-8",
+    )
+
+    records, rows_seen, bytes_read, truncated = parse_zeek_logs(
+        tmp_path,
+        row_limit=10,
+        byte_limit=1024 * 1024,
+    )
+
+    assert rows_seen == 1
+    assert bytes_read == len(ascii_log.encode("utf-8"))
+    assert truncated is False
+    assert len(records) == 1
+    record = records[0]
+    assert record.log_name == "conn.log"
+    assert record.source_row == 1
+    assert record.attributes["src"] == "192.0.2.10"
+    assert record.attributes["dst"] == "198.51.100.8"
+    assert record.attributes["bytes"] == 1000
+    assert record.attributes["packets"] == 7
+    assert record.attributes["source_log"] == "conn.log"
+    assert record.attributes["source_row"] == 1
+    assert "uri" not in record.attributes
+    assert "secret" not in record.summary
+    assert "do-not-retain" not in str(record.attributes)
+
+
+def test_zeek_jsonl_and_global_row_and_disk_bounds(tmp_path) -> None:
+    (tmp_path / "dns.log").write_text(
+        '{"ts":1700000000.5,"uid":"Dabc","id.orig_h":"192.0.2.9",'
+        '"id.orig_p":53000,"id.resp_h":"198.51.100.53","id.resp_p":53,'
+        '"proto":"udp","query":"exfil.example","qtype_name":"TXT",'
+        '"rcode_name":"NOERROR","answers":["192.0.2.8"]}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "ssl.log").write_text(
+        '{"ts":1700000001,"uid":"Sabc","id.orig_h":"192.0.2.9",'
+        '"id.resp_h":"198.51.100.8","proto":"tcp","version":"TLSv13",'
+        '"cipher":"TLS_AES_128_GCM_SHA256","server_name":"api.example",'
+        '"ja3":"0123456789abcdef0123456789abcdef"}\n',
+        encoding="utf-8",
+    )
+
+    records, rows_seen, _, truncated = parse_zeek_logs(tmp_path, row_limit=1, byte_limit=1024 * 1024)
+    assert rows_seen == 1
+    assert len(records) == 1
+    assert records[0].log_name == "dns.log"
+    assert records[0].attributes["dns_answer_count"] == 1
+    assert records[0].attributes["qtype_name"] == "TXT"
+    assert truncated is True
+
+    total, exceeded = pipeline.bounded_directory_size(tmp_path, 16)
+    assert exceeded is True
+    assert total > 16
+
+
+def test_zeek_normalized_rows_enter_evidence_bundle_with_stable_ids(tmp_path, monkeypatch) -> None:
+    capture = tmp_path / "case capture.pcap"
+    capture.write_bytes(b"synthetic")
+    args_path = tmp_path / "argv.txt"
+    log = (
+        r"#separator \x09" + "\n"
+        "#unset_field -\n"
+        "#fields\tts\tuid\tid.orig_h\tid.orig_p\tid.resp_h\tid.resp_p\tproto\tconn_state\n"
+        "#types\ttime\tstring\taddr\tport\taddr\tport\tstring\tstring\n"
+        "1700000000\tCabc\t192.0.2.1\t12345\t198.51.100.2\t443\ttcp\tSF\n"
+    )
+    tool = tmp_path / "fake-zeek"
+    tool.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path('conn.log').write_text({log!r}, encoding='utf-8')\n"
+        f"pathlib.Path({str(args_path)!r}).write_text(' '.join(sys.argv[1:]), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: str(tool) if name == "zeek" else None)
+
+    limits = pipeline._get_limits(settings(zeek_enabled=True))
+    stage, rows = pipeline._run_zeek(
+        capture,
+        limits=limits,
+        deadline=time.monotonic() + 10,
+        is_cancelled=lambda: False,
+    )
+    accumulator = pipeline._Accumulator(packet_limit=100, flow_limit=100)
+    bundle = pipeline._build_bundle(
+        accumulator,
+        capture_sha256=HASH,
+        parser_state="completed",
+        parser_detail="bounded test",
+        zeek_stage=stage,
+        zeek_records=rows,
+    )
+
+    assert stage.state == "completed"
+    assert "-r" in args_path.read_text(encoding="utf-8")
+    zeek_evidence = [item for item in bundle.evidence if item.kind == "zeek"]
+    assert len(zeek_evidence) == 1
+    assert zeek_evidence[0].evidence_id == "EV-000001"
+    assert zeek_evidence[0].attributes["source_log"] == "conn.log"
+    assert "[conn.log row 1]" in zeek_evidence[0].summary
+    assert bundle.coverage.truncated is False
+    safe_context = json.dumps(_safe_context(bundle, b"unit-test-salt"), sort_keys=True)
+    assert '"kind": "zeek"' in safe_context
+    assert "192.0.2.1" not in safe_context
+    assert "198.51.100.2" not in safe_context
+    assert "conn.log" not in safe_context
+
+
+def test_zeek_environment_bounds_are_validated() -> None:
+    overlay = _env_overlay(
+        {
+            "PCAP_ZEEK_ENABLED": "1",
+            "PCAP_ZEEK_MAX_ROWS": "321",
+            "PCAP_ZEEK_MAX_OUTPUT_BYTES": "4194304",
+            "PCAP_ZEEK_TIMEOUT_SECONDS": "30",
+            "PCAP_ZEEK_MEMORY_MB": "192",
+        }
+    )
+    config = AppSettings.model_validate(overlay)
+    assert config.zeek_enabled is True
+    assert config.zeek_max_rows == 321
+    assert config.zeek_max_output_bytes == 4 * 1024 * 1024
+    assert config.zeek_timeout_seconds == 30
+    assert config.zeek_memory_mb == 192
+    with pytest.raises(ValidationError):
+        AppSettings(zeek_max_rows=10_001)

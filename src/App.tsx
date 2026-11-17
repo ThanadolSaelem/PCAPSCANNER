@@ -13,18 +13,18 @@ import type {
 } from "./api/client";
 import { ApiProblemError, PcapApiClient, normalizeBaseUrl } from "./api/client";
 import ArchitectureExplorer from "./components/ArchitectureExplorer";
-import type { Severity } from "./data/demo";
-import { stages as sampleStages } from "./data/demo";
+import BatchIntakePanel from "./components/BatchIntakePanel";
 import type {
   WorkspaceFinding,
   WorkspaceFlow,
   WorkspacePacket,
+  Severity,
   WorkspaceReport,
   WorkspaceStage,
 } from "./utils/adapters";
 import {
   adaptBackendReport,
-  demoAsWorkspaceReport,
+  emptyWorkspaceReport,
   exportReportJson,
   exportReportMarkdown,
   exportTriageJsonlFallback,
@@ -32,9 +32,11 @@ import {
   formatBytes,
   formatCompactCount,
   formatDuration,
+  packetCoverageSummary,
 } from "./utils/adapters";
 import type { CaptureHeaderInspection } from "./utils/localAnalyzer";
 import { analyzeLocalCsvFile, inspectCaptureFile } from "./utils/localAnalyzer";
+import { resolveBatchLimits } from "./utils/batchLimits";
 
 type Screen = "overview" | "analyze" | "jobs" | "findings" | "traffic" | "reports" | "architecture";
 type IconName =
@@ -129,16 +131,6 @@ const NAV_GROUPS: { group: string; items: { id: Screen; label: string; icon: Ico
   },
 ];
 
-const DEFAULT_PROFILE_ESTIMATES: Record<
-  ResourceMode,
-  { packet_limit: number; flow_limit: number; parser_memory_mb: number; timeout_seconds: number; chunk_size_bytes: number }
-> = {
-  auto: { packet_limit: 1_000_000, flow_limit: 12_000, parser_memory_mb: 2048, timeout_seconds: 360, chunk_size_bytes: 8 * 1024 * 1024 },
-  fast: { packet_limit: 100_000, flow_limit: 5_000, parser_memory_mb: 1024, timeout_seconds: 120, chunk_size_bytes: 4 * 1024 * 1024 },
-  deep: { packet_limit: 5_000_000, flow_limit: 20_000, parser_memory_mb: 4096, timeout_seconds: 600, chunk_size_bytes: 16 * 1024 * 1024 },
-  unlimited: { packet_limit: 0, flow_limit: 25_000, parser_memory_mb: 4096, timeout_seconds: 1800, chunk_size_bytes: 16 * 1024 * 1024 },
-};
-
 const ACTIVE_STATES = new Set<JobSummary["state"]>(["queued", "parsing", "awaiting_ai", "generating"]);
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -214,6 +206,15 @@ function formatUtcShort(iso: string): string {
   return iso.replace("T", " ").slice(0, 19) + " UTC";
 }
 
+function safeEndpointOrigin(value?: string | null): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
 function safeFormatError(err: unknown): string {
   if (err instanceof ApiProblemError) return err.message;
   if (err instanceof Error) return err.message;
@@ -255,12 +256,12 @@ function App() {
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isPickingPath, setIsPickingPath] = useState(false);
 
-  // Active workspace report (live report, local CSV scan, or demo sample fallback)
-  const [activeReport, setActiveReport] = useState<WorkspaceReport>(() => demoAsWorkspaceReport(false));
+  // Active report is empty until a real backend or local CSV analysis is selected.
+  const [activeReport, setActiveReport] = useState<WorkspaceReport>(() => emptyWorkspaceReport());
   const [lastLocalCsvReport, setLastLocalCsvReport] = useState<WorkspaceReport | null>(null);
 
   // Investigation filters
-  const [selectedFindingId, setSelectedFindingId] = useState<string>(() => demoAsWorkspaceReport(false).findings[0]?.id ?? "");
+  const [selectedFindingId, setSelectedFindingId] = useState<string>("");
   const [severityFilter, setSeverityFilter] = useState<"all" | Severity>("all");
   const [protocolFilter, setProtocolFilter] = useState("All protocols");
   const [packetSearch, setPacketSearch] = useState("");
@@ -271,8 +272,10 @@ function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileInspection, setFileInspection] = useState<CaptureHeaderInspection | null>(null);
   const [localPathInput, setLocalPathInput] = useState("");
+  const [localFileGrantToken, setLocalFileGrantToken] = useState<string | null>(null);
   const [resourceMode, setResourceMode] = useState<ResourceMode>("auto");
   const [triageEnabled, setTriageEnabled] = useState(true);
+  const [triageEndpointConsent, setTriageEndpointConsent] = useState(false);
   const [aiEnabled, setAiEnabled] = useState(false);
   const [aiConsent, setAiConsent] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
@@ -282,17 +285,26 @@ function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [localCsvProgress, setLocalCsvProgress] = useState<number | null>(null);
 
-  // Offline demo simulator fallback
-  const [demoRunning, setDemoRunning] = useState(false);
-  const [demoProgress, setDemoProgress] = useState(0);
   const [toast, setToast] = useState("");
 
   const uploadAbortRef = useRef<AbortController | null>(null);
   const pauseRequestedRef = useRef(false);
   const autoLoadedJobRef = useRef<string | null>(null);
   const userSetResourceModeRef = useRef(false);
+  const workspaceRefreshGenerationRef = useRef(0);
 
   const api = useMemo(() => new PcapApiClient(backendUrl, bearerToken), [backendUrl, bearerToken]);
+  const workspaceApiRef = useRef(api);
+  const consentPolicyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const nextPolicy = aiConfig?.policy_hash ?? null;
+    if (consentPolicyRef.current !== null && consentPolicyRef.current !== nextPolicy) {
+      setAiConsent(false);
+      setTriageEndpointConsent(false);
+    }
+    consentPolicyRef.current = nextPolicy;
+  }, [aiConfig?.policy_hash]);
 
   const activeFindingList = activeReport.findings;
   const selectedFinding: WorkspaceFinding | null =
@@ -327,13 +339,21 @@ function App() {
 
   const refreshWorkspace = useCallback(
     async (quiet = true) => {
+      const requestGeneration = ++workspaceRefreshGenerationRef.current;
+      if (workspaceApiRef.current !== api) {
+        workspaceApiRef.current = api;
+        setCapabilities(null);
+      }
       try {
         const health = await api.getHealth();
+        if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
         if (!health || health.status !== "ok") {
+          setCapabilities(null);
           setConnectionStatus("offline");
           return;
         }
         if (!bearerToken.trim()) {
+          setCapabilities(null);
           setConnectionStatus("auth_required");
           setConnectionError(
             health.authentication_configured
@@ -350,10 +370,12 @@ function App() {
           api.browseLocalCaptures(),
           api.listJobs(50),
         ]);
+        if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
 
         if (jobsRes.status === "rejected") {
           const reason = jobsRes.reason;
           if (reason instanceof ApiProblemError && (reason.status === 401 || reason.status === 403 || reason.status === 503)) {
+            setCapabilities(null);
             setConnectionStatus("auth_required");
             setConnectionError(reason.message);
             if (!quiet) setToast(reason.message);
@@ -373,7 +395,7 @@ function App() {
           ) {
             setResourceMode(serverMode);
           }
-        }
+        } else setCapabilities(null);
         if (wsRes.status === "fulfilled") setWorkspaceConfig(wsRes.value);
         if (cfgRes.status === "fulfilled") setAiConfig(cfgRes.value);
         if (modelsRes.status === "fulfilled") setAiModels(modelsRes.value);
@@ -381,9 +403,11 @@ function App() {
         setJobs(jobsRes.value);
         if (!quiet) setToast("เชื่อมต่อ FastAPI backend สำเร็จ");
       } catch (err) {
+        if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
+        setCapabilities(null);
         setConnectionStatus("offline");
         setConnectionError(safeFormatError(err));
-        if (!quiet) setToast("ไม่สามารถติดต่อ backend API — ใช้โหมด Local CSV หรือ Sample Preview ได้");
+        if (!quiet) setToast("ไม่สามารถติดต่อ backend API — เชื่อมต่อ Backend เพื่อดูคิวและวิเคราะห์ capture");
       }
     },
     [api, bearerToken],
@@ -435,9 +459,9 @@ function App() {
     return () => window.clearInterval(timer);
   }, [api, connectionStatus, hasRunningJobs, activeJobId, loadBackendReport]);
 
-  // Select first completed backend job automatically once connected if user is still looking at unmodified sample
+  // Select the first completed backend job automatically from the empty workspace state.
   useEffect(() => {
-    if (connectionStatus !== "connected" || jobs.length === 0 || activeReport.origin !== "sample") return;
+    if (connectionStatus !== "connected" || jobs.length === 0 || activeReport.origin !== "empty") return;
     const readyJob = jobs.find((j) => j.evidence_available);
     if (readyJob && autoLoadedJobRef.current !== readyJob.id) {
       autoLoadedJobRef.current = readyJob.id;
@@ -502,7 +526,11 @@ function App() {
     uploadAbortRef.current = controller;
 
     try {
-      const chunkSize = capabilities?.profiles[resourceMode]?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes ?? 8 * 1024 * 1024;
+      const chunkSize = capabilities?.profiles[resourceMode]?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes;
+      if (!chunkSize || !Number.isSafeInteger(chunkSize) || chunkSize <= 0) {
+        setToast("ไม่สามารถยืนยันขนาด chunk จาก Backend ได้ — โหลด capabilities ก่อนอัปโหลด");
+        return;
+      }
       const receipt = await api.uploadCapture(selectedFile, {
         chunkSizeBytes: chunkSize,
         resumeUploadId: resumeUploadId ?? undefined,
@@ -523,6 +551,7 @@ function App() {
         aiConsent,
         resourceMode,
         triageEnabled,
+        triageEndpointConsent,
       });
       autoLoadedJobRef.current = null;
       setActiveJobId(job.id);
@@ -571,7 +600,7 @@ function App() {
 
   const handleRegisterLocalCapture = async () => {
     const clean = localPathInput.trim();
-    if (!clean || isSubmitting) return;
+    if ((!clean && !localFileGrantToken) || isSubmitting) return;
     if (aiEnabled && !aiConsent) {
       setToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์");
       return;
@@ -581,22 +610,28 @@ function App() {
       return;
     }
     setIsSubmitting(true);
+    const fileGrantToken = localFileGrantToken;
     try {
-      const receipt = await api.registerLocalCapture(clean);
+      const receipt = await api.registerLocalCapture(
+        fileGrantToken ? { fileGrantToken } : { path: clean },
+      );
+      if (fileGrantToken) setLocalFileGrantToken(null);
       const job = await api.startAnalysis({
         captureId: receipt.capture_id,
         aiEnabled,
         aiConsent,
         resourceMode,
         triageEnabled,
+        triageEndpointConsent,
       });
       autoLoadedJobRef.current = null;
       setActiveJobId(job.id);
       const updated = await api.listJobs(50);
       setJobs(updated);
-      setToast(`ลงทะเบียนไฟล์ Zero-Copy (${formatBytes(receipt.size_bytes)}) และเข้าคิวงานแล้ว`);
+      setToast(`ลงทะเบียน local capture (${formatBytes(receipt.size_bytes)}) และเข้าคิวงานแล้ว`);
       navigate("jobs");
     } catch (err) {
+      if (fileGrantToken) setLocalFileGrantToken(null);
       setToast(safeFormatError(err));
     } finally {
       setIsSubmitting(false);
@@ -613,30 +648,6 @@ function App() {
     }
   };
 
-  const runDemo = () => {
-    if (demoRunning) return;
-    if (aiEnabled && !aiConsent) {
-      setToast("โปรดยืนยันการใช้ AI ก่อนเริ่ม sample preview");
-      return;
-    }
-    setDemoRunning(true);
-    setDemoProgress(0);
-    navigate("jobs");
-    let progress = 0;
-    const timer = window.setInterval(() => {
-      progress = Math.min(100, progress + 20);
-      setDemoProgress(progress);
-      if (progress >= 100) {
-        window.clearInterval(timer);
-        setDemoRunning(false);
-        const sample = demoAsWorkspaceReport(aiEnabled && aiConsent);
-        setActiveReport(sample);
-        setSelectedFindingId(sample.findings[0]?.id ?? "");
-        setToast("แสดงผล Sample Preview แล้ว");
-      }
-    }, 300);
-  };
-
   const openEvidence = (finding: WorkspaceFinding | null, evidenceId?: string) => {
     if (finding) {
       setSelectedFindingId(finding.id);
@@ -650,6 +661,10 @@ function App() {
   };
 
   const handleExport = async (kind: "json" | "markdown" | "triage-jsonl") => {
+    if (activeReport.origin === "empty") {
+      setToast("ยังไม่มีผลวิเคราะห์จริงให้ส่งออก");
+      return;
+    }
     const slug = activeReport.caseId.toLowerCase();
     if (kind === "json") {
       downloadTextFile(`${slug}-report.json`, exportReportJson(activeReport), "application/json");
@@ -721,11 +736,16 @@ function App() {
         setToast(`สลับ Data Directory เป็น ${res.selected_path} แล้ว (API และ Worker ซิงค์อัตโนมัติ)`);
       } else if (purpose === "capture_root") {
         setToast(`เพิ่มโฟลเดอร์ PCAP: ${res.selected_path}`);
-      } else if (purpose === "capture_file" && res.selected_path) {
-        setLocalPathInput(res.selected_path);
+      } else if (purpose === "capture_file") {
+        if (!res.file_grant_token) {
+          setToast("Backend ไม่ได้ออก one-time file grant; เลือกไฟล์ใหม่หรือตรวจรุ่น backend");
+          return;
+        }
+        setLocalFileGrantToken(res.file_grant_token);
+        setLocalPathInput(res.filename ?? "ไฟล์ capture ที่เลือก");
         setSourceTab("local");
         setToast(
-          `เลือก ${res.filename ?? res.selected_path}${res.size_bytes ? ` (${formatBytes(res.size_bytes)})` : ""} พร้อมกด Register & Analyze`,
+          `เลือก ${res.filename ?? "capture"}${res.size_bytes ? ` (${formatBytes(res.size_bytes)})` : ""}; สิทธิ์ไฟล์เดียวหมดอายุใน ${res.grant_expires_in_seconds ?? 300} วินาที และไม่เพิ่มโฟลเดอร์แม่`,
         );
       }
       await refreshWorkspace(true);
@@ -758,7 +778,7 @@ function App() {
     try {
       const ws = await api.updateWorkspaceConfig({ remove_local_ingest_root: rootPath });
       setWorkspaceConfig(ws);
-      setToast(`นำโฟลเดอร์ออกจากรายการ Zero-Copy แล้ว`);
+      setToast(`นำโฟลเดอร์ capture ออกจากรายการที่อนุญาตแล้ว`);
       await refreshWorkspace(true);
     } catch (err) {
       setToast(safeFormatError(err));
@@ -767,10 +787,10 @@ function App() {
 
   const pillClass =
     connectionStatus === "connected"
-      ? "mock-pill status-live"
+      ? "connection-pill status-live"
       : activeReport.origin === "local-csv"
-        ? "mock-pill status-local"
-        : "mock-pill";
+        ? "connection-pill status-local"
+        : "connection-pill";
   const pillLabel =
     connectionStatus === "connected"
       ? "LIVE API CONNECTED"
@@ -778,10 +798,14 @@ function App() {
         ? "TOKEN REQUIRED"
         : activeReport.origin === "local-csv"
           ? "BROWSER CSV ACTIVE"
-          : "SAMPLE PREVIEW · CONNECT";
+          : "API DISCONNECTED";
 
   const activeJobCount = jobs.filter((j) => ACTIVE_STATES.has(j.state)).length;
   const completedJobsForSwitcher = jobs.filter((j) => j.evidence_available);
+  const batchLimits = resolveBatchLimits(capabilities?.limits);
+  const batchMaxFiles = batchLimits?.maxFiles ?? null;
+  const batchMaxTotalBytes = batchLimits?.maxTotalBytes ?? null;
+  const batchMaxFileBytes = batchLimits?.maxFileBytes ?? null;
 
   return (
     <div className="app-shell">
@@ -801,9 +825,9 @@ function App() {
             aria-expanded={caseDropdownOpen}
             onClick={() => setCaseDropdownOpen((v) => !v)}
           >
-            <div className="case-avatar">{activeReport.origin === "live" ? "LV" : activeReport.origin === "local-csv" ? "CS" : "GW"}</div>
+            <div className="case-avatar">{activeReport.origin === "live" ? "LV" : activeReport.origin === "local-csv" ? "CS" : "—"}</div>
             <div className="case-meta">
-              <span>{activeReport.origin === "live" ? "LIVE CASE" : activeReport.origin === "local-csv" ? "LOCAL CSV CASE" : "SAMPLE CASE"}</span>
+              <span>{activeReport.origin === "live" ? "LIVE CASE" : activeReport.origin === "local-csv" ? "LOCAL CSV CASE" : "NO ACTIVE CASE"}</span>
               <strong>{activeReport.caseId}</strong>
             </div>
             <Icon name="chevron" size={15} />
@@ -844,19 +868,9 @@ function App() {
                   </small>
                 </button>
               )}
-              <button
-                type="button"
-                className={`case-option ${activeReport.origin === "sample" ? "case-option-active" : ""}`}
-                onClick={() => {
-                  setCaseDropdownOpen(false);
-                  const sample = demoAsWorkspaceReport(aiEnabled && aiConsent);
-                  setActiveReport(sample);
-                  setSelectedFindingId(sample.findings[0]?.id ?? "");
-                }}
-              >
-                <strong>Sample Preview (TEST-NET)</strong>
-                <small className="mono">4 canned findings · offline reference</small>
-              </button>
+              {completedJobsForSwitcher.length === 0 && !lastLocalCsvReport && (
+                <div className="case-dropdown-empty" role="status">ยังไม่มี case ที่วิเคราะห์เสร็จ</div>
+              )}
             </div>
           )}
         </div>
@@ -868,7 +882,7 @@ function App() {
               {group.items.map((item) => {
                 const badge =
                   item.id === "jobs"
-                    ? String(activeJobCount > 0 ? activeJobCount : demoRunning ? 1 : jobs.length)
+                    ? String(activeJobCount > 0 ? activeJobCount : jobs.length)
                     : item.id === "findings"
                       ? String(activeReport.findings.length)
                       : undefined;
@@ -897,7 +911,7 @@ function App() {
               <small>
                 {connectionStatus === "connected"
                   ? capabilities?.limits.unlimited_upload_enabled
-                    ? "Streaming chunked · unlimited disk"
+                    ? "Streaming chunked · disk-bounded"
                     : "Authenticated · bounded workers"
                   : "CSV runs local · connect API for PCAP"}
               </small>
@@ -956,18 +970,16 @@ function App() {
         </header>
 
         <main className="main-content">
-          {activeReport.origin === "sample" ? (
-            <div className="mock-banner">
+          {activeReport.origin === "empty" ? (
+            <div className="status-banner status-empty" role="status">
               <Icon name="info" size={16} />
-              <span>
-                <b>Sample Preview Active</b> — กำลังแสดงข้อมูลตัวอย่าง TEST-NET ({connectionStatus === "connected" ? "Backend เชื่อมต่อแล้ว พร้อมวิเคราะห์ไฟล์จริง" : "คุณสามารถลากไฟล์ .csv/.tsv เข้ามาสแกนในเบราว์เซอร์ได้ทันที หรือเชื่อม Backend เพื่อรัน .pcap/.pcapng ขนาดไม่จำกัด"})
-              </span>
+              <span><b>ยังไม่ได้เลือกผลวิเคราะห์</b> — เริ่มจากอัปโหลด PCAP/PCAPNG หรือเลือกงานที่เสร็จแล้วจากคิวงาน</span>
               <button onClick={() => navigate("analyze")} aria-label="ไปยังหน้าวิเคราะห์ไฟล์">
                 <Icon name="arrow" size={15} />
               </button>
             </div>
           ) : activeReport.origin === "local-csv" ? (
-            <div className="mock-banner banner-local">
+            <div className="status-banner banner-local">
               <Icon name="check" size={16} />
               <span>
                 <b>Browser CSV Streaming Result</b> — วิเคราะห์ <code>{activeReport.fileName}</code> ({formatCompactCount(activeReport.packetsAnalyzed)} packets) ในเบราว์เซอร์แบบไม่ส่งออกข้อมูล
@@ -977,7 +989,7 @@ function App() {
               </button>
             </div>
           ) : (
-            <div className="mock-banner banner-live">
+            <div className="status-banner banner-live">
               <Icon name="check" size={16} />
               <span>
                 <b>Live Capture Analysis</b> — <code>{activeReport.fileName}</code> ({activeReport.sizeLabel} · {formatCompactCount(activeReport.packetsAnalyzed)} packets · {activeReport.parsedPct} coverage)
@@ -994,6 +1006,7 @@ function App() {
 
           {screen === "analyze" && (
             <AnalyzePage
+              apiClient={api}
               connectionStatus={connectionStatus}
               connectionError={connectionError}
               capabilities={capabilities}
@@ -1007,14 +1020,23 @@ function App() {
               fileInspection={fileInspection}
               onFileSelect={handleFileSelect}
               localPathInput={localPathInput}
-              setLocalPathInput={setLocalPathInput}
+              setLocalPathInput={(value) => {
+                setLocalPathInput(value);
+                setLocalFileGrantToken(null);
+              }}
+              hasLocalFileGrant={Boolean(localFileGrantToken)}
               resourceMode={resourceMode}
               setResourceMode={(next) => {
                 userSetResourceModeRef.current = true;
                 setResourceMode(next);
               }}
               triageEnabled={triageEnabled}
-              setTriageEnabled={setTriageEnabled}
+              setTriageEnabled={(next) => {
+                setTriageEnabled(next);
+                if (!next) setTriageEndpointConsent(false);
+              }}
+              triageEndpointConsent={triageEndpointConsent}
+              setTriageEndpointConsent={setTriageEndpointConsent}
               aiEnabled={aiEnabled}
               setAiEnabled={(val) => {
                 setAiEnabled(val);
@@ -1035,8 +1057,11 @@ function App() {
               onRegisterLocalCapture={handleRegisterLocalCapture}
               onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
               onRemoveLocalRoot={(root) => void handleRemoveLocalRoot(root)}
-              onRunDemo={runDemo}
               onOpenConnectionModal={() => setConnectionModalOpen(true)}
+              batchMaxFiles={batchMaxFiles}
+              batchMaxTotalBytes={batchMaxTotalBytes}
+              batchMaxFileBytes={batchMaxFileBytes}
+              onOpenBatchJob={(id) => void loadBackendReport(id, "reports")}
             />
           )}
 
@@ -1047,8 +1072,6 @@ function App() {
               jobs={jobs}
               activeJobId={activeJobId}
               report={activeReport}
-              demoRunning={demoRunning}
-              demoProgress={demoProgress}
               aiEnabled={aiEnabled}
               onNavigate={navigate}
               onCancelJob={handleCancelJob}
@@ -1196,7 +1219,7 @@ function ConnectionModal({
                     ? "Backend online — Bearer token required"
                     : status === "checking"
                       ? "Checking backend health..."
-                      : "Backend offline — Browser CSV & Sample modes still work"}
+                      : "Backend offline — browser CSV analysis remains local-only"}
               </strong>
               {statusError && <small>{statusError}</small>}
               {capabilities && (
@@ -1245,8 +1268,8 @@ function ConnectionModal({
 
               <div className="workspace-picker-head workspace-roots-head">
                 <div>
-                  <strong>Zero-Copy Capture Folders (`PCAP_LOCAL_INGEST_ROOTS`)</strong>
-                  <small>โฟลเดอร์ที่อนุญาตให้อ่านไฟล์ PCAP/PCAPNG ขนาดใหญ่โดยตรงจากดิสก์</small>
+                  <strong>Authorized Local Capture Folders (`PCAP_LOCAL_INGEST_ROOTS`)</strong>
+                  <small>โฟลเดอร์ที่อนุญาตให้ backend ลงทะเบียน capture; worker จะสร้าง private verified snapshot ก่อน parse</small>
                 </div>
                 <button
                   type="button"
@@ -1441,8 +1464,8 @@ function OverviewPage({
       <section className="case-hero">
         <div className="hero-left">
           <div className="hero-topline">
-            <span className={`status-chip ${report.findings.length > 0 ? "status-review" : "status-complete"}`}>
-              <i /> {report.findings.length > 0 ? "REVIEW REQUIRED" : "NO SIGNALS FLAGGED"}
+            <span className={`status-chip ${report.findings.length > 0 || report.packetCapReached ? "status-review" : "status-complete"}`}>
+              <i /> {report.findings.length > 0 ? "REVIEW REQUIRED" : report.packetCapReached ? "PARTIAL — PACKET CAP" : "NO SIGNALS FLAGGED"}
             </span>
             <span className="hero-divider" />
             <span className="case-code mono">{report.caseId}</span>
@@ -1452,12 +1475,16 @@ function OverviewPage({
           <h2>
             {report.findings.length > 0
               ? `พบ ${report.findings.length} สัญญาณที่ควรตรวจสอบต่อ`
-              : "ไม่พบ anomaly ที่เกิน threshold ภายในขอบเขตที่ตรวจ"}
+              : report.packetCapReached
+                ? "ถึง packet cap — ยังสรุปความครอบคลุมของ capture ทั้งหมดไม่ได้"
+                : "ไม่พบ anomaly ที่เกิน threshold ภายในข้อมูลที่วิเคราะห์"}
           </h2>
           <p>
             {report.findings.length > 0
               ? `มี high ${highCount} รายการ, medium ${medCount} รายการ และ low ${lowCount} รายการ — ผล deterministic เป็นหลักฐานตั้งต้น ยังไม่ใช่ข้อยืนยัน intrusion`
-              : "ไม่มี finding ไม่ได้แปลว่า capture ปลอดภัย 100% — โปรดตรวจสอบ coverage warnings และ excluded stages"}
+              : report.packetCapReached
+                ? "ผลที่ไม่พบ finding ครอบคลุมเฉพาะ packets ที่วิเคราะห์ได้ ส่วนที่เหลือไม่ได้ตรวจ — อย่าตีความว่า capture ปลอดภัย"
+                : "ไม่มี finding ไม่ได้แปลว่า capture ปลอดภัย 100% — โปรดตรวจสอบ coverage warnings และ excluded stages"}
           </p>
           <div className="hero-actions">
             <button className="primary-button" onClick={() => onNavigate("findings")}>
@@ -1469,20 +1496,15 @@ function OverviewPage({
           </div>
         </div>
         <div className="hero-score">
-          <div
-            className="score-ring"
-            style={{
-              background: `conic-gradient(${report.priorityScore >= 60 ? "var(--amber)" : "var(--cyan)"} 0 ${report.priorityScore}%, #354a57 ${report.priorityScore}% 100%)`,
-            }}
-          >
+          <div className="score-ring finding-count-ring">
             <div>
-              <strong>{report.priorityScore}</strong>
-              <span>/100</span>
+              <strong>{formatCompactCount(report.findings.length)}</strong>
+              <span>items</span>
             </div>
           </div>
-          <span className="score-caption">Review priority</span>
+          <span className="score-caption">Deterministic findings</span>
           <span className="score-confidence">
-            <span /> {report.priorityConfidence}
+            <span /> {report.packetCapReached ? "Partial packet window" : "Not an intrusion verdict"}
           </span>
         </div>
         <div className="hero-watermark">
@@ -1499,7 +1521,7 @@ function OverviewPage({
         <MetricCard
           label="PACKETS ANALYZED"
           value={formatCompactCount(report.packetsAnalyzed)}
-          note={`${report.parsedPct} of ${formatCompactCount(report.packetsSeen)} seen`}
+          note={packetCoverageSummary(report)}
           icon="packets"
           tone="blue"
         />
@@ -1534,7 +1556,7 @@ function OverviewPage({
         <section className="panel triage-panel">
           <div className="triage-panel-head">
             <div>
-              <div className="section-kicker">TIER-1 FAST CLASSIFIER · CONTEXT REDUCTION FOR BIG AI</div>
+              <div className="section-kicker">TIER-1 CLASSIFIER · EVIDENCE BUDGET</div>
               <h2>
                 {report.triage.model} <span className="mono">({report.triage.mode})</span>
               </h2>
@@ -1603,7 +1625,11 @@ function OverviewPage({
           />
           <div className="mini-finding-list">
             {report.findings.length === 0 ? (
-              <div className="empty-state">ไม่พบ deterministic finding ใน capture นี้</div>
+              <div className="empty-state">
+                {report.packetCapReached
+                  ? "ไม่พบ finding ใน packets ที่วิเคราะห์; packet cap reached และส่วนที่เหลือยังไม่ถูกประเมิน"
+                  : "ไม่พบ deterministic finding ในข้อมูลที่วิเคราะห์"}
+              </div>
             ) : (
               report.findings.slice(0, 4).map((finding) => (
                 <button key={finding.id} className="mini-finding" onClick={() => onSelectFinding(finding)}>
@@ -1686,10 +1712,10 @@ function OverviewPage({
             <Icon name="shield" size={15} />
             <span>
               {report.origin === "live"
-                ? "Analyzed offline inside bounded parser worker; Tier-1 classifier reduces Big AI payload."
+                ? "วิเคราะห์ offline ใน parser worker ที่จำกัดทรัพยากร; จะส่งเฉพาะ minimized structured evidence เมื่อเปิด AI พร้อม consent"
                 : report.origin === "local-csv"
                   ? "Streamed 100% locally inside your browser; zero bytes uploaded."
-                  : "Sample preview addresses belong to RFC 5737 documentation ranges."}
+                  : "No analysis is selected."}
             </span>
           </div>
         </section>
@@ -1699,6 +1725,7 @@ function OverviewPage({
 }
 
 function AnalyzePage({
+  apiClient,
   connectionStatus,
   connectionError,
   capabilities,
@@ -1713,10 +1740,13 @@ function AnalyzePage({
   onFileSelect,
   localPathInput,
   setLocalPathInput,
+  hasLocalFileGrant,
   resourceMode,
   setResourceMode,
   triageEnabled,
   setTriageEnabled,
+  triageEndpointConsent,
+  setTriageEndpointConsent,
   aiEnabled,
   setAiEnabled,
   aiConsent,
@@ -1734,9 +1764,13 @@ function AnalyzePage({
   onRegisterLocalCapture,
   onPickNativePath,
   onRemoveLocalRoot,
-  onRunDemo,
   onOpenConnectionModal,
+  batchMaxFiles,
+  batchMaxTotalBytes,
+  batchMaxFileBytes,
+  onOpenBatchJob,
 }: {
+  apiClient: PcapApiClient;
   connectionStatus: ConnectionStatus;
   connectionError: string;
   capabilities: SystemCapabilities | null;
@@ -1751,10 +1785,13 @@ function AnalyzePage({
   onFileSelect: (file: File | null) => Promise<void>;
   localPathInput: string;
   setLocalPathInput: (val: string) => void;
+  hasLocalFileGrant: boolean;
   resourceMode: ResourceMode;
   setResourceMode: (mode: ResourceMode) => void;
   triageEnabled: boolean;
   setTriageEnabled: (val: boolean) => void;
+  triageEndpointConsent: boolean;
+  setTriageEndpointConsent: (val: boolean) => void;
   aiEnabled: boolean;
   setAiEnabled: (val: boolean) => void;
   aiConsent: boolean;
@@ -1772,19 +1809,29 @@ function AnalyzePage({
   onRegisterLocalCapture: () => void;
   onPickNativePath: (purpose: NativePickPurpose) => void;
   onRemoveLocalRoot: (root: string) => void;
-  onRunDemo: () => void;
   onOpenConnectionModal: () => void;
+  batchMaxFiles: number | null;
+  batchMaxTotalBytes: number | null;
+  batchMaxFileBytes: number | null;
+  onOpenBatchJob: (analysisId: string) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [dragging, setDragging] = useState(false);
 
-  const profiles = capabilities?.profiles ?? DEFAULT_PROFILE_ESTIMATES;
-  const activeProfile = profiles[resourceMode];
+  const profiles = capabilities?.profiles ?? null;
+  const activeProfile = profiles?.[resourceMode] ?? null;
   const isCsvSelected = fileInspection?.detectedFormat === "csv" || fileInspection?.detectedFormat === "tsv";
-  const effectiveChunkSize = activeProfile?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes ?? 8 * 1024 * 1024;
+  const effectiveChunkSize = activeProfile?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes ?? null;
   const canStartBackendAi = Boolean(aiConfig?.configuration.enabled && aiConfig?.configuration.model);
+  const triageEndpointConfigured = Boolean(
+    aiConfig?.triage?.endpoint_configured || aiConfig?.triage?.etbert_endpoint_configured,
+  );
+  const triageEndpointTargets = [
+    aiConfig?.triage?.endpoint_url ? `OpenJev ${safeEndpointOrigin(aiConfig.triage.endpoint_url) ?? "configured endpoint"}` : null,
+    aiConfig?.triage?.etbert_endpoint_url ? `ET-BERT ${safeEndpointOrigin(aiConfig.triage.etbert_endpoint_url) ?? "configured endpoint"}` : null,
+  ].filter((value): value is string => Boolean(value));
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
-  const nativePickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? true;
+  const nativePickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? false;
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -1803,7 +1850,7 @@ function AnalyzePage({
       <PageHeading
         eyebrow="ANALYSIS / NEW RUN"
         title="วิเคราะห์ network capture"
-        detail="รองรับอัปโหลดไฟล์ขนาดไม่จำกัดแบบ Resumable Chunked Upload, Zero-Copy Local Server Path และการสแกน Wireshark CSV/TSV ในเบราว์เซอร์"
+        detail="รองรับ bounded resumable upload, private local-capture snapshots และการวิเคราะห์ Wireshark CSV/TSV ในเบราว์เซอร์"
         actions={
           <button type="button" className="secondary-button" onClick={onOpenConnectionModal}>
             <Icon name="activity" size={15} /> {connectionStatus === "connected" ? "Workspace & Folders" : "Connect Backend"}
@@ -1817,12 +1864,12 @@ function AnalyzePage({
           <strong>
             {capabilities
               ? `${capabilities.host.cpu_count} vCPU · ${capabilities.host.effective_memory_mb} MB RAM`
-              : "Probe offline (Connect API)"}
+              : "เชื่อมต่อ API เพื่ออ่าน resource limits"}
           </strong>
           <small>
             {capabilities?.host.cgroup_memory_limit_mb
               ? `cgroup capped (${capabilities.host.cgroup_memory_limit_mb} MB)`
-              : "Scales chunk & flow memory dynamically"}
+              : "ยังไม่มีข้อมูล resource จาก Backend"}
           </small>
         </div>
         <div className="hw-item">
@@ -1830,15 +1877,15 @@ function AnalyzePage({
           <strong>
             {capabilities
               ? capabilities.limits.unlimited_upload_enabled
-                ? `Unlimited (${formatBytes(capabilities.limits.effective_storage_max_bytes)} free)`
+                ? `ไม่กำหนดเพดานตายตัว · พื้นที่พร้อมใช้งาน ${formatBytes(capabilities.limits.effective_storage_max_bytes)}`
                 : formatBytes(capabilities.limits.effective_upload_max_bytes)
-              : "Resumable File.slice()"}
+              : "เชื่อมต่อ API เพื่ออ่าน upload limits"}
           </strong>
           <small className="hw-subline">
             <span className="mono" title={resolvedDataDir || undefined}>
               {resolvedDataDir
-                ? `Data: ${resolvedDataDir} · Chunk ${formatBytes(effectiveChunkSize)}`
-                : `Chunk size: ${formatBytes(effectiveChunkSize)} · Disk reserve protected`}
+                ? `Data: ${resolvedDataDir} · Chunk ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`
+                : `Chunk size: ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"} · Disk reserve status from Backend`}
             </span>
             {connectionStatus === "connected" && nativePickerAvailable && (
               <button
@@ -1856,7 +1903,7 @@ function AnalyzePage({
           <span>PARSERS &amp; TIER-1</span>
           <strong>
             {capabilities
-              ? `TShark ${capabilities.host.tshark_available ? "Ready" : "Missing"} · Zeek ${capabilities.host.zeek_available ? "Ready" : "Off"}`
+              ? `TShark ${capabilities.host.tshark_available ? "Ready" : "Missing"} · Zeek ${capabilities.host.zeek_available ? "Ready" : "Off"} · YARA ${capabilities.host.yara_available ? "Ready" : "Off"}`
               : "CSV Engine Ready · TShark via API"}
           </strong>
           <small>Tier-1 classifier: {capabilities?.triage.model_name ?? "openjev-cal-tier1"}</small>
@@ -1889,7 +1936,7 @@ function AnalyzePage({
                   className={sourceTab === "local" ? "segment-active" : ""}
                   onClick={() => setSourceTab("local")}
                 >
-                  Local Server Path (Zero-Copy)
+                  Local Capture (Verified Snapshot)
                 </button>
               </div>
             </div>
@@ -1922,8 +1969,8 @@ function AnalyzePage({
                   </strong>
                   <span>
                     {fileInspection
-                      ? `ตรวจพบ: ${fileInspection.label}${selectedFile && selectedFile.size > effectiveChunkSize ? ` · ส่งทีละ ${formatBytes(effectiveChunkSize)} chunk` : ""}`
-                      : "สตรีมด้วย File.slice() + Priority Eviction O(K) RAM รองรับไฟล์ขนาดใหญ่ไม่จำกัด"}
+                      ? `ตรวจพบ: ${fileInspection.label}${selectedFile && effectiveChunkSize && selectedFile.size > effectiveChunkSize ? ` · ส่งทีละ ${formatBytes(effectiveChunkSize)} chunk` : ""}`
+                      : "Frontend ตรวจ file signature; Backend ใช้ขนาดอัปโหลดและ resource limits ตามการตั้งค่า"}
                   </span>
 
                   <div className="dropzone-actions">
@@ -1967,12 +2014,7 @@ function AnalyzePage({
                   )}
 
                   {!selectedFile && (
-                    <div className="dropzone-sample-row">
-                      <small>ไม่มีไฟล์ทดสอบ?</small>
-                      <button type="button" className="text-button" onClick={onRunDemo}>
-                        <Icon name="play" size={13} /> รัน Sample Preview
-                      </button>
-                    </div>
+                    <div className="dropzone-empty-hint">ยังไม่มีไฟล์ — เลือก PCAP/PCAPNG หรือ Wireshark CSV/TSV เพื่อเริ่ม</div>
                   )}
                 </div>
 
@@ -2025,7 +2067,7 @@ function AnalyzePage({
               <div className="local-ingest-box">
                 {connectionStatus !== "connected" ? (
                   <div className="consent-required">
-                    ต้องเชื่อมต่อ Backend API ก่อนจึงจะเลือกโฟลเดอร์และอ่านไฟล์ Zero-Copy จากเครื่องได้{" "}
+                    ต้องเชื่อมต่อ Backend API ก่อนจึงจะเลือกไฟล์ local และสร้าง private snapshot เพื่อวิเคราะห์ได้{" "}
                     <button type="button" className="text-button" onClick={onOpenConnectionModal}>
                       ตั้งค่าการเชื่อมต่อ <Icon name="arrow" size={13} />
                     </button>
@@ -2065,12 +2107,28 @@ function AnalyzePage({
 
                     {!localBrowse?.enabled ? (
                       <div className="consent-required">
-                        <strong>ยังไม่มีโฟลเดอร์ Zero-Copy — กด &quot;เลือกไฟล์ Capture (Popup)&quot; หรือ &quot;+ เพิ่มโฟลเดอร์ PCAP (Popup)&quot; ด้านบนได้เลย</strong>
+                        <strong>ยังไม่มี local capture folder — กด &quot;เลือกไฟล์ Capture (Popup)&quot; หรือ &quot;+ เพิ่มโฟลเดอร์ PCAP (Popup)&quot; ด้านบนได้เลย</strong>
                         <span>
                           {nativePickerAvailable
-                            ? "ไม่ต้องพิมพ์คำสั่ง export: เมื่อเลือกไฟล์ .pcap / .pcapng / .cap / .csv จาก Finder หรือ File Manager ระบบจะอนุญาตโฟลเดอร์นั้นให้อัตโนมัติ"
+                            ? "การเลือกไฟล์ให้สิทธิ์อ่านเฉพาะไฟล์นั้นครั้งเดียว นาน 5 นาที; จะไม่เพิ่มโฟลเดอร์แม่ใน allowlist"
                             : "Environment ปัจจุบันไม่มีหน้าต่าง GUI Picker — กรอก path ใน Workspace & Folders หรือตั้ง env ก่อนสตาร์ทเซิร์ฟเวอร์"}
                         </span>
+                        <div className="local-path-row">
+                          <input
+                            type="text"
+                            value={localPathInput}
+                            onChange={(e) => setLocalPathInput(e.target.value)}
+                            placeholder={hasLocalFileGrant ? "ไฟล์ที่เลือกผ่าน native picker" : "เลือกไฟล์ผ่าน Popup หรือเพิ่ม allowlisted folder ก่อนกรอก path"}
+                          />
+                          <button
+                            type="button"
+                            className="primary-button"
+                            disabled={(!hasLocalFileGrant && !localPathInput.trim()) || isSubmitting}
+                            onClick={onRegisterLocalCapture}
+                          >
+                            <Icon name="play" size={15} /> Register &amp; Analyze
+                          </button>
+                        </div>
                         {!nativePickerAvailable && (
                           <code>export PCAP_LOCAL_INGEST_ROOTS="/data/pcaps,/home/user/captures"</code>
                         )}
@@ -2139,42 +2197,52 @@ function AnalyzePage({
               </div>
             )}
 
-            <div className="upload-foot">
+          <div className="upload-foot">
               <span>
                 <Icon name="shield" size={15} /> พาสเวิร์ด, cookies และ raw payloads จะไม่ถูกส่งออกจาก parser หรือส่งเข้า AI LLM
               </span>
               <span className="muted">
                 {connectionStatus !== "connected" && connectionError ? connectionError : "SHA-256 provenance tracked per capture"}
               </span>
-            </div>
-          </section>
+          </div>
+        </section>
+
+        <BatchIntakePanel
+          api={apiClient}
+          connected={connectionStatus === "connected"}
+          maxFiles={batchMaxFiles}
+          maxTotalBytes={batchMaxTotalBytes}
+          maxFileBytes={batchMaxFileBytes}
+          onOpenJob={onOpenBatchJob}
+        />
 
           <section className="panel options-panel">
             <div className="upload-head">
               <div>
-                <div className="section-kicker">02 / ADAPTIVE SCALING &amp; TIER-1 + BIG AI</div>
-                <h2>ปรับกำลังเครื่องและลดบริบทก่อนถึง AI</h2>
-                <p>ตัวคัดกรอง Tier-1 (OpenJev RL+LoRA) ช่วยกรอง Benign flows ก่อนส่งสรุปให้ Big AI ของผู้ใช้ เพื่อไม่ให้ล้น Context Window</p>
+                <div className="section-kicker">02 / RESOURCE LIMITS &amp; OPTIONAL AI</div>
+                <h2>ควบคุม resource และข้อมูลก่อนส่ง provider</h2>
+                <p>Tier-1 ใช้ local classifier เป็นค่าเริ่มต้น; HTTP endpoint ต้องผ่าน allowlist และ consent ต่อ analysis; AI narrator แยก consent อีกชั้นและรับเฉพาะ minimized structured evidence</p>
               </div>
               <span className="step-tag">PIPELINE</span>
             </div>
 
             <div className="profile-grid" role="radiogroup" aria-label="Resource execution profile">
               {(["auto", "fast", "deep", "unlimited"] as ResourceMode[]).map((mode) => {
-                const prof = profiles[mode];
+                const prof = profiles?.[mode] ?? null;
                 const titleMap: Record<ResourceMode, string> = {
                   auto: "Auto (Device-Adaptive)",
                   fast: "Fast Triage",
                   deep: "Deep Capture",
-                  unlimited: "Unlimited Stream",
+                  unlimited: "Max Server-Bounded",
                 };
                 return (
                   <button
                     type="button"
                     key={mode}
                     role="radio"
-                    aria-checked={resourceMode === mode}
+                    aria-checked={Boolean(prof) && resourceMode === mode}
                     className={`profile-option ${resourceMode === mode ? "profile-option-active" : ""}`}
+                    disabled={!prof}
                     onClick={() => setResourceMode(mode)}
                   >
                     <div className="profile-option-head">
@@ -2182,11 +2250,12 @@ function AnalyzePage({
                       <span className="mono">{mode.toUpperCase()}</span>
                     </div>
                     <small className="mono">
-                      {prof.packet_limit === 0 ? "All packets (∞ stream)" : `${formatCompactCount(prof.packet_limit)} pkts`} ·{" "}
-                      {formatCompactCount(prof.flow_limit)} priority flows
+                      {prof
+                        ? `${prof.packet_limit === 0 ? "All packets (∞ stream)" : `${formatCompactCount(prof.packet_limit)} pkts`} · ${formatCompactCount(prof.flow_limit)} flows`
+                        : "Limits unavailable until Backend capabilities load"}
                     </small>
                     <small>
-                      RAM {prof.parser_memory_mb} MB · Timeout {formatDuration(prof.timeout_seconds)}
+                      {prof ? `RAM ${prof.parser_memory_mb} MB · Timeout ${formatDuration(prof.timeout_seconds)}` : "No estimate is shown without server data"}
                     </small>
                   </button>
                 );
@@ -2198,9 +2267,9 @@ function AnalyzePage({
                 <Icon name="nodes" size={18} />
               </div>
               <div className="option-copy">
-                <strong id="triage-label">Tier-1 OpenJev Fast Classifier + Pre-AI Compactor</strong>
+                <strong id="triage-label">Tier-1 local classifier + Pre-AI Compactor</strong>
                 <span id="triage-help">
-                  จำแนก L2–L7 flows (Confidence p + Perplexity), กรอง Benign ซ้ำซ้อนก่อนถึง LLM และส่งออก triage.jsonl สำหรับเทรนต่อได้
+                  ใช้ local heuristic เมื่อเปิดใช้; network endpoint แยก consent ต่อ analysis และไม่เปิดโดยปริยาย
                 </span>
               </div>
               <label className="switch">
@@ -2214,6 +2283,24 @@ function AnalyzePage({
                 <span />
               </label>
             </div>
+
+            {triageEnabled && triageEndpointConfigured && (
+              <div className="ai-config-callout">
+                <div className="consent-required">
+                  <strong>Tier-1 endpoint configured</strong>
+                  <span>ค่าเริ่มต้นจะไม่ส่ง network request. เมื่อยินยอม จะส่งเฉพาะ pseudonymized, allowlisted flow features ไปยัง endpoint ที่ผู้ดูแลกำหนด — ไม่ส่งไฟล์ PCAP หรือ packet payload.</span>
+                  <span className="mono">ปลายทาง: {triageEndpointTargets.join(" · ") || "configured endpoint"}</span>
+                </div>
+                <label className="consent-choice">
+                  <input
+                    type="checkbox"
+                    checked={triageEndpointConsent}
+                    onChange={(e) => setTriageEndpointConsent(e.target.checked)}
+                  />
+                  <span>ยินยอมให้ analysis นี้เรียก Tier-1 endpoint ที่กำหนดไว้</span>
+                </label>
+              </div>
+            )}
 
             <div className="option-row option-row-last">
               <div className="option-symbol ai-symbol">
@@ -2248,11 +2335,11 @@ function AnalyzePage({
                 ) : (
                   <>
                     <div className="ai-meta-grid mono">
-                      <span>Provider: {aiConfig?.configuration.provider ?? "sample/env-configured"}</span>
+                  <span>Provider: {aiConfig?.configuration.provider ?? "server-configured"}</span>
                       <span>Model: {aiConfig?.configuration.model ?? "server PCAP_AI_MODEL"}</span>
                       <span>
-                        Context Budget: {aiConfig?.configuration.context_window_tokens ?? 16384} tok /{" "}
-                        {formatBytes(aiConfig?.configuration.input_max_bytes ?? 100000)}
+                        Context Budget: {aiConfig?.configuration.context_window_tokens ?? "unreported"} tok /{" "}
+                        {aiConfig?.configuration.input_max_bytes ? formatBytes(aiConfig.configuration.input_max_bytes) : "unreported"}
                       </span>
                       {aiModels && <span>Discovered models: {aiModels.items.length}</span>}
                     </div>
@@ -2276,7 +2363,7 @@ function AnalyzePage({
 
         <aside className="panel run-summary">
           <div className="summary-kicker">ACTIVE EXECUTION PLAN</div>
-          <h2>{resourceMode.toUpperCase()} Profile</h2>
+          <h2>{activeProfile ? `${resourceMode.toUpperCase()} Profile` : "Resource limits unavailable"}</h2>
           <p className="summary-description">Pipeline แบบ Asynchronous + Streaming Priority Eviction</p>
           <div className="profile-stage-list">
             <div>
@@ -2287,7 +2374,9 @@ function AnalyzePage({
             <div>
               <span className="profile-index">02</span>
               <span>
-                {activeProfile.packet_limit === 0 ? "∞ Streaming TShark/CSV" : `≤ ${formatCompactCount(activeProfile.packet_limit)} pkts`}
+                {activeProfile
+                  ? activeProfile.packet_limit === 0 ? "∞ Streaming TShark/CSV" : `≤ ${formatCompactCount(activeProfile.packet_limit)} pkts`
+                  : "Packet limit unavailable until Backend capabilities load"}
               </span>
               <span className="profile-required">STREAM</span>
             </div>
@@ -2298,7 +2387,7 @@ function AnalyzePage({
             </div>
             <div>
               <span className="profile-index">04</span>
-              <span>Tier-1 OpenJev Triage &amp; Compact</span>
+              <span>Tier-1 local heuristics / optional endpoint</span>
               <span className={triageEnabled ? "profile-required" : "profile-optional"}>
                 {triageEnabled ? "ON" : "OFF"}
               </span>
@@ -2315,7 +2404,9 @@ function AnalyzePage({
             <div>
               <strong>Device-Scaled Memory</strong>
               <span>
-                จัดสรร {activeProfile.parser_memory_mb} MB RAM, เก็บสูงสุด {formatCompactCount(activeProfile.flow_limit)} priority flows เพื่อไม่ให้ค้างเมื่อไฟล์ใหญ่
+                {activeProfile
+                  ? `Backend กำหนด ${activeProfile.parser_memory_mb} MB RAM และ flow cap ${formatCompactCount(activeProfile.flow_limit)} รายการ`
+                  : "ยังไม่แสดงค่าประมาณ — เชื่อมต่อ Backend เพื่ออ่านขีดจำกัดจริง"}
               </span>
             </div>
           </div>
@@ -2347,12 +2438,10 @@ function AnalyzePage({
               disabled={isSubmitting}
               onClick={onRegisterLocalCapture}
             >
-              <Icon name="play" size={15} /> Run Zero-Copy Analysis
+              <Icon name="play" size={15} /> Analyze Local Capture
             </button>
           ) : (
-            <button type="button" className="secondary-button full-button" onClick={onRunDemo}>
-              <Icon name="play" size={15} /> ทดสอบ Sample Preview
-            </button>
+            <div className="empty-state">เลือก capture จริงก่อนเริ่มวิเคราะห์</div>
           )}
         </aside>
       </div>
@@ -2366,8 +2455,6 @@ function JobsPage({
   jobs,
   activeJobId,
   report,
-  demoRunning,
-  demoProgress,
   aiEnabled,
   onNavigate,
   onCancelJob,
@@ -2379,8 +2466,6 @@ function JobsPage({
   jobs: JobSummary[];
   activeJobId: string | null;
   report: WorkspaceReport;
-  demoRunning: boolean;
-  demoProgress: number;
   aiEnabled: boolean;
   onNavigate: (screen: Screen) => void;
   onCancelJob: (id: string) => Promise<void>;
@@ -2392,13 +2477,9 @@ function JobsPage({
 
   const focusedJob = jobs.find((j) => j.id === activeJobId) ?? jobs[0] ?? null;
 
-  // Map focused job state or demo progress to the 7-step lifecycle diagram
-  let lifecycleCurrent = 6;
-  let lifecycleTag = report.origin.toUpperCase();
-  if (demoRunning) {
-    lifecycleCurrent = Math.min(5, Math.floor((demoProgress / 100) * 6));
-    lifecycleTag = `DEMO ${demoProgress}%`;
-  } else if (focusedJob) {
+  let lifecycleCurrent = 0;
+  let lifecycleTag = focusedJob?.state.toUpperCase() ?? "IDLE";
+  if (focusedJob) {
     lifecycleTag = `${focusedJob.state.toUpperCase()}`;
     if (focusedJob.state === "queued") lifecycleCurrent = 0;
     else if (focusedJob.state === "parsing") lifecycleCurrent = 2;
@@ -2416,10 +2497,7 @@ function JobsPage({
     "Complete",
   ];
 
-  const displayedStages: WorkspaceStage[] =
-    report.origin === "sample" && demoRunning
-      ? sampleStages.map((s) => ({ ...s, status: "running" as const }))
-      : report.stages;
+  const displayedStages: WorkspaceStage[] = report.stages;
 
   return (
     <>
@@ -2444,8 +2522,8 @@ function JobsPage({
       <div className="jobs-summary">
         <div className="queue-stat">
           <span>ACTIVE JOBS</span>
-          <strong>{String(activeCount + (demoRunning ? 1 : 0)).padStart(2, "0")}</strong>
-          <small>{connectionStatus === "connected" ? "Live worker queue" : "Offline preview"}</small>
+          <strong>{String(activeCount).padStart(2, "0")}</strong>
+          <small>{connectionStatus === "connected" ? "Live worker queue" : "Backend connection required"}</small>
         </div>
         <div className="queue-stat">
           <span>COMPLETED / PARTIAL</span>
@@ -2455,7 +2533,7 @@ function JobsPage({
         <div className="queue-stat queue-capacity">
           <span>FREE DISK HEADROOM</span>
           <strong>{capabilities ? formatBytes(capabilities.limits.effective_storage_max_bytes) : "Adaptive"}</strong>
-          <small>{capabilities?.limits.unlimited_upload_enabled ? "Unlimited disk-bounded" : "Policy quota active"}</small>
+          <small>{capabilities?.limits.unlimited_upload_enabled ? "No fixed cap · disk reserve enforced" : "Policy quota active"}</small>
         </div>
         <div className="queue-note">
           <Icon name="info" size={17} />
@@ -2470,13 +2548,13 @@ function JobsPage({
             <h2>
               {focusedJob
                 ? `${focusedJob.capture_filename ?? focusedJob.id.slice(0, 8)} (${focusedJob.resource_mode ?? "auto"})`
-                : report.fileName}
+                : report.origin === "empty" ? "ยังไม่มี active job" : report.fileName}
             </h2>
           </div>
-          <span className="lifecycle-demo-tag">{lifecycleTag}</span>
+          <span className="lifecycle-status-tag">{lifecycleTag}</span>
         </div>
         <div className="lifecycle-track">
-          {lifecycleSteps.map((label, index) => {
+          {focusedJob ? lifecycleSteps.map((label, index) => {
             const optionalOff = index === 5 && !(focusedJob ? focusedJob.ai_enabled : aiEnabled);
             const state = optionalOff
               ? "skipped"
@@ -2491,7 +2569,7 @@ function JobsPage({
                 <span>{label}</span>
               </div>
             );
-          })}
+          }) : <div className="empty-state">ยังไม่มี lifecycle ของ job จริงให้แสดง</div>}
         </div>
         <div className="terminal-outcomes">
           <span>Terminal states</span>
@@ -2526,37 +2604,7 @@ function JobsPage({
             </thead>
             <tbody>
               {jobs.length === 0 ? (
-                <tr>
-                  <td>
-                    <div className="job-name">
-                      <div className="file-icon">
-                        <Icon name="file" size={17} />
-                      </div>
-                      <span>
-                        <strong>{report.fileName}</strong>
-                        <small className="mono">
-                          {report.caseId} · {report.origin}
-                        </small>
-                      </span>
-                    </div>
-                  </td>
-                  <td className="mono">{report.origin}</td>
-                  <td>
-                    <span className={`job-status ${demoRunning ? "job-running" : "job-done"}`}>
-                      <i />
-                      {demoRunning ? `Demo ${demoProgress}%` : report.status}
-                    </span>
-                  </td>
-                  <td className="mono">
-                    {formatCompactCount(report.packetsAnalyzed)} pkts · {report.findings.length} findings
-                  </td>
-                  <td className="mono">{formatUtcShort(report.createdAt)}</td>
-                  <td>
-                    <button className="secondary-button tiny-btn" onClick={() => onNavigate("findings")}>
-                      Inspect
-                    </button>
-                  </td>
-                </tr>
+                <tr><td colSpan={6}><div className="empty-state">ยังไม่มี job จาก backend — เลือกวิเคราะห์ capture เพื่อสร้างงานจริง</div></td></tr>
               ) : (
                 jobs.map((job) => {
                   const active = ACTIVE_STATES.has(job.state);
@@ -2582,7 +2630,7 @@ function JobsPage({
                             <small className="mono">
                               {job.id.slice(0, 8)} ·{" "}
                               {job.capture_size_bytes ? formatBytes(job.capture_size_bytes) : "capture"}
-                              {job.capture_source_kind === "local" ? " · zero-copy" : ""}
+                              {job.capture_source_kind === "local" ? " · verified snapshot" : ""}
                             </small>
                           </span>
                         </div>
@@ -3330,10 +3378,15 @@ function ReportsPage({
 
           <div className="report-section" id="report-assessment">
             <span className="section-kicker">01 / ASSESSMENT</span>
-            <h2>{report.findings.length > 0 ? "Signals require analyst review" : "No high-threshold signals triggered"}</h2>
+            <h2>
+              {report.findings.length > 0
+                ? "Signals require analyst review"
+                : report.packetCapReached
+                  ? "Packet cap reached — capture only partially assessed"
+                  : "No high-threshold signals triggered in the analyzed data"}
+            </h2>
             <p>
-              วิเคราะห์ทั้งหมด {formatCompactCount(report.packetsAnalyzed)} packets ({report.parsedPct} coverage) และพบ{" "}
-              {report.findings.length} deterministic findings ภายในขอบเขตของ pipeline นี้
+              {packetCoverageSummary(report)} พบ {report.findings.length} deterministic findings ภายในขอบเขตของ pipeline นี้
             </p>
             <div className="report-verdict">
               <div className="verdict-icon">
@@ -3341,7 +3394,7 @@ function ReportsPage({
               </div>
               <div>
                 <strong>{report.disclaimer}</strong>
-                <span>Origin: {report.origin} · Priority: {report.priorityScore}/100 ({report.priorityConfidence})</span>
+                <span>Origin: {report.origin} · {packetCoverageSummary(report)}</span>
               </div>
             </div>
           </div>
@@ -3350,7 +3403,11 @@ function ReportsPage({
             <span className="section-kicker">02 / DETECTOR EVIDENCE ({report.findings.length})</span>
             <h3>สิ่งที่ระบบตรวจพบจาก capture</h3>
             {report.findings.length === 0 ? (
-              <p className="muted">ไม่พบ deterministic anomaly ที่เกิน threshold</p>
+              <p className="muted">
+                {report.packetCapReached
+                  ? "ไม่พบ threshold finding ใน packets ที่วิเคราะห์; capture ที่เหลือยังไม่ถูกประเมิน"
+                  : "ไม่พบ deterministic anomaly ที่เกิน threshold ในข้อมูลที่วิเคราะห์"}
+              </p>
             ) : (
               <div className="report-finding-list">
                 {report.findings.map((finding) => (
@@ -3400,8 +3457,8 @@ function ReportsPage({
                 </span>
                 {report.ai?.context_reduction && (
                   <span>
-                    Pre-AI Pack: sent {report.ai.context_reduction.sent_evidence_count ?? 0} of{" "}
-                    {report.ai.context_reduction.raw_evidence_count ?? 0} records to prevent Big AI out-of-context overflow
+                    Pre-AI evidence budget: selected {report.ai.context_reduction.sent_evidence_count ?? 0} of{" "}
+                    {report.ai.context_reduction.raw_evidence_count ?? 0} structured records; evidence references are retained
                   </span>
                 )}
               </div>
@@ -3409,7 +3466,15 @@ function ReportsPage({
 
             {aiActive && report.ai?.report ? (
               <div className="ai-narrative">
-                <p>{report.ai.report.summary}</p>
+                <ul className="ai-summary-list">
+                  {report.ai.report.summary.map((claim, idx) => (
+                    <li key={idx}>
+                      {claim.claim} {claim.evidence_ids.map((eid) => (
+                        <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
+                      ))}
+                    </li>
+                  ))}
+                </ul>
                 {report.ai.report.assessments.length > 0 && (
                   <ul className="ai-assessment-list">
                     {report.ai.report.assessments.map((a) => (
@@ -3424,15 +3489,30 @@ function ReportsPage({
                     ))}
                   </ul>
                 )}
+                {report.ai.report.limitations.length > 0 && (
+                  <ul className="ai-limitation-list">
+                    {report.ai.report.limitations.map((claim, idx) => (
+                      <li key={idx}>
+                        Limitation: {claim.claim} {claim.evidence_ids.map((eid) => (
+                          <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
+                        ))}
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 {report.ai.report.recommended_actions.length > 0 && (
                   <ul className="ai-action-list">
                     {report.ai.report.recommended_actions.map((act, idx) => (
-                      <li key={idx}>Action: {act.action}</li>
+                      <li key={idx}>
+                        Action: {act.action} {act.evidence_ids.map((eid) => (
+                          <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
+                        ))}
+                      </li>
                     ))}
                   </ul>
                 )}
                 <small>
-                  Provider: {report.ai.provider} · Model: {report.ai.model} · Prompt hash: {report.ai.prompt_sha256?.slice(0, 12) ?? "preview"}
+                  Provider: {report.ai.provider} · Model: {report.ai.model} · Prompt hash: {report.ai.prompt_sha256?.slice(0, 12) ?? "unavailable"}
                 </small>
               </div>
             ) : (
@@ -3490,7 +3570,7 @@ function ReportsPage({
               <Icon name="shield" size={19} />
             </div>
             <strong>Evidence is the source of truth</strong>
-            <p>Tier-1 classifier filters benign noise; AI explains escalated candidates. Neither replaces endpoint verification.</p>
+            <p>Tier-1 is prioritization, not proof of benignity; AI is advisory. Neither replaces endpoint verification.</p>
             <button className="subtle-link" onClick={() => onNavigate("findings")}>
               Review findings <Icon name="arrow" size={14} />
             </button>
@@ -3507,19 +3587,19 @@ function ArchitecturePage() {
       <PageHeading
         eyebrow="SYSTEM DESIGN / CASE EXPLORER"
         title="ระบบรับมือแต่ละกรณีอย่างไร"
-        detail="เลือกเคสเพื่อเปลี่ยนแผนภาพ แล้วเล่นเส้นทางทีละขั้น — รวมถึงการปรับ resource แบบ dynamic และ Tier-1 pre-filter ก่อน AI"
+        detail="เลือก case เพื่อดูเส้นทางและ failure handling; แผนภาพอธิบาย architecture ไม่ใช่ผลวิเคราะห์ของ capture"
       />
       <section className="architecture-callout">
         <div className="arch-callout-icon">
           <Icon name="shield" size={19} />
         </div>
         <div>
-          <strong>Local-first analysis boundary + Two-Tier Cascading</strong>
+          <strong>Offline-First Analysis + Optional AI</strong>
           <p>
-            อัปโหลดไฟล์แบบ resumable chunked หรือ zero-copy local path, วิเคราะห์แบบ O(K) RAM ด้วย priority eviction, คัดกรอง Benign ด้วย OpenJev Tier-1 แล้วค่อยส่งเฉพาะ summary ให้ Big AI
+            อัปโหลดแบบ resumable หรือเลือก local capture เพื่อสร้าง private SHA-256 snapshot; parser ใช้ resource limits ที่ตั้งไว้; HTTP Tier-1 และ AI ทำงานเมื่อ allowlist/consent ของงานผ่าน และรับเฉพาะ minimized evidence projection
           </p>
         </div>
-        <span className="mock-tag">LOCAL-FIRST</span>
+        <span className="environment-tag">LOCAL-FIRST</span>
       </section>
       <ArchitectureExplorer />
       <div className="architecture-cards">
@@ -3528,11 +3608,11 @@ function ArchitecturePage() {
             <Icon name="file" />
           </div>
           <span className="section-kicker">01 / INGEST</span>
-          <h3>Chunked + Zero-Copy</h3>
-          <p>อัปโหลดด้วย File.slice() แบบ resume ได้หรืออ่านจาก local_ingest_roots สำหรับไฟล์หลายสิบ GB</p>
+          <h3>Chunked + Private Snapshot</h3>
+          <p>อัปโหลดแบบ resume ได้ หรือเลือกไฟล์ local ซึ่ง worker จะ copy ไป private verified snapshot ก่อน parse; ทุกเส้นทางยังถูกจำกัดด้วย upload quota และ disk reserve</p>
           <div className="arch-tags">
             <span>PCAP / PCAPNG / CSV</span>
-            <span>Unlimited disk headroom</span>
+            <span>Disk reserve enforced</span>
           </div>
         </section>
         <section className="panel architecture-card">
@@ -3543,7 +3623,7 @@ function ArchitecturePage() {
           <h3>Device-scaled RAM</h3>
           <p>ตรวจ CPU, cgroup RAM และ free disk เพื่อปรับ chunk size และ priority flow eviction อัตโนมัติ</p>
           <div className="arch-tags">
-            <span>Auto / Unlimited</span>
+            <span>Auto / Max bounded</span>
             <span>Bounded RAM</span>
           </div>
         </section>
@@ -3551,9 +3631,9 @@ function ArchitecturePage() {
           <div className="arch-card-icon icon-evidence">
             <Icon name="nodes" />
           </div>
-          <span className="section-kicker">03 / TIER-1 TRIAGE</span>
-          <h3>OpenJev + Perplexity</h3>
-          <p>จัดหมวด L2–L7 ด้วย calibrated confidence และส่งออก triage.jsonl สำหรับเทรน RL+LoRA+GRPO</p>
+          <span className="section-kicker">03 / OPTIONAL TIER-1 TRIAGE</span>
+          <h3>Local by default</h3>
+          <p>ใช้ local heuristic เป็นค่าเริ่มต้น; HTTP classifier ต้องมี allowlist และ consent; export มีเฉพาะ normalized fields ที่อนุญาต</p>
           <div className="arch-tags">
             <span>Confidence gating</span>
             <span>Benign filter</span>
@@ -3563,9 +3643,9 @@ function ArchitecturePage() {
           <div className="arch-card-icon icon-ai">
             <Icon name="spark" />
           </div>
-          <span className="section-kicker">04 / BIG AI PACKER</span>
+          <span className="section-kicker">04 / OPTIONAL AI EVIDENCE BUDGET</span>
           <h3>Context protection</h3>
-          <p>pack_evidence_for_ai() คัดเฉพาะ findings สำคัญเข้า Big LLM ป้องกันปัญหา out-of-context</p>
+          <p>pack_evidence_for_ai() คัดเฉพาะ minimized structured evidence ที่อยู่ใน budget และคง evidence IDs สำหรับการอ้างอิง</p>
           <div className="arch-tags">
             <span>Opt-in</span>
             <span>Grounded refs</span>
@@ -3574,8 +3654,8 @@ function ArchitecturePage() {
       </div>
       <section className="panel method-panel">
         <PanelTitle
-          title="แนวคิด Two-Tier + Evidence First"
-          detail="ลดภาระ Context Window ของ Big AI โดยไม่สูญเสีย packet traceability"
+          title="Offline-First + Evidence First"
+          detail="ส่งข้อมูลออกเฉพาะเมื่อได้รับ consent; ไม่ส่ง raw PCAP หรือ packet payload และคง evidence references"
         />
         <div className="method-grid">
           <div>

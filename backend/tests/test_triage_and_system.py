@@ -4,11 +4,15 @@ import hashlib
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+
+import httpx
 
 try:
     import pydantic
@@ -390,7 +394,27 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
 
     def test_openjev_http_anonymizes_ips_macs_and_urls(self) -> None:
         bundle = self._build_mixed_bundle(benign_count=2)
+        secret_path = "/account/reset?access_token=PRIVATE-URI-SENTINEL"
+        bundle.evidence[3].attributes["http_path"] = secret_path
+        bundle.evidence[3].attributes.update(
+            {
+                "http_xss_hits": 1,
+                "http_crlf_hits": 2,
+                "http_sqli_hits": 3,
+                "http_shell_hits": 4,
+                "http_host_ip_hits": 5,
+            }
+        )
         report = triage.classify_bundle(bundle)
+        local_decision = next(d for d in report.decisions if d.evidence_id == "EV-000004")
+        local_state = local_decision.compact_text
+        self.assertEqual(local_decision.predicted_class, "Web_Injection_Or_Tunnel")
+        self.assertIn("suspicious_http_uri_marker", local_decision.signals)
+        self.assertIn("xss=1", local_state)
+        self.assertIn("crlf=2", local_state)
+        self.assertIn("sqli=3", local_state)
+        self.assertIn("shell=4", local_state)
+        self.assertIn("host_ip=5", local_state)
         captured: list[dict[str, object]] = []
 
         class _FakeResp:
@@ -410,7 +434,7 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
             def __exit__(self, *_args: object) -> None:
                 return None
 
-        def _fake_urlopen(req, timeout=10.0):  # noqa: ANN001
+        def _fake_urlopen(req, timeout=10.0, **_kwargs):  # noqa: ANN001
             payload = json.loads(req.data.decode("utf-8"))
             captured.append(payload)
             return _FakeResp(len(payload["items"]))
@@ -418,7 +442,13 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
         orig_urlopen = triage.urlopen
         triage.urlopen = _fake_urlopen  # type: ignore[assignment]
         try:
-            updated = triage._call_openjev_http(report.decisions, "http://127.0.0.1:9000/classify", "openjev-cal-tier1", 2.0)
+            updated = triage._call_openjev_http(
+                report.decisions,
+                "http://127.0.0.1:9000/classify",
+                "openjev-cal-tier1",
+                2.0,
+                allow_network=True,
+            )
         finally:
             triage.urlopen = orig_urlopen  # type: ignore[assignment]
 
@@ -427,6 +457,12 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
         self.assertNotIn("192.168.10.1", serialized)
         self.assertNotIn("2c:30:33:e2:d5:c3", serialized)
         self.assertNotIn("198.51.100.14", serialized)
+        self.assertNotIn(secret_path, serialized)
+        self.assertNotIn("PRIVATE-URI-SENTINEL", serialized)
+        for token in ("xss=1", "crlf=2", "sqli=3", "shell=4", "host_ip=5"):
+            self.assertNotIn(token, serialized)
+        self.assertNotIn("uri_len", serialized)
+        self.assertNotIn("uri_ent", serialized)
         self.assertIn("ip_", serialized)
         self.assertIn("mac_", serialized)
 
@@ -461,16 +497,80 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
         self.assertIn("host_", serialized)
 
         # Fail closed when endpoint raises URLError
-        def _fail_urlopen(_req, timeout=5.0):  # noqa: ANN001
-            raise OSError("connection refused")
-
-        orig_urlopen = etbert_bridge.urlopen
-        etbert_bridge.urlopen = _fail_urlopen  # type: ignore[assignment]
+        orig_post_json = etbert_bridge.post_json_bounded
+        etbert_bridge.post_json_bounded = lambda *_args, **_kwargs: None  # type: ignore[assignment]
         try:
-            res = etbert_bridge.score_with_etbert_http([tls_ev], endpoint_url="http://127.0.0.1:9000/etbert/score")
+            res = etbert_bridge.score_with_etbert_http(
+                [tls_ev],
+                endpoint_url="http://127.0.0.1:9000/etbert/score",
+                allow_network=True,
+            )
         finally:
-            etbert_bridge.urlopen = orig_urlopen  # type: ignore[assignment]
+            etbert_bridge.post_json_bounded = orig_post_json  # type: ignore[assignment]
         self.assertEqual(res, {})
+
+    def test_etbert_projection_excludes_uri_and_derived_metrics(self) -> None:
+        secret_path = "/admin/reset?access_token=ETBERT-URI-SENTINEL"
+        evidence = _StubEvidence(
+            "EV-URI-001",
+            "flow",
+            "HTTP flow",
+            [19],
+            {
+                "protocol": "HTTP",
+                "src": "192.0.2.19",
+                "dst": "198.51.100.19",
+                "src_port": 52000,
+                "dst_port": 80,
+                "packets": 4,
+                "bytes": 1200,
+                "data_len_sum": 900,
+                "http_method": "GET",
+                "http_uri_max_len": len(secret_path),
+                "http_uri_max_entropy": 6.75,
+                "http_path": secret_path,
+            },
+        )
+        items, _ = etbert_bridge.build_etbert_request_items([evidence], salt="unit-test")
+        serialized = json.dumps(items)
+        self.assertEqual(len(items), 1)
+        self.assertNotIn(secret_path, serialized)
+        self.assertNotIn("ETBERT-URI-SENTINEL", serialized)
+        self.assertNotIn("http_uri_max_len", serialized)
+        self.assertNotIn("http_uri_max_entropy", serialized)
+
+        evidence.attributes["http_method"] = "PROPFIND-PCAP-METHOD-SENTINEL"
+        items, _ = etbert_bridge.build_etbert_request_items([evidence], salt="unit-test")
+        serialized = json.dumps(items)
+        self.assertEqual(items[0]["features"]["http_method"], "OTHER")
+        self.assertIn("http=OTHER", items[0]["state"])
+        self.assertNotIn("PROPFIND-PCAP-METHOD-SENTINEL", serialized)
+
+    def test_network_tier1_is_skipped_without_explicit_consent(self) -> None:
+        bundle = self._build_mixed_bundle(benign_count=1)
+        cfg = SimpleNamespace(
+            enabled=True,
+            mode="etbert_openjev",
+            endpoint_url="http://127.0.0.1:9000/v1/systemone",
+            etbert_enabled=True,
+            etbert_endpoint_url="http://127.0.0.1:9000/etbert/score",
+        )
+
+        def _unexpected_call(*_args, **_kwargs):
+            raise AssertionError("network classifier called without consent")
+
+        original_post = etbert_bridge.post_json_bounded
+        original_urlopen = triage.urlopen
+        etbert_bridge.post_json_bounded = _unexpected_call  # type: ignore[assignment]
+        triage.urlopen = _unexpected_call  # type: ignore[assignment]
+        try:
+            report = triage.classify_bundle(bundle, cfg)
+        finally:
+            etbert_bridge.post_json_bounded = original_post  # type: ignore[assignment]
+            triage.urlopen = original_urlopen  # type: ignore[assignment]
+
+        self.assertIn("consent_required", report.mode)
+        self.assertEqual(report.etbert_scored_count, 0)
 
     def test_unified_10_class_etbert_plus_openjev_systemone_fusion(self) -> None:
         self.assertEqual(len(triage.TRAFFIC_CLASSES), 10)
@@ -526,14 +626,13 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
             def __exit__(self, *_args: object) -> None:
                 return None
 
-        def _fake_etbert(req, timeout=8.0):  # noqa: ANN001
-            payload = json.loads(req.data.decode("utf-8"))
+        def _fake_etbert(url, payload, *, timeout_seconds, **_kwargs):  # noqa: ANN001
             self.assertEqual(len(payload["items"]), 1)  # Only TLS flow (not WLAN) sent to ET-BERT
-            return _JsonResp(
-                {"results": [{"label": "C2_Beaconing", "score": 0.89, "confidence": 0.88, "entropy": 0.42}]}
-            )
+            return {
+                "results": [{"label": "C2_Beaconing", "score": 0.89, "confidence": 0.88, "entropy": 0.42}]
+            }
 
-        def _fake_systemone(req, timeout=10.0):  # noqa: ANN001
+        def _fake_systemone(req, timeout=10.0, **_kwargs):  # noqa: ANN001
             payload = json.loads(req.data.decode("utf-8"))
             seen_systemone_reqs.append(payload)
             state = payload["state"]
@@ -557,15 +656,14 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
             timeout_seconds=5,
         )
 
-        orig_et_urlopen = etbert_bridge.urlopen
+        orig_et_post_json = etbert_bridge.post_json_bounded
         orig_tr_urlopen = triage.urlopen
-        etbert_bridge.urlopen = _fake_etbert  # type: ignore[assignment]
+        etbert_bridge.post_json_bounded = _fake_etbert  # type: ignore[assignment]
         triage.urlopen = _fake_systemone  # type: ignore[assignment]
         try:
-            report = triage.classify_bundle(bundle, cfg)
-            jsonl = triage.bundle_to_triage_jsonl(bundle, cfg)
+            report = triage.classify_bundle(bundle, cfg, allow_network=True)
         finally:
-            etbert_bridge.urlopen = orig_et_urlopen  # type: ignore[assignment]
+            etbert_bridge.post_json_bounded = orig_et_post_json  # type: ignore[assignment]
             triage.urlopen = orig_tr_urlopen  # type: ignore[assignment]
 
         self.assertEqual(report.etbert_scored_count, 1)
@@ -582,11 +680,99 @@ class Tier1TriageAndCompactorTests(unittest.TestCase):
         self.assertIn("etbert_lbl=C2_Beaconing", serialized_reqs)
         self.assertIn("wlan_deauth=40", serialized_reqs)
 
-        # Verify bundle_to_triage_jsonl carries extended telemetry & etbert block
+        # JSONL export is deterministic and must not silently repeat a network call.
+        jsonl = triage.bundle_to_triage_jsonl(bundle, cfg)
         rows = [json.loads(line) for line in jsonl.splitlines() if line.strip()]
         self.assertEqual(len(rows), 2)
-        self.assertIn("etbert", rows[1])
+        self.assertNotIn("etbert", rows[1])
         self.assertEqual(rows[1]["metrics"]["ttl_distinct_count"], 2)
+
+
+class OptionalClassifierDeadlineTests(unittest.TestCase):
+    def test_systemone_reuses_one_deadline_and_stops_between_requests_on_cancel(self) -> None:
+        decisions = [
+            triage.TriageDecision(
+                evidence_id=f"EV-{idx}",
+                kind="flow",
+                predicted_class="Benign",
+                confidence=0.99,
+                uncertainty_ppl=1.0,
+                decision="fast_benign",
+                compact_text="TCP 192.0.2.1->198.51.100.1 pkts=1 bytes=64",
+            )
+            for idx in range(3)
+        ]
+        deadlines: list[float | None] = []
+
+        class _JsonResp:
+            status = 200
+
+            def read(self, _limit: int = -1) -> bytes:
+                return json.dumps({"answers": {"traffic_class": "Benign"}}).encode()
+
+            def __enter__(self) -> "_JsonResp":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        def _fake_urlopen(_req, timeout=10.0, **kwargs):  # noqa: ANN001
+            self.assertGreater(timeout, 0)
+            deadlines.append(kwargs.get("deadline_monotonic"))
+            return _JsonResp()
+
+        orig_urlopen = triage.urlopen
+        triage.urlopen = _fake_urlopen  # type: ignore[assignment]
+        shared_deadline = time.monotonic() + 5.0
+        try:
+            updated = triage._call_openjev_systemone_http(
+                decisions,
+                "http://127.0.0.1:9000/v1/systemone",
+                "openjev-cal-tier1",
+                10.0,
+                allow_network=True,
+                deadline_monotonic=shared_deadline,
+                cancellation_check=lambda: len(deadlines) >= 2,
+            )
+        finally:
+            triage.urlopen = orig_urlopen  # type: ignore[assignment]
+
+        self.assertIsNotNone(updated)
+        self.assertEqual(len(deadlines), 2)
+        self.assertEqual(deadlines, [shared_deadline, shared_deadline])
+
+    def test_bounded_transport_cancels_slow_stream_at_total_deadline(self) -> None:
+        started = threading.Event()
+        closed = threading.Event()
+
+        class _SlowStream(httpx.SyncByteStream):
+            def __iter__(self):
+                started.set()
+                time.sleep(0.4)
+                yield b"{}"
+
+            def close(self) -> None:
+                closed.set()
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=_SlowStream(), request=request)
+
+        transport = httpx.MockTransport(_handler)
+        deadline = time.monotonic() + 0.06
+        began = time.monotonic()
+        result = triage.post_json_bounded(
+            "http://classifier.invalid/score",
+            {"items": [1]},
+            timeout_seconds=2.0,
+            transport=transport,
+            deadline_monotonic=deadline,
+        )
+        elapsed = time.monotonic() - began
+
+        self.assertIsNone(result)
+        self.assertTrue(started.wait(0.2))
+        self.assertTrue(closed.wait(0.5))
+        self.assertLess(elapsed, 0.25)
 
 
 @unittest.skipUnless(HAS_PYDANTIC_V2, "Requires Pydantic v2 + FastAPI backend environment")

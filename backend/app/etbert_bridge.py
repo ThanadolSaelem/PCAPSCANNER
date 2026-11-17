@@ -20,14 +20,14 @@ import json
 import math
 import re
 import secrets
-from typing import Any, Sequence
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+from typing import Any, Callable, Sequence
+from .http_transport import post_json_bounded
 
 DATA_BEARING_KINDS = frozenset({"flow", "tls", "http", "dns", "packet"})
 NON_L7_KINDS = frozenset({"arp", "icmp", "wlan"})
 NON_L7_PROTOS = frozenset({"ARP", "ICMP", "ICMPV6", "WLAN"})
 COMMON_L7_PORTS = frozenset({21, 22, 23, 25, 53, 80, 110, 143, 443, 993, 995, 8080, 8443})
+STANDARD_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE"})
 
 _MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
 _IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
@@ -55,8 +55,6 @@ _SAFE_ETBERT_FEATURE_KEYS: tuple[str, ...] = (
     "tls_client_hello_count",
     "http_method",
     "http_status_codes",
-    "http_uri_max_len",
-    "http_uri_max_entropy",
     "dns_qry_type",
     "rcode",
     "syn_count",
@@ -185,6 +183,12 @@ def build_etbert_request_items(
                     continue
                 features[key] = val
 
+        # A method is packet-controlled input. Keep only a fixed, standard
+        # category in both the structured feature map and the human-readable state.
+        if "http_method" in features:
+            method = str(features["http_method"]).upper()
+            features["http_method"] = method if method in STANDARD_HTTP_METHODS else "OTHER"
+
         src_raw = str(attrs.get("src") or attrs.get("src_ip") or "")
         dst_raw = str(attrs.get("dst") or attrs.get("dst_ip") or "")
         if src_raw:
@@ -232,32 +236,32 @@ def score_with_etbert_http(
     model_name: str = "etbert-l7-datagram",
     timeout_seconds: float = 8.0,
     max_items: int = 256,
+    allow_network: bool = False,
+    deadline_monotonic: float | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Query user-hosted ET-BERT HTTP endpoint for data-bearing L7 flows.
 
     Returns `{evidence_id: {"label": str, "score": float, "confidence": float, "entropy": float, "model": str}}`
     or `{}` cleanly on network/timeout/malformed-response failures.
     """
-    if not endpoint_url or not evidence_list:
+    if not allow_network or not endpoint_url or not evidence_list:
         return {}
 
     items, ev_ids = build_etbert_request_items(evidence_list, max_items=max_items)
     if not items:
         return {}
 
-    req_body = json.dumps({"model": model_name, "items": items}, ensure_ascii=False).encode("utf-8")
-    request = Request(
-        endpoint_url,
-        data=req_body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
     try:
-        with urlopen(request, timeout=max(1.0, float(timeout_seconds))) as resp:
-            if getattr(resp, "status", 200) != 200:
-                return {}
-            raw = resp.read(2 * 1024 * 1024)
-        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        parsed = post_json_bounded(
+            endpoint_url,
+            {"model": model_name, "items": items},
+            timeout_seconds=max(1.0, float(timeout_seconds)),
+            deadline_monotonic=deadline_monotonic,
+            cancellation_check=cancellation_check,
+        )
+        if not isinstance(parsed, (dict, list)):
+            return {}
         rows = parsed.get("results") if isinstance(parsed, dict) else parsed
         if not isinstance(rows, list):
             return {}
@@ -307,7 +311,7 @@ def score_with_etbert_http(
                 "model": str(row.get("model") or model_name)[:80],
             }
         return out
-    except (OSError, TimeoutError, URLError, ValueError, TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError, KeyError):
         return {}
 
 

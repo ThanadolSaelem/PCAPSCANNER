@@ -36,7 +36,7 @@ class Coverage(Contract):
 
 class Evidence(Contract):
     evidence_id: EvidenceId
-    kind: Literal["flow", "dns", "tls", "packet", "arp", "http", "icmp", "wlan"]
+    kind: Literal["flow", "dns", "tls", "packet", "arp", "http", "icmp", "wlan", "zeek", "yara"]
     summary: str = Field(max_length=1000)
     packet_refs: list[int] = Field(max_length=50)
     attributes: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=40)
@@ -147,15 +147,20 @@ class Assessment(Contract):
     evidence_ids: list[EvidenceId] = Field(min_length=1, max_length=100)
 
 
+class GroundedClaim(Contract):
+    claim: str = Field(min_length=1, max_length=4000)
+    evidence_ids: list[EvidenceId] = Field(min_length=1, max_length=100)
+
+
 class Recommendation(Contract):
     action: str = Field(min_length=1, max_length=1000)
-    evidence_ids: list[EvidenceId] = Field(max_length=100)
+    evidence_ids: list[EvidenceId] = Field(min_length=1, max_length=100)
 
 
 class AISummary(Contract):
-    summary: str = Field(min_length=1, max_length=6000)
+    summary: list[GroundedClaim] = Field(min_length=1, max_length=30)
     assessments: list[Assessment] = Field(max_length=1000)
-    limitations: list[str] = Field(max_length=30)
+    limitations: list[GroundedClaim] = Field(max_length=30)
     recommended_actions: list[Recommendation] = Field(max_length=20)
 
 
@@ -164,7 +169,7 @@ class AIResult(Contract):
     provider: str
     model: str | None = None
     prompt_sha256: str | None = None
-    prompt_version: str = "1.0"
+    prompt_version: str = "2.0"
     redaction_policy: str = "identifiers-v1"
     usage: dict[str, int] = Field(default_factory=dict)
     report: AISummary | None = None
@@ -179,11 +184,14 @@ class AnalysisRequest(Contract):
     ai_consent: bool = False
     resource_mode: Literal["auto", "fast", "deep", "unlimited"] = "auto"
     triage_enabled: bool = True
+    triage_endpoint_consent: bool = False
 
     @model_validator(mode="after")
     def consent(self):
         if self.ai_enabled and not self.ai_consent:
             raise ValueError("AI processing requires explicit consent")
+        if self.triage_endpoint_consent and not self.triage_enabled:
+            raise ValueError("Tier-1 endpoint consent requires Tier-1 to be enabled")
         return self
 
 
@@ -194,7 +202,14 @@ class ChunkUploadInitRequest(Contract):
 
 
 class LocalCaptureRequest(Contract):
-    path: str = Field(min_length=1, max_length=1024)
+    path: str | None = Field(default=None, min_length=1, max_length=1024)
+    file_grant_token: str | None = Field(default=None, min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+    @model_validator(mode="after")
+    def exactly_one_source(self):
+        if bool(self.path) == bool(self.file_grant_token):
+            raise ValueError("provide exactly one local path or file grant")
+        return self
 
 
 class WorkspaceUpdateRequest(Contract):
@@ -209,10 +224,33 @@ class NativePickRequest(Contract):
     purpose: Literal["data_dir", "capture_root", "capture_file"]
 
 
+class BatchItemResponse(Contract):
+    index: int = Field(ge=0)
+    capture_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    analysis_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int = Field(ge=1)
+    format: Literal["pcap", "pcapng"]
+    state: Literal["queued", "parsing", "awaiting_ai", "generating", "completed", "partial", "failed", "cancelled"]
+    error_code: str | None = None
+    evidence_available: bool = False
+
+
+class BatchResponse(Contract):
+    batch_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    created_at: str
+    state: Literal["queued", "running", "partial", "completed", "failed", "cancelled"]
+    total_items: int = Field(ge=1, le=64)
+    completed_items: int = Field(ge=0)
+    failed_items: int = Field(ge=0)
+    partial_items: int = Field(ge=0)
+    cancelled_items: int = Field(ge=0)
+    items: list[BatchItemResponse] = Field(min_length=1, max_length=64)
+
+
 class ProblemDetails(Contract):
     type: str
     title: str
     status: int = Field(ge=400, le=599)
     code: str
     request_id: str = Field(pattern=r"^[a-f0-9]{32}$")
-

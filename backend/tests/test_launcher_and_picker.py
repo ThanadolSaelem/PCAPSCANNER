@@ -217,7 +217,7 @@ class WorkspaceApiAndSpaTests(unittest.TestCase):
                 # Initial workspace GET
                 ws = client.get("/api/v1/system/workspace").json()
                 self.assertEqual(ws["data_dir"], str(data_dir_a.resolve()))
-                self.assertTrue(ws["native_picker_available"])
+                self.assertEqual(ws["native_picker_available"], main.detect_picker_backend() is not None)
 
                 # Switch data_dir live via PUT /workspace
                 sw = client.put("/api/v1/system/workspace", json={"data_dir": str(data_dir_b)})
@@ -225,14 +225,41 @@ class WorkspaceApiAndSpaTests(unittest.TestCase):
                 self.assertEqual(app.state.settings.data_dir, data_dir_b.resolve())
                 self.assertEqual(client.get("/api/v1/system/capabilities").json()["limits"]["data_dir"], str(data_dir_b.resolve()))
 
-                # Pick capture_file via mocked native picker -> auto-allows parent folder
+                # A selected file grants one-time access to exactly that file; no folder is added.
                 with mock.patch.object(main, "pick_native_path", return_value=sample_pcap):
                     picked = client.post("/api/v1/system/pick-path", json={"purpose": "capture_file"})
                 self.assertEqual(picked.status_code, 200, picked.text)
                 body = picked.json()
                 self.assertFalse(body["cancelled"])
-                self.assertEqual(body["selected_path"], str(sample_pcap.resolve()))
-                self.assertIn(str(cap_dir.resolve()), body["workspace"]["local_ingest_roots"])
+                self.assertIsNone(body["selected_path"])
+                self.assertTrue(body["file_grant_token"])
+                self.assertEqual(
+                    body["sha256"],
+                    __import__("hashlib").sha256(sample_pcap.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(body["workspace"]["local_ingest_roots"], [])
+                registered = client.post(
+                    "/api/v1/captures/local",
+                    json={"file_grant_token": body["file_grant_token"]},
+                )
+                self.assertEqual(registered.status_code, 201, registered.text)
+                self.assertEqual(registered.json()["sha256"], body["sha256"])
+                replay = client.post(
+                    "/api/v1/captures/local",
+                    json={"file_grant_token": body["file_grant_token"]},
+                )
+                self.assertEqual(replay.status_code, 409)
+                self.assertEqual(client.get("/api/v1/system/workspace").json()["local_ingest_roots"], [])
+
+                with mock.patch.object(main, "pick_native_path", return_value=sample_pcap):
+                    picked_again = client.post("/api/v1/system/pick-path", json={"purpose": "capture_file"})
+                self.assertEqual(picked_again.status_code, 200, picked_again.text)
+                sample_pcap.write_bytes(sample_pcap.read_bytes() + b"\x01")
+                tampered = client.post(
+                    "/api/v1/captures/local",
+                    json={"file_grant_token": picked_again.json()["file_grant_token"]},
+                )
+                self.assertEqual(tampered.status_code, 409)
 
                 # Cancel path keeps workspace unchanged
                 with mock.patch.object(main, "pick_native_path", return_value=None):

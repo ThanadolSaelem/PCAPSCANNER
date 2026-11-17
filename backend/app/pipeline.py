@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import errno
+import hashlib
 import ipaddress
 import math
 import os
@@ -15,6 +16,7 @@ import re
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,8 @@ from .models import (
 )
 from .system import probe_capabilities, resolve_adaptive_profile
 from .triage import classify_bundle
+from .zeek import NormalizedZeekRow, bounded_directory_size, parse_zeek_logs
+from .yara import NormalizedYaraMatch, RuleSnapshot, YaraRulesError, snapshot_ruleset
 
 
 # Canonical 16-field TShark allowlist kept stable for unit tests and base builds.
@@ -104,6 +108,21 @@ DEFAULT_MAX_STDOUT_BYTES = 64 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_DNS_RECORDS = MAX_EVIDENCE
 MAX_ARP_RECORDS = 1500
+DEFAULT_ZEEK_MAX_ROWS = 2_000
+DEFAULT_ZEEK_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+DEFAULT_ZEEK_TIMEOUT_SECONDS = 45
+DEFAULT_ZEEK_MEMORY_MB = 256
+MAX_ZEEK_DIAGNOSTIC_BYTES = 1024 * 1024
+DEFAULT_YARA_MAX_RULES_FILES = 64
+DEFAULT_YARA_MAX_RULES_BYTES = 16 * 1024 * 1024
+DEFAULT_YARA_MAX_OBJECTS = 100
+DEFAULT_YARA_MAX_OBJECT_BYTES = 16 * 1024 * 1024
+DEFAULT_YARA_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+DEFAULT_YARA_MAX_MATCHES = 200
+DEFAULT_YARA_MAX_OUTPUT_BYTES = 1024 * 1024
+DEFAULT_YARA_TIMEOUT_SECONDS = 30
+DEFAULT_YARA_MEMORY_MB = 256
+MAX_YARA_DIAGNOSTIC_BYTES = 64 * 1024
 TCP_PORT_SPREAD_THRESHOLD = 20
 DNS_NXDOMAIN_THRESHOLD = 3
 DNS_HIGH_ENTROPY_THRESHOLD = 3.5
@@ -132,6 +151,21 @@ class _Limits:
     stdout_budget_bytes: int = DEFAULT_MAX_STDOUT_BYTES  # 0 = unlimited stream
     streaming_eviction: bool = False
     mode_label: str = "legacy"
+    zeek_max_rows: int = DEFAULT_ZEEK_MAX_ROWS
+    zeek_max_output_bytes: int = DEFAULT_ZEEK_MAX_OUTPUT_BYTES
+    zeek_timeout_seconds: int = DEFAULT_ZEEK_TIMEOUT_SECONDS
+    zeek_memory_mb: int = DEFAULT_ZEEK_MEMORY_MB
+    yara_enabled: bool = False
+    yara_rules_dir: Path | None = None
+    yara_max_rules_files: int = DEFAULT_YARA_MAX_RULES_FILES
+    yara_max_rules_bytes: int = DEFAULT_YARA_MAX_RULES_BYTES
+    yara_max_objects: int = DEFAULT_YARA_MAX_OBJECTS
+    yara_max_object_bytes: int = DEFAULT_YARA_MAX_OBJECT_BYTES
+    yara_max_total_bytes: int = DEFAULT_YARA_MAX_TOTAL_BYTES
+    yara_max_matches: int = DEFAULT_YARA_MAX_MATCHES
+    yara_max_output_bytes: int = DEFAULT_YARA_MAX_OUTPUT_BYTES
+    yara_timeout_seconds: int = DEFAULT_YARA_TIMEOUT_SECONDS
+    yara_memory_mb: int = DEFAULT_YARA_MEMORY_MB
 
 
 @dataclass
@@ -1027,6 +1061,43 @@ def _setting_int(settings: object, name: str, default: int, *, minimum: int = 1,
     return result
 
 
+def _yara_limit_values(settings: object, parser_memory_mb: int) -> dict[str, object]:
+    raw_rules_dir = getattr(settings, "yara_rules_dir", None)
+    if raw_rules_dir is None or (isinstance(raw_rules_dir, str) and not raw_rules_dir.strip()):
+        rules_dir = None
+    elif isinstance(raw_rules_dir, (str, Path)):
+        try:
+            rules_dir = Path(raw_rules_dir).expanduser().resolve()
+        except (OSError, RuntimeError):
+            raise PipelineError("INVALID_SETTINGS", "yara_rules_dir is invalid") from None
+    else:
+        raise PipelineError("INVALID_SETTINGS", "yara_rules_dir is invalid")
+
+    max_total = _setting_int(
+        settings, "yara_max_total_bytes", DEFAULT_YARA_MAX_TOTAL_BYTES,
+        minimum=1024 * 1024, maximum=256 * 1024 * 1024,
+    )
+    return {
+        "yara_enabled": bool(getattr(settings, "yara_enabled", False)),
+        "yara_rules_dir": rules_dir,
+        "yara_max_rules_files": _setting_int(settings, "yara_max_rules_files", DEFAULT_YARA_MAX_RULES_FILES, minimum=1, maximum=256),
+        "yara_max_rules_bytes": _setting_int(settings, "yara_max_rules_bytes", DEFAULT_YARA_MAX_RULES_BYTES, minimum=1024, maximum=64 * 1024 * 1024),
+        "yara_max_objects": _setting_int(settings, "yara_max_objects", DEFAULT_YARA_MAX_OBJECTS, minimum=1, maximum=500),
+        "yara_max_object_bytes": min(
+            _setting_int(settings, "yara_max_object_bytes", DEFAULT_YARA_MAX_OBJECT_BYTES, minimum=1024, maximum=128 * 1024 * 1024),
+            max_total,
+        ),
+        "yara_max_total_bytes": max_total,
+        "yara_max_matches": _setting_int(settings, "yara_max_matches", DEFAULT_YARA_MAX_MATCHES, minimum=1, maximum=2_000),
+        "yara_max_output_bytes": _setting_int(settings, "yara_max_output_bytes", DEFAULT_YARA_MAX_OUTPUT_BYTES, minimum=64 * 1024, maximum=16 * 1024 * 1024),
+        "yara_timeout_seconds": _setting_int(settings, "yara_timeout_seconds", DEFAULT_YARA_TIMEOUT_SECONDS, minimum=1, maximum=120),
+        "yara_memory_mb": min(
+            _setting_int(settings, "yara_memory_mb", DEFAULT_YARA_MEMORY_MB, minimum=128, maximum=512),
+            max(128, parser_memory_mb // 2),
+        ),
+    }
+
+
 def _setting_timeout(settings: object) -> float:
     value = getattr(settings, "parser_timeout_seconds", 120)
     if isinstance(value, bool):
@@ -1044,15 +1115,24 @@ def _get_limits(settings: object, *, resource_mode: str | None = None) -> _Limit
     requested_mode = resource_mode or getattr(settings, "resource_mode", None)
     # Preserve exact deterministic low caps when callers pass plain SimpleNamespace without resource_mode
     if not requested_mode or requested_mode == "legacy":
+        parser_memory_mb = _setting_int(settings, "parser_memory_mb", 512, minimum=1, maximum=16_384)
         return _Limits(
             packet_limit=_setting_int(settings, "packet_limit", 20_000, minimum=1, maximum=10_000_000),
             flow_limit=_setting_int(settings, "flow_limit", 5_000, minimum=1, maximum=5_000),
             timeout_seconds=_setting_timeout(settings),
-            memory_mb=_setting_int(settings, "parser_memory_mb", 512, minimum=1, maximum=16_384),
+            memory_mb=parser_memory_mb,
             zeek_enabled=bool(getattr(settings, "zeek_enabled", False)),
+            zeek_max_rows=_setting_int(settings, "zeek_max_rows", DEFAULT_ZEEK_MAX_ROWS, minimum=1, maximum=10_000),
+            zeek_max_output_bytes=_setting_int(settings, "zeek_max_output_bytes", DEFAULT_ZEEK_MAX_OUTPUT_BYTES, minimum=1024 * 1024, maximum=256 * 1024 * 1024),
+            zeek_timeout_seconds=_setting_int(settings, "zeek_timeout_seconds", DEFAULT_ZEEK_TIMEOUT_SECONDS, minimum=1, maximum=120),
+            zeek_memory_mb=min(
+                _setting_int(settings, "zeek_memory_mb", DEFAULT_ZEEK_MEMORY_MB, minimum=128, maximum=512),
+                max(128, _setting_int(settings, "parser_memory_mb", 512, minimum=1, maximum=16_384) // 2),
+            ),
             stdout_budget_bytes=DEFAULT_MAX_STDOUT_BYTES,
             streaming_eviction=False,
             mode_label="legacy",
+            **_yara_limit_values(settings, parser_memory_mb),
         )
 
     caps = probe_capabilities(getattr(settings, "data_dir", "./data/pcapscanner"))
@@ -1081,36 +1161,56 @@ def _get_limits(settings: object, *, resource_mode: str | None = None) -> _Limit
         timeout_seconds=profile.timeout_seconds,
         memory_mb=profile.parser_memory_mb,
         zeek_enabled=profile.zeek_enabled,
+        zeek_max_rows=_setting_int(settings, "zeek_max_rows", DEFAULT_ZEEK_MAX_ROWS, minimum=1, maximum=10_000),
+        zeek_max_output_bytes=_setting_int(settings, "zeek_max_output_bytes", DEFAULT_ZEEK_MAX_OUTPUT_BYTES, minimum=1024 * 1024, maximum=256 * 1024 * 1024),
+        zeek_timeout_seconds=_setting_int(settings, "zeek_timeout_seconds", DEFAULT_ZEEK_TIMEOUT_SECONDS, minimum=1, maximum=120),
+        zeek_memory_mb=min(
+            _setting_int(settings, "zeek_memory_mb", DEFAULT_ZEEK_MEMORY_MB, minimum=128, maximum=512),
+            max(128, profile.parser_memory_mb // 2),
+        ),
         stdout_budget_bytes=profile.stdout_budget_bytes,
         streaming_eviction=profile.streaming_eviction,
         mode_label=profile.mode,
+        **_yara_limit_values(settings, profile.parser_memory_mb),
     )
 
 
-def _child_limits(memory_mb: int, timeout_seconds: float) -> Callable[[], None]:
-    """Return a POSIX child setup hook; skips RLIMIT_AS on macOS Mach VM."""
+def _child_limits(
+    memory_mb: int,
+    timeout_seconds: float,
+    file_size_limit_bytes: int | None = None,
+) -> Callable[[], None]:
+    """Return a POSIX child setup hook with platform-aware memory and output limits."""
     def apply() -> None:
         if os.name != "posix":
             return
         try:
             import resource
-
-            if sys.platform != "darwin":
-                memory = memory_mb * 1024 * 1024
-                current_as = resource.getrlimit(resource.RLIMIT_AS)
-                as_hard = current_as[1]
-                if as_hard != resource.RLIM_INFINITY:
-                    memory = min(memory, as_hard)
-                resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
-
-            cpu = max(1, int(math.ceil(timeout_seconds)))
-            current_cpu = resource.getrlimit(resource.RLIMIT_CPU)
-            cpu_hard = current_cpu[1]
-            if cpu_hard != resource.RLIM_INFINITY:
-                cpu = min(cpu, cpu_hard)
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-        except (ImportError, OSError, ValueError):
+        except ImportError:
             return
+
+        def set_child_limit(which: int, value: int) -> None:
+            try:
+                current = resource.getrlimit(which)
+                bounded = max(0, int(value))
+                if current[1] != resource.RLIM_INFINITY:
+                    bounded = min(bounded, current[1])
+                resource.setrlimit(which, (bounded, bounded))
+            except (OSError, ValueError, TypeError):
+                return
+
+        memory_limit = getattr(resource, "RLIMIT_AS", None)
+        if sys.platform == "darwin":
+            # RLIMIT_AS is unreliable under Mach VM; RLIMIT_DATA still bounds heap growth.
+            memory_limit = getattr(resource, "RLIMIT_DATA", None)
+        if memory_limit is not None:
+            set_child_limit(memory_limit, memory_mb * 1024 * 1024)
+        if file_size_limit_bytes is not None and hasattr(resource, "RLIMIT_FSIZE"):
+            set_child_limit(resource.RLIMIT_FSIZE, max(1, int(file_size_limit_bytes)))
+        if hasattr(resource, "RLIMIT_CORE"):
+            set_child_limit(resource.RLIMIT_CORE, 0)
+        if hasattr(resource, "RLIMIT_CPU"):
+            set_child_limit(resource.RLIMIT_CPU, max(1, int(math.ceil(timeout_seconds))))
 
     return apply
 
@@ -1120,17 +1220,26 @@ def _spawn(
     *,
     limits: _Limits,
     cwd: str | None = None,
+    memory_mb: int | None = None,
+    timeout_seconds: float | None = None,
+    file_size_limit_bytes: int | None = None,
+    stdout_target: object | None = None,
+    stderr_target: object | None = None,
 ) -> subprocess.Popen[bytes]:
     kwargs: dict[str, object] = {
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
+        "stdout": stdout_target if stdout_target is not None else subprocess.PIPE,
+        "stderr": stderr_target if stderr_target is not None else subprocess.PIPE,
         "shell": False,
         "cwd": cwd,
         "start_new_session": True,
     }
     if os.name == "posix":
-        kwargs["preexec_fn"] = _child_limits(limits.memory_mb, limits.timeout_seconds)
+        kwargs["preexec_fn"] = _child_limits(
+            memory_mb if memory_mb is not None else limits.memory_mb,
+            timeout_seconds if timeout_seconds is not None else limits.timeout_seconds,
+            file_size_limit_bytes,
+        )
     try:
         return subprocess.Popen(list(command), **kwargs)  # type: ignore[arg-type]
     except FileNotFoundError:
@@ -1339,6 +1448,12 @@ def _drain_command(
     *,
     deadline: float,
     is_cancelled: Callable[[], bool],
+    output_budget_bytes: int = DEFAULT_MAX_STDOUT_BYTES,
+    output_directory: Path | None = None,
+    disk_budget_bytes: int | None = None,
+    output_entry_limit: int | None = None,
+    watched_file: Path | None = None,
+    watched_file_budget_bytes: int | None = None,
 ) -> str:
     """Drain an optional stage without retaining any tool output."""
     selector = selectors.DefaultSelector()
@@ -1355,7 +1470,7 @@ def _drain_command(
     total = 0
     limited = False
     try:
-        while streams:
+        while streams or process.poll() is None:
             if is_cancelled():
                 _terminate_tree(process)
                 raise PipelineError("CANCELLED", "Offline parser cancelled")
@@ -1363,9 +1478,12 @@ def _drain_command(
             if remaining <= 0:
                 _terminate_tree(process)
                 return "partial"
-            events = selector.select(timeout=min(0.25, remaining))
-            if not events:
-                continue
+            wait_for = min(0.05, remaining)
+            if streams:
+                events = selector.select(timeout=wait_for)
+            else:
+                time.sleep(wait_for)
+                events = []
             for key, _ in events:
                 data = _read_fd(key.fileobj)
                 if not data:
@@ -1377,11 +1495,31 @@ def _drain_command(
                         streams.remove(key.fileobj)
                     continue
                 total += len(data)
-                if total > DEFAULT_MAX_STDOUT_BYTES:
+                if total > output_budget_bytes:
                     limited = True
                     _terminate_tree(process)
                     streams.clear()
                     break
+            if (
+                not limited
+                and output_directory is not None
+                and disk_budget_bytes is not None
+                and bounded_directory_size(
+                    output_directory,
+                    disk_budget_bytes,
+                    max_entries=output_entry_limit or 128,
+                )[1]
+            ):
+                limited = True
+                _terminate_tree(process)
+            if not limited and watched_file is not None and watched_file_budget_bytes is not None:
+                try:
+                    watched_size = watched_file.stat().st_size
+                except OSError:
+                    watched_size = 0
+                if watched_size > watched_file_budget_bytes:
+                    limited = True
+                    _terminate_tree(process)
             if limited:
                 break
     finally:
@@ -1882,15 +2020,24 @@ def _build_bundle(
     parser_state: str,
     parser_detail: str,
     zeek_stage: Stage,
+    zeek_records: Sequence[NormalizedZeekRow] = (),
+    yara_stage: Stage | None = None,
+    yara_records: Sequence[NormalizedYaraMatch] = (),
     parser_name: str = "tshark-fields-offline",
     triage_cfg: object | None = None,
     triage_enabled: bool = True,
+    triage_endpoint_consent: bool = False,
 ) -> EvidenceBundle:
+    if yara_stage is None:
+        yara_stage = _stage("yara", "skipped", "Optional HTTP carving/YARA stage is disabled by settings.")
     evidence: list[Evidence] = []
     flow_evidence: dict[tuple[int | str, str, int | None, str, int | None], str] = {}
     dns_evidence: list[tuple[_DnsRecord, str]] = []
     arp_evidence: list[tuple[_ArpConflictRecord, str]] = []
     evidence_cap_hit = False
+    zeek_evidence_cap_hit = False
+    yara_evidence_cap_hit = False
+    yara_evidence_ids: list[str] = []
 
     # 1. Include conflicting/high-activity ARP IP->MAC claims first (never buried below huge flows)
     arp_candidates = [
@@ -2002,14 +2149,92 @@ def _build_bundle(
         )
         dns_evidence.append((record, evidence_id))
 
+    # 4. Allowlisted Zeek protocol metadata, with provenance embedded in attrs.
+    for record in zeek_records:
+        if len(evidence) >= MAX_EVIDENCE:
+            evidence_cap_hit = True
+            zeek_evidence_cap_hit = True
+            break
+        evidence_id = f"EV-{len(evidence) + 1:06d}"
+        evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                kind="zeek",
+                summary=record.summary,
+                packet_refs=[],
+                attributes=record.attributes,
+            )
+        )
+    if zeek_evidence_cap_hit and zeek_stage.state == "completed":
+        zeek_stage = zeek_stage.model_copy(
+            update={
+                "state": "partial",
+                "detail": "Zeek rows were normalized, but the global evidence cap prevented retaining every row.",
+            }
+        )
+
+    # 5. YARA contributes only local rule IDs and hashes of temporary HTTP objects.
+    for record in yara_records:
+        if len(evidence) >= MAX_EVIDENCE:
+            evidence_cap_hit = True
+            yara_evidence_cap_hit = True
+            break
+        evidence_id = f"EV-{len(evidence) + 1:06d}"
+        evidence.append(
+            Evidence(
+                evidence_id=evidence_id,
+                kind="yara",
+                summary=(
+                    f"YARA rule {record.rule_id} matched a temporary HTTP object "
+                    f"({record.object_size_bytes} bytes; SHA-256 {record.object_sha256[:16]}…)."
+                ),
+                packet_refs=[],
+                attributes={
+                    "protocol": "HTTP",
+                    "match_count": 1,
+                    "rule_id": record.rule_id,
+                    "ruleset_sha256": record.ruleset_sha256,
+                    "artifact_sha256": record.object_sha256,
+                    "object_size_bytes": record.object_size_bytes,
+                    "object_index": record.object_index,
+                },
+            )
+        )
+        yara_evidence_ids.append(evidence_id)
+    if yara_evidence_cap_hit and yara_stage.state == "completed":
+        yara_stage = yara_stage.model_copy(
+            update={
+                "state": "partial",
+                "detail": "YARA matches were normalized, but the global evidence cap prevented retaining every match.",
+            }
+        )
+
     if evidence_cap_hit:
-        accumulator.warn("Evidence cap reached; additional normalized flow/DNS evidence was not retained.")
+        accumulator.warn("Evidence cap reached; additional normalized flow/DNS/Zeek/YARA evidence was not retained.")
+    if zeek_stage.state == "partial":
+        accumulator.warn("Zeek stage coverage is partial; inspect the Zeek stage detail and configured bounds.")
+    if yara_stage.state == "partial":
+        accumulator.warn("YARA stage coverage is partial; inspect the stage detail and configured bounds.")
     if accumulator.flow_evictions > 0:
         accumulator.warn(
             f"Streaming flow table evicted {accumulator.flow_evictions} low-signal ephemeral flows to maintain bounded RAM."
         )
 
     findings = _detect_findings(accumulator, flow_evidence, dns_evidence, arp_evidence)
+    for evidence_id in yara_evidence_ids:
+        _finding(
+            findings,
+            detector="yara_rule_match",
+            title="YARA rule matched a carved HTTP object",
+            severity="medium",
+            confidence="medium",
+            summary="An operator-managed local YARA rule matched a temporary carved HTTP object.",
+            evidence_ids=[evidence_id],
+            limitations=[
+                "YARA match is a rule-based indicator and requires analyst validation against rule quality and surrounding traffic.",
+                "The original object bytes are intentionally not retained as evidence or included in AI context.",
+            ],
+        )
     if evidence_cap_hit or accumulator.stream_limited:
         parser_state = "partial"
 
@@ -2030,7 +2255,7 @@ def _build_bundle(
     stages = [
         _stage("tshark", parser_state, parser_detail),
         zeek_stage,
-        _stage("yara", "skipped", "YARA integration is unsupported in this offline parser."),
+        yara_stage,
         _stage("osint", "skipped", "OSINT integration is unsupported and no network lookup was performed."),
     ]
     packets_seen = (
@@ -2052,6 +2277,8 @@ def _build_bundle(
             or accumulator.flow_cap_hit
             or accumulator.dns_cap_hit
             or evidence_cap_hit
+            or zeek_stage.state == "partial"
+            or yara_stage.state == "partial"
         ),
         parser=parser_name,
         warnings=deduped_warnings,
@@ -2087,7 +2314,7 @@ def _build_bundle(
     triage_summary: Tier1Summary | None = None
     if triage_enabled and evidence:
         temp_bundle = type("_TempBundle", (), {"evidence": evidence, "findings": findings})()
-        triage_report = classify_bundle(temp_bundle, triage_cfg)
+        triage_report = classify_bundle(temp_bundle, triage_cfg, allow_network=triage_endpoint_consent)
         dec_by_ev = {d.evidence_id: d for d in triage_report.decisions}
         enriched_findings: list[Finding] = []
         for f in findings:
@@ -2159,28 +2386,333 @@ def _run_zeek(
     limits: _Limits,
     deadline: float,
     is_cancelled: Callable[[], bool],
-) -> Stage:
+) -> tuple[Stage, list[NormalizedZeekRow]]:
     zeek = shutil.which("zeek")
     if not zeek:
-        return _stage("zeek", "unavailable", "Zeek is not installed; TShark evidence was retained.")
+        return _stage("zeek", "unavailable", "Zeek is not installed; TShark evidence was retained."), []
+    zeek_deadline = min(deadline, time.monotonic() + limits.zeek_timeout_seconds)
+    if zeek_deadline <= time.monotonic():
+        return _stage("zeek", "partial", "No operation time remained for the bounded offline Zeek stage."), []
+    records: list[NormalizedZeekRow] = []
+    rows_seen = 0
+    bytes_read = 0
+    parse_truncated = False
     try:
         with tempfile.TemporaryDirectory(prefix="pcapscanner-zeek-") as run_dir:
-            process = _spawn([zeek, "-r", str(path)], limits=limits, cwd=run_dir)
+            output_directory = Path(run_dir)
+            process = _spawn(
+                [zeek, "-r", str(path)],
+                limits=limits,
+                cwd=run_dir,
+                memory_mb=limits.zeek_memory_mb,
+                timeout_seconds=limits.zeek_timeout_seconds,
+                file_size_limit_bytes=limits.zeek_max_output_bytes,
+            )
             try:
-                result = _drain_command(process, deadline=deadline, is_cancelled=is_cancelled)
+                result = _drain_command(
+                    process,
+                    deadline=zeek_deadline,
+                    is_cancelled=is_cancelled,
+                    output_budget_bytes=MAX_ZEEK_DIAGNOSTIC_BYTES,
+                    output_directory=output_directory,
+                    disk_budget_bytes=limits.zeek_max_output_bytes,
+                )
             finally:
                 if process.poll() is None:
                     _terminate_tree(process)
                 _close_streams(process)
+            records, rows_seen, bytes_read, parse_truncated = parse_zeek_logs(
+                output_directory,
+                row_limit=limits.zeek_max_rows,
+                byte_limit=limits.zeek_max_output_bytes,
+                deadline=zeek_deadline,
+                is_cancelled=is_cancelled,
+            )
     except PipelineError:
         raise
     except (OSError, ValueError):
-        return _stage("zeek", "failed", "Zeek could not be started; TShark evidence was retained.")
-    if result == "completed":
-        return _stage("zeek", "completed", "Zeek offline artifact stage completed; protocol output was not normalized into evidence.")
-    if result == "partial":
-        return _stage("zeek", "partial", "Zeek offline artifact stage exceeded its bounded deadline/output budget; TShark evidence was retained.")
-    return _stage("zeek", "failed", "Zeek offline artifact stage failed; TShark evidence was retained.")
+        return _stage("zeek", "failed", "Zeek could not be started; TShark evidence was retained."), []
+
+    detail = (
+        f"Offline Zeek normalized {len(records)} allowlisted rows (read {rows_seen}; "
+        f"limits: {limits.zeek_max_rows} rows, {limits.zeek_max_output_bytes} log bytes, "
+        f"{limits.zeek_timeout_seconds}s, {limits.zeek_memory_mb} MiB)."
+    )
+    if result == "failed" and not records:
+        return _stage("zeek", "failed", "Zeek returned an error and no normalized rows; TShark evidence was retained."), []
+    if result != "completed" or parse_truncated:
+        return _stage("zeek", "partial", detail + " Output or normalization reached a configured bound."), records
+    return _stage("zeek", "completed", detail), records
+
+
+def _run_yara(
+    path: Path,
+    *,
+    limits: _Limits,
+    deadline: float,
+    is_cancelled: Callable[[], bool],
+) -> tuple[Stage, list[NormalizedYaraMatch]]:
+    """Carve bounded HTTP objects and scan them locally; never retain object bytes."""
+    if not limits.yara_enabled:
+        return _stage("yara", "skipped", "Optional HTTP carving/YARA stage is disabled by settings."), []
+    if limits.yara_rules_dir is None:
+        return _stage("yara", "unavailable", "YARA is enabled but no operator rules directory is configured."), []
+    tshark = shutil.which("tshark")
+    yara = shutil.which("yara")
+    if not tshark or not yara:
+        return _stage("yara", "unavailable", "TShark or the YARA CLI is not installed; no objects were scanned."), []
+
+    stage_deadline = min(deadline, time.monotonic() + limits.yara_timeout_seconds)
+    if stage_deadline <= time.monotonic():
+        return _stage("yara", "partial", "No operation time remained for bounded HTTP carving/YARA."), []
+
+    matches: list[NormalizedYaraMatch] = []
+    objects_scanned = 0
+    carved_bytes = 0
+    partial = False
+    carve_state = "failed"
+    ruleset: RuleSnapshot | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="pcapscanner-yara-") as run_dir_text:
+            run_dir = Path(run_dir_text)
+            objects_dir = run_dir / "objects"
+            rules_dir = run_dir / "rules"
+            objects_dir.mkdir(mode=0o700)
+            ruleset = snapshot_ruleset(
+                limits.yara_rules_dir,
+                rules_dir,
+                max_files=limits.yara_max_rules_files,
+                max_bytes=limits.yara_max_rules_bytes,
+            )
+
+            carve_process = _spawn(
+                [tshark, "-n", "-r", str(path), "--export-objects", f"http,{objects_dir}"],
+                limits=limits,
+                cwd=str(run_dir),
+                memory_mb=limits.memory_mb,
+                timeout_seconds=max(1, stage_deadline - time.monotonic()),
+                file_size_limit_bytes=limits.yara_max_object_bytes,
+            )
+            try:
+                carve_state = _drain_command(
+                    carve_process,
+                    deadline=stage_deadline,
+                    is_cancelled=is_cancelled,
+                    output_budget_bytes=MAX_YARA_DIAGNOSTIC_BYTES,
+                    output_directory=run_dir,
+                    disk_budget_bytes=(
+                        limits.yara_max_total_bytes
+                        + limits.yara_max_rules_bytes
+                        + limits.yara_max_output_bytes
+                        + 4 * 1024 * 1024
+                    ),
+                    output_entry_limit=limits.yara_max_objects + limits.yara_max_rules_files + 16,
+                )
+            finally:
+                if carve_process.poll() is None:
+                    _terminate_tree(carve_process)
+                _close_streams(carve_process)
+
+            names: list[str] = []
+            unsafe_entries = False
+            with os.scandir(objects_dir) as entries:
+                for entry in entries:
+                    if is_cancelled():
+                        raise PipelineError("CANCELLED", "Offline parser cancelled")
+                    if time.monotonic() >= stage_deadline:
+                        partial = True
+                        break
+                    try:
+                        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                            unsafe_entries = True
+                            continue
+                    except OSError:
+                        unsafe_entries = True
+                        continue
+                    names.append(entry.name)
+                    if len(names) > limits.yara_max_objects:
+                        partial = True
+                        break
+            names.sort()
+            names = names[: limits.yara_max_objects]
+            if unsafe_entries:
+                partial = True
+            if carve_state == "failed" and not names:
+                return _stage("yara", "failed", "TShark HTTP object export failed; TShark and Zeek evidence were retained."), []
+
+            object_meta: dict[int, tuple[str, int]] = {}
+            for object_index, original_name in enumerate(names, start=1):
+                if is_cancelled():
+                    raise PipelineError("CANCELLED", "Offline parser cancelled")
+                if time.monotonic() >= stage_deadline:
+                    partial = True
+                    break
+                original = objects_dir / original_name
+                safe_path = objects_dir / f"object-{object_index:06d}.bin"
+                try:
+                    info = original.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+                        partial = True
+                        continue
+                    if info.st_size > limits.yara_max_object_bytes or carved_bytes + info.st_size > limits.yara_max_total_bytes:
+                        partial = True
+                        continue
+                    os.replace(original, safe_path)
+                    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                    fd = os.open(safe_path, flags)
+                    digest = hashlib.sha256()
+                    size = 0
+                    with os.fdopen(fd, "rb") as object_file:
+                        opened = os.fstat(object_file.fileno())
+                        if not stat.S_ISREG(opened.st_mode) or opened.st_size != info.st_size:
+                            partial = True
+                            safe_path.unlink(missing_ok=True)
+                            continue
+                        while True:
+                            if is_cancelled():
+                                raise PipelineError("CANCELLED", "Offline parser cancelled")
+                            if time.monotonic() >= stage_deadline:
+                                partial = True
+                                break
+                            block = object_file.read(64 * 1024)
+                            if not block:
+                                break
+                            size += len(block)
+                            if size > limits.yara_max_object_bytes or carved_bytes + size > limits.yara_max_total_bytes:
+                                partial = True
+                                break
+                            digest.update(block)
+                    if partial and time.monotonic() >= stage_deadline:
+                        break
+                    if size != info.st_size:
+                        partial = True
+                        safe_path.unlink(missing_ok=True)
+                        continue
+                    carved_bytes += size
+                    object_meta[object_index] = (digest.hexdigest(), size)
+                except PipelineError:
+                    raise
+                except OSError:
+                    partial = True
+
+            objects_scanned = len(object_meta)
+            if carve_state != "completed":
+                partial = True
+
+            if objects_scanned:
+                remaining = stage_deadline - time.monotonic()
+                if remaining <= 0:
+                    partial = True
+                else:
+                    result_path = run_dir / "yara-results.txt"
+                    scan_list = run_dir / "yara-scan-list.txt"
+                    scan_list.write_text(
+                        "".join(f"{(objects_dir / f'object-{index:06d}.bin').resolve()}\n" for index in object_meta),
+                        encoding="utf-8",
+                    )
+                    yara_timeout = max(1, min(limits.yara_timeout_seconds, int(math.ceil(remaining))))
+                    yara_command = [
+                        yara,
+                        f"--timeout={yara_timeout}",
+                        "--threads=1",
+                        "--no-follow-symlinks",
+                        "--recursive",
+                        f"--max-rules={limits.yara_max_matches + 1}",
+                        *(str(rule_path) for rule_path in ruleset.files),
+                        "--scan-list", str(scan_list),
+                    ]
+                    with result_path.open("wb") as result_file:
+                        yara_process = _spawn(
+                            yara_command,
+                            limits=limits,
+                            cwd=str(objects_dir),
+                            memory_mb=limits.yara_memory_mb,
+                            timeout_seconds=min(remaining, float(limits.yara_timeout_seconds)),
+                            file_size_limit_bytes=limits.yara_max_output_bytes,
+                            stdout_target=result_file,
+                            stderr_target=subprocess.DEVNULL,
+                        )
+                        try:
+                            yara_state = _drain_command(
+                                yara_process,
+                                deadline=stage_deadline,
+                                is_cancelled=is_cancelled,
+                                output_budget_bytes=limits.yara_max_output_bytes,
+                                watched_file=result_path,
+                                watched_file_budget_bytes=limits.yara_max_output_bytes,
+                            )
+                        finally:
+                            if yara_process.poll() is None:
+                                _terminate_tree(yara_process)
+                            _close_streams(yara_process)
+                    try:
+                        result_bytes = result_path.stat().st_size
+                    except OSError:
+                        result_bytes = limits.yara_max_output_bytes + 1
+                    if result_bytes > limits.yara_max_output_bytes:
+                        partial = True
+                    elif yara_state == "partial":
+                        partial = True
+                    elif yara_state == "failed":
+                        partial = True
+
+                    valid_objects = {f"object-{index:06d}.bin": (index, *meta) for index, meta in object_meta.items()}
+                    parsed_results = 0
+                    try:
+                        with result_path.open("rb") as result_file:
+                            for raw_line in result_file:
+                                if is_cancelled():
+                                    raise PipelineError("CANCELLED", "Offline parser cancelled")
+                                if time.monotonic() >= stage_deadline:
+                                    partial = True
+                                    break
+                                line = raw_line.decode("utf-8", errors="replace").strip()
+                                if not line:
+                                    continue
+                                parts = line.split(maxsplit=1)
+                                if len(parts) != 2 or parts[0] not in ruleset.rule_names:
+                                    partial = True
+                                    continue
+                                basename = Path(parts[1]).name
+                                meta = valid_objects.get(basename)
+                                if meta is None:
+                                    partial = True
+                                    continue
+                                object_index, object_hash, object_size = meta
+                                matches.append(
+                                    NormalizedYaraMatch(
+                                        rule_id=parts[0],
+                                        object_index=object_index,
+                                        object_sha256=object_hash,
+                                        object_size_bytes=object_size,
+                                        ruleset_sha256=ruleset.sha256,
+                                    )
+                                )
+                                parsed_results += 1
+                                if parsed_results > limits.yara_max_matches:
+                                    matches = matches[: limits.yara_max_matches]
+                                    partial = True
+                                    break
+                    except OSError:
+                        partial = True
+                    if yara_state == "failed" and not matches:
+                        return _stage("yara", "failed", "The local YARA scan failed; TShark and Zeek evidence were retained."), []
+
+            detail = (
+                f"Offline YARA scanned {objects_scanned} HTTP object(s), retained {len(matches)} rule match(es), "
+                f"using the configured operator ruleset; limits: {limits.yara_max_objects} objects, "
+                f"{limits.yara_max_total_bytes} object bytes, {limits.yara_max_matches} matches, "
+                f"{limits.yara_timeout_seconds}s, {limits.yara_memory_mb} MiB. Raw objects were temporary and are not evidence."
+            )
+            if partial:
+                return _stage("yara", "partial", detail + " One or more configured bounds or parser conditions limited coverage."), matches
+            return _stage("yara", "completed", detail), matches
+    except PipelineError:
+        raise
+    except YaraRulesError:
+        return _stage("yara", "failed", "The operator YARA ruleset is invalid, unsafe, or exceeds its configured bounds."), []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return _stage("yara", "failed", "HTTP carving or local YARA scanning failed; TShark evidence was retained."), []
 
 
 _ARP_IS_AT_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3})\s+is at\s+([0-9A-Fa-f:]{11,17})", re.I)
@@ -2213,6 +2745,7 @@ def _analyze_csv_capture(
     is_cancelled: Callable[[], bool],
     triage_cfg: object | None,
     triage_enabled: bool,
+    triage_endpoint_consent: bool,
 ) -> EvidenceBundle:
     """Stream-parse a Wireshark CSV/TSV export line-by-line with bounded memory."""
     accumulator = _Accumulator(
@@ -2406,15 +2939,18 @@ def _analyze_csv_capture(
     parser_state = "partial" if deadline_hit or (limits.packet_limit > 0 and accumulator.rows_seen > limits.packet_limit) else "completed"
     parser_detail = f"Wireshark CSV/TSV export was parsed incrementally (mode={limits.mode_label}); full binary packet payloads unavailable."
     zeek_stage = _stage("zeek", "skipped", "Zeek offline parsing applies to binary PCAP/PCAPNG captures only.")
+    yara_stage = _stage("yara", "skipped", "HTTP object carving/YARA applies to binary PCAP/PCAPNG captures only.")
     return _build_bundle(
         accumulator,
         capture_sha256=capture_sha256,
         parser_state=parser_state,
         parser_detail=parser_detail,
         zeek_stage=zeek_stage,
+        yara_stage=yara_stage,
         parser_name="wireshark-csv-offline",
         triage_cfg=triage_cfg,
         triage_enabled=triage_enabled,
+        triage_endpoint_consent=triage_endpoint_consent,
     )
 
 
@@ -2426,6 +2962,7 @@ def analyze_capture(
     *,
     resource_mode: str | None = None,
     triage_enabled: bool = True,
+    triage_endpoint_consent: bool = False,
 ) -> EvidenceBundle:
     """Analyze a PCAP/PCAPNG or Wireshark CSV/TSV capture offline with bounded memory."""
     if not isinstance(path, Path):
@@ -2450,6 +2987,7 @@ def analyze_capture(
             is_cancelled=is_cancelled,
             triage_cfg=triage_cfg,
             triage_enabled=triage_enabled,
+            triage_endpoint_consent=triage_endpoint_consent,
         )
 
     tshark = shutil.which("tshark")
@@ -2497,8 +3035,9 @@ def analyze_capture(
         else f"TShark fields were parsed incrementally (mode={limits.mode_label}); full-capture coverage is not claimed."
     )
 
+    zeek_records: list[NormalizedZeekRow] = []
     if limits.zeek_enabled:
-        zeek_stage = _run_zeek(
+        zeek_stage, zeek_records = _run_zeek(
             path,
             limits=limits,
             deadline=deadline,
@@ -2506,14 +3045,24 @@ def analyze_capture(
         )
     else:
         zeek_stage = _stage("zeek", "skipped", "Optional Zeek stage is disabled by settings.")
+    yara_stage, yara_records = _run_yara(
+        path,
+        limits=limits,
+        deadline=deadline,
+        is_cancelled=is_cancelled,
+    )
     return _build_bundle(
         accumulator,
         capture_sha256=capture_sha256,
         parser_state=parser_state,
         parser_detail=parser_detail,
         zeek_stage=zeek_stage,
+        zeek_records=zeek_records,
+        yara_stage=yara_stage,
+        yara_records=yara_records,
         triage_cfg=triage_cfg,
         triage_enabled=triage_enabled,
+        triage_endpoint_consent=triage_endpoint_consent,
     )
 
 

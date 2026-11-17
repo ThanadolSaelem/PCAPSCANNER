@@ -36,6 +36,8 @@ class HostCapabilities:
     tshark_version: str | None
     zeek_available: bool
     zeek_version: str | None
+    yara_available: bool = False
+    yara_version: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -190,6 +192,7 @@ def probe_capabilities(data_dir: Path | str = Path("./data/pcapscanner")) -> Hos
     disk_total, disk_free = _probe_disk(Path(data_dir))
     tshark_ok, tshark_ver = _probe_tool_version("tshark")
     zeek_ok, zeek_ver = _probe_tool_version("zeek")
+    yara_ok, yara_ver = _probe_tool_version("yara")
     return HostCapabilities(
         cpu_count=cpu_count,
         host_memory_total_mb=host_total_mb,
@@ -202,6 +205,8 @@ def probe_capabilities(data_dir: Path | str = Path("./data/pcapscanner")) -> Hos
         tshark_version=tshark_ver,
         zeek_available=zeek_ok,
         zeek_version=zeek_ver,
+        yara_available=yara_ok,
+        yara_version=yara_ver,
     )
 
 
@@ -395,6 +400,25 @@ def build_capabilities_payload(settings: object) -> dict[str, object]:
             "local_ingest_enabled": len(local_roots) > 0,
             "local_ingest_roots": local_roots,
             "native_picker_available": native_picker_available,
+            "batch_max_files": int(getattr(settings, "batch_max_files", 8)),
+            "batch_max_total_bytes": int(getattr(settings, "batch_max_total_bytes", 2 * 1024 * 1024 * 1024)),
+            "batch_admission_concurrency": int(getattr(settings, "batch_admission_concurrency", 2)),
+            "zeek_enabled": bool(getattr(settings, "zeek_enabled", False)),
+            "zeek_max_rows": int(getattr(settings, "zeek_max_rows", 2_000)),
+            "zeek_max_output_bytes": int(getattr(settings, "zeek_max_output_bytes", 32 * 1024 * 1024)),
+            "zeek_timeout_seconds": int(getattr(settings, "zeek_timeout_seconds", 45)),
+            "zeek_memory_mb": int(getattr(settings, "zeek_memory_mb", 256)),
+            "yara_enabled": bool(getattr(settings, "yara_enabled", False)),
+            "yara_rules_configured": bool(getattr(settings, "yara_rules_dir", None)),
+            "yara_max_rules_files": int(getattr(settings, "yara_max_rules_files", 64)),
+            "yara_max_rules_bytes": int(getattr(settings, "yara_max_rules_bytes", 16 * 1024 * 1024)),
+            "yara_max_objects": int(getattr(settings, "yara_max_objects", 100)),
+            "yara_max_object_bytes": int(getattr(settings, "yara_max_object_bytes", 16 * 1024 * 1024)),
+            "yara_max_total_bytes": int(getattr(settings, "yara_max_total_bytes", 64 * 1024 * 1024)),
+            "yara_max_matches": int(getattr(settings, "yara_max_matches", 200)),
+            "yara_max_output_bytes": int(getattr(settings, "yara_max_output_bytes", 1024 * 1024)),
+            "yara_timeout_seconds": int(getattr(settings, "yara_timeout_seconds", 30)),
+            "yara_memory_mb": int(getattr(settings, "yara_memory_mb", 256)),
         },
         "profiles": profiles,
         "triage": triage_info,

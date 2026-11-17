@@ -6,7 +6,11 @@ import hmac
 import json
 import mimetypes
 import os
+import re
+import secrets
 import sqlite3
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +22,10 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
 from .config import AppSettings, load_settings
+from .batch_upload import BatchUploadError, stage_batch_upload
 from .models import (
     AIResult,
+    BatchResponse,
     AnalysisRequest,
     ChunkUploadInitRequest,
     EvidenceBundle,
@@ -106,6 +112,31 @@ def _hash_and_peek_file(path: Path) -> tuple[str, int, bytes]:
     return digest.hexdigest(), total, bytes(prefix)
 
 
+def _finalize_chunked_upload(store: Store, upload_id: str) -> tuple[dict, str, str]:
+    """Serialize completeness checks, hashing, format validation, and publication."""
+    with store.upload_lock(upload_id):
+        pending = store.pending_upload(upload_id)
+        part = store.upload_part_path(upload_id)
+        expected = int(pending["expected_bytes"])
+        received = int(pending["bytes_received"])
+        try:
+            actual_size = part.stat().st_size
+        except OSError as exc:
+            raise HTTPException(409, "chunked_upload_incomplete") from exc
+        if received != expected or actual_size != expected:
+            raise HTTPException(409, "chunked_upload_incomplete")
+        sha256, total, prefix = _hash_and_peek_file(part)
+        if total != expected:
+            raise HTTPException(409, "chunked_upload_incomplete")
+        fmt = _detect_capture_format(prefix)
+        minimum = 28 if fmt == "pcapng" else (24 if fmt == "pcap" else 12)
+        if fmt is None or total < minimum:
+            store.abort_capture(upload_id, lock_held=True)
+            raise HTTPException(400, "invalid_capture_header")
+        row = store.complete_chunk_upload(upload_id, total, sha256, fmt, lock_held=True)
+        return row, sha256, fmt
+
+
 def _allowed_roots(cfg: AppSettings) -> list[Path]:
     roots: list[Path] = []
     for raw in getattr(cfg, "local_ingest_roots", []) or []:
@@ -133,7 +164,8 @@ def _resolve_local_file(raw_path: str, roots: list[Path]) -> Path:
 
 
 def profile_hash(settings: AppSettings) -> str:
-    return hashlib.sha256(settings.ai.model_dump_json().encode()).hexdigest()
+    policy = settings.ai.model_dump_json() + "\0" + settings.triage.model_dump_json()
+    return hashlib.sha256(policy.encode()).hexdigest()
 
 
 def problem(status: int, code: str, request_id: str | None = None, headers=None):
@@ -175,7 +207,7 @@ class BoundaryMiddleware:
             if not authorized:
                 return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
 
-        is_binary_upload = scope["path"] == "/api/v1/captures" or (
+        is_binary_upload = scope["path"] in {"/api/v1/captures", "/api/v1/batches"} or (
             scope["path"].startswith("/api/v1/captures/uploads/") and scope["path"].endswith("/chunk")
         )
         if scope["method"] in ("POST", "PUT", "PATCH") and not is_binary_upload:
@@ -221,6 +253,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         storage_max_bytes=initial_cfg.storage_max_bytes,
         storage_max_captures=initial_cfg.storage_max_captures,
         disk_reserve_bytes=getattr(initial_cfg, "disk_reserve_bytes", 256 * 1024 * 1024),
+        batch_admission_concurrency=initial_cfg.batch_admission_concurrency,
     )
     app = FastAPI(
         title="PCAPSCANNER Backend",
@@ -229,6 +262,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     )
     app.openapi_version = "3.1.0"
     app.state.settings, app.state.store = initial_cfg, initial_store
+    app.state.local_file_grants = {}
+    app.state.local_file_grants_lock = threading.Lock()
+    app.state.batch_admission = threading.BoundedSemaphore(initial_cfg.batch_admission_concurrency)
+    app.state.batch_admission_active = 0
+    app.state.batch_admission_state_lock = threading.Lock()
     app.add_middleware(BoundaryMiddleware, settings=initial_cfg)
 
     def _cfg() -> AppSettings:
@@ -236,6 +274,34 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     def _store() -> Store:
         return app.state.store
+
+    def _issue_local_file_grant(path: Path, sha256: str, size: int, st: os.stat_result) -> str:
+        now = time.monotonic()
+        with app.state.local_file_grants_lock:
+            grants = app.state.local_file_grants
+            for token, grant in list(grants.items()):
+                if grant["expires_at"] <= now:
+                    grants.pop(token, None)
+            if len(grants) >= LOCAL_FILE_GRANT_MAX_ENTRIES:
+                raise HTTPException(429, "local_file_grant_capacity")
+            token = secrets.token_urlsafe(32)
+            grants[token] = {
+                "path": str(path),
+                "sha256": sha256,
+                "size": size,
+                "device": st.st_dev,
+                "inode": st.st_ino,
+                "mtime_ns": st.st_mtime_ns,
+                "expires_at": now + LOCAL_FILE_GRANT_TTL_SECONDS,
+            }
+        return token
+
+    def _consume_local_file_grant(token: str) -> dict[str, object]:
+        with app.state.local_file_grants_lock:
+            grant = app.state.local_file_grants.pop(token, None)
+        if not grant or float(grant["expires_at"]) <= time.monotonic():
+            raise HTTPException(409, "local_file_grant_expired_or_used")
+        return grant
 
     def _workspace_state() -> dict[str, object]:
         cfg_now = _cfg()
@@ -286,6 +352,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if target_dir.exists() and not target_dir.is_dir():
                 raise HTTPException(400, "invalid_data_dir")
             if target_dir != store_now.root:
+                with app.state.batch_admission_state_lock:
+                    if app.state.batch_admission_active:
+                        raise HTTPException(409, "batch_admission_in_progress")
                 active_jobs = [j for j in store_now.jobs(50) if j.get("state") in ACTIVE]
                 if active_jobs:
                     raise HTTPException(409, "active_jobs_in_progress")
@@ -296,6 +365,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         storage_max_bytes=cfg_now.storage_max_bytes,
                         storage_max_captures=cfg_now.storage_max_captures,
                         disk_reserve_bytes=getattr(cfg_now, "disk_reserve_bytes", 256 * 1024 * 1024),
+                        batch_admission_concurrency=cfg_now.batch_admission_concurrency,
                     )
                 except (OSError, sqlite3.Error) as exc:
                     raise HTTPException(400, "invalid_data_dir") from exc
@@ -334,7 +404,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def http_error(request, exc):
-        return problem(exc.status_code, str(exc.detail), request.state.request_id)
+        return problem(exc.status_code, str(exc.detail), request.state.request_id, exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
@@ -429,20 +499,36 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "workspace": ws_state,
             }
 
-        # capture_file: validate capture extension & auto-allow its parent directory for zero-copy ingest
+        # A file selection grants one exact path once; it never authorizes the parent folder.
         if not picked.is_file():
             raise HTTPException(404, "local_file_not_found")
         if picked.suffix.lower() not in LOCAL_CAPTURE_EXTENSIONS:
             raise HTTPException(415, "unsupported_capture_extension")
-        merged_roots = list(cfg_now.local_ingest_roots or []) + [str(picked.parent)]
-        ws_state = _apply_workspace_mutation(new_roots=merged_roots)
+        resolved = picked.resolve(strict=True)
+        before = resolved.stat()
+        if cfg_now.upload_max_bytes > 0 and before.st_size > cfg_now.upload_max_bytes:
+            raise HTTPException(413, "capture_too_large")
+        sha256, total, prefix = await run_in_threadpool(_hash_and_peek_file, resolved)
+        after = resolved.stat()
+        fmt = _detect_capture_format(prefix)
+        minimum = 28 if fmt == "pcapng" else (24 if fmt == "pcap" else 12)
+        if fmt is None or total < minimum:
+            raise HTTPException(400, "invalid_capture_header")
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ) or total != after.st_size:
+            raise HTTPException(409, "local_file_changed_during_selection")
+        grant_token = _issue_local_file_grant(resolved, sha256, total, after)
         return {
             "cancelled": False,
             "purpose": "capture_file",
-            "selected_path": str(picked),
-            "filename": picked.name,
-            "size_bytes": picked.stat().st_size,
-            "workspace": ws_state,
+            "selected_path": None,
+            "file_grant_token": grant_token,
+            "filename": resolved.name,
+            "size_bytes": total,
+            "sha256": sha256,
+            "grant_expires_in_seconds": LOCAL_FILE_GRANT_TTL_SECONDS,
+            "workspace": _workspace_state(),
         }
 
     @app.post(
@@ -464,7 +550,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         length = request.headers.get("content-length")
         declared_size: int | None = None
         upload_limit = cfg_now.upload_max_bytes
-        if length:
+        if length is not None:
             try:
                 declared_size = int(length)
                 if declared_size < 0:
@@ -477,13 +563,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         raw_name = request.headers.get("x-capture-filename", "").strip()
         clean_name = Path(raw_name).name[:255] if raw_name else None
         reserve_bytes = declared_size if declared_size is not None else (upload_limit if upload_limit > 0 else 0)
+        charge_actual_bytes = declared_size is None and upload_limit == 0
         cid = store_now.reserve_capture(reserve_bytes, filename=clean_name)
         path, digest, total, prefix = store_now.capture_path(cid, "pcap"), hashlib.sha256(), 0, bytearray()
+        write_buffer = bytearray()
+        write_block_bytes = 1024 * 1024
         try:
             with open(path, "xb") as f:
                 os.chmod(path, 0o600)
                 async for chunk in request.stream():
                     total += len(chunk)
+                    if declared_size is not None and total > declared_size:
+                        raise HTTPException(400, "content_length_mismatch")
                     if upload_limit > 0 and total > upload_limit:
                         raise HTTPException(413, "capture_too_large")
                     if len(prefix) < 512:
@@ -494,7 +585,22 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                             if b"\n" in prefix or len(prefix) >= 256:
                                 raise HTTPException(400, "invalid_capture_magic")
                     digest.update(chunk)
-                    f.write(chunk)
+                    for offset in range(0, len(chunk), write_block_bytes):
+                        write_buffer.extend(chunk[offset:offset + write_block_bytes])
+                        if len(write_buffer) == write_block_bytes:
+                            block = bytes(write_buffer)
+                            write_buffer.clear()
+                            if charge_actual_bytes:
+                                await run_in_threadpool(store_now.write_unreserved_capture_chunk, cid, f, block)
+                            else:
+                                await run_in_threadpool(store_now.write_capture_chunk, f, block)
+                if write_buffer:
+                    if charge_actual_bytes:
+                        await run_in_threadpool(store_now.write_unreserved_capture_chunk, cid, f, bytes(write_buffer))
+                    else:
+                        await run_in_threadpool(store_now.write_capture_chunk, f, bytes(write_buffer))
+                if declared_size is not None and total != declared_size:
+                    raise HTTPException(400, "content_length_mismatch")
             fmt = _detect_capture_format(bytes(prefix))
             if fmt is None:
                 raise HTTPException(400, "invalid_capture_header")
@@ -520,6 +626,103 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "filename": clean_name,
             "validation": "header_only_full_validation_in_worker",
         }
+
+    @app.post(
+        "/api/v1/batches",
+        status_code=202,
+        tags=["Batches"],
+        response_model=BatchResponse,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["files"],
+                            "properties": {"files": {"type": "array", "items": {"type": "string", "format": "binary"}}},
+                        }
+                    }
+                },
+            }
+        },
+    )
+    async def create_batch(
+        request: Request,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=128)] = None,
+    ):
+        if idempotency_key is not None and not re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", idempotency_key):
+            raise HTTPException(400, "invalid_idempotency_key")
+        if not app.state.batch_admission.acquire(blocking=False):
+            raise HTTPException(429, "batch_admission_busy", headers={"Retry-After": "2"})
+        with app.state.batch_admission_state_lock:
+            app.state.batch_admission_active += 1
+        store_now, cfg_now = _store(), _cfg()
+        staged = []
+        try:
+            with store_now.batch_upload_slot(cfg_now.batch_admission_concurrency):
+                total_limit = cfg_now.batch_max_total_bytes
+                per_file_limit = min(cfg_now.upload_max_bytes, total_limit) if cfg_now.upload_max_bytes > 0 else total_limit
+                try:
+                    staged = await stage_batch_upload(
+                        request,
+                        store_now.batch_staging_dir,
+                        max_files=cfg_now.batch_max_files,
+                        max_file_bytes=per_file_limit,
+                        max_total_bytes=total_limit,
+                        max_staging_bytes=total_limit * cfg_now.batch_admission_concurrency,
+                        staging_writer=store_now.write_batch_staging_chunk,
+                    )
+                except BatchUploadError as exc:
+                    raise HTTPException(exc.status, exc.code) from exc
+
+                policy = profile_hash(cfg_now)
+                manifest = {
+                    "items": [
+                        {"sha256": item.sha256, "size_bytes": item.size_bytes, "format": item.format}
+                        for item in staged
+                    ],
+                    "policy_hash": policy,
+                    "ai_enabled": False,
+                    "triage_enabled": True,
+                    "triage_endpoint_consent": False,
+                    "resource_mode": "auto",
+                }
+                request_digest = hashlib.sha256(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                staged_payload = [
+                    {"path": item.path, "size_bytes": item.size_bytes, "sha256": item.sha256, "format": item.format}
+                    for item in staged
+                ]
+                return await run_in_threadpool(
+                    store_now.create_batch,
+                    staged_payload,
+                    request_sha256=request_digest,
+                    policy_hash=policy,
+                    idempotency_key=idempotency_key,
+                )
+        finally:
+            for item in staged:
+                try:
+                    item.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            with app.state.batch_admission_state_lock:
+                app.state.batch_admission_active -= 1
+            app.state.batch_admission.release()
+
+    @app.get("/api/v1/batches", tags=["Batches"], response_model=list[BatchResponse])
+    def list_batches(limit: Annotated[int, Query(ge=1, le=100)] = 20):
+        return _store().batches(limit)
+
+    @app.get("/api/v1/batches/{batch_id}", tags=["Batches"], response_model=BatchResponse)
+    def get_batch(batch_id: str):
+        return _store().batch(batch_id)
+
+    @app.post("/api/v1/batches/{batch_id}/cancel", tags=["Batches"], response_model=BatchResponse)
+    def cancel_batch(batch_id: str):
+        return _store().cancel_batch(batch_id)
 
     @app.post("/api/v1/captures/uploads", status_code=201, tags=["Captures"])
     def init_chunked_upload(body: ChunkUploadInitRequest):
@@ -581,24 +784,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     @app.post("/api/v1/captures/uploads/{upload_id}/complete", tags=["Captures"])
     async def finish_chunked_upload(upload_id: str):
         store_now = _store()
-        store_now.pending_upload(upload_id)
-        part = store_now.upload_part_path(upload_id)
-        if not part.is_file():
-            raise HTTPException(404, "upload_not_found")
-        sha256, total, prefix = await run_in_threadpool(_hash_and_peek_file, part)
-        fmt = _detect_capture_format(prefix)
-        if fmt is None:
-            store_now.abort_capture(upload_id)
-            raise HTTPException(400, "invalid_capture_header")
-        minimum = 28 if fmt == "pcapng" else (24 if fmt == "pcap" else 12)
-        if total < minimum:
-            store_now.abort_capture(upload_id)
-            raise HTTPException(400, "invalid_capture_header")
-        row = store_now.complete_chunk_upload(upload_id, total, sha256, fmt)
+        row, sha256, fmt = await run_in_threadpool(_finalize_chunked_upload, store_now, upload_id)
         return {
             "capture_id": row["id"],
             "sha256": sha256,
-            "size_bytes": total,
+            "size_bytes": row["size"],
             "format": fmt,
             "filename": row["filename"],
             "validation": "header_only_full_validation_in_worker",
@@ -644,9 +834,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     @app.post("/api/v1/captures/local", status_code=201, tags=["Captures"])
     async def register_local_capture(body: LocalCaptureRequest):
-        roots = _allowed_roots(_cfg())
-        target = _resolve_local_file(body.path, roots)
+        cfg_now = _cfg()
+        if body.file_grant_token:
+            grant = _consume_local_file_grant(body.file_grant_token)
+            try:
+                target = Path(str(grant["path"])).resolve(strict=True)
+                current = target.stat()
+            except OSError as exc:
+                raise HTTPException(409, "local_file_changed_after_selection") from exc
+            if not target.is_file() or (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+            ) != (grant["device"], grant["inode"], grant["size"], grant["mtime_ns"]):
+                raise HTTPException(409, "local_file_changed_after_selection")
+        else:
+            roots = _allowed_roots(cfg_now)
+            target = _resolve_local_file(body.path or "", roots)
         sha256, total, prefix = await run_in_threadpool(_hash_and_peek_file, target)
+        if cfg_now.upload_max_bytes > 0 and total > cfg_now.upload_max_bytes:
+            raise HTTPException(413, "capture_too_large")
+        if body.file_grant_token and (sha256 != grant["sha256"] or total != grant["size"]):
+            raise HTTPException(409, "local_file_changed_after_selection")
         fmt = _detect_capture_format(prefix)
         if fmt is None:
             raise HTTPException(400, "invalid_capture_header")
@@ -805,3 +1015,5 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     app.openapi = secured_openapi
     return app
+LOCAL_FILE_GRANT_TTL_SECONDS = 300
+LOCAL_FILE_GRANT_MAX_ENTRIES = 128

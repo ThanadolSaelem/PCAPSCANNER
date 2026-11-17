@@ -18,6 +18,8 @@ export interface HostCapabilities {
   tshark_version: string | null;
   zeek_available: boolean;
   zeek_version: string | null;
+  yara_available?: boolean;
+  yara_version?: string | null;
 }
 
 export interface AdaptiveProfile {
@@ -36,7 +38,9 @@ export interface TriageConfigInfo {
   enabled: boolean;
   mode: string;
   model_name: string;
+  endpoint_url?: string | null;
   endpoint_configured?: boolean;
+  etbert_endpoint_url?: string | null;
   etbert_enabled?: boolean;
   etbert_endpoint_configured?: boolean;
   etbert_model_name?: string;
@@ -66,6 +70,25 @@ export interface SystemCapabilities {
     local_ingest_enabled: boolean;
     local_ingest_roots: string[];
     native_picker_available?: boolean;
+    batch_max_files: number;
+    batch_max_total_bytes: number;
+    batch_admission_concurrency: number;
+    zeek_enabled: boolean;
+    zeek_max_rows: number;
+    zeek_max_output_bytes: number;
+    zeek_timeout_seconds: number;
+    zeek_memory_mb: number;
+    yara_enabled?: boolean;
+    yara_rules_configured?: boolean;
+    yara_max_rules_files?: number;
+    yara_max_rules_bytes?: number;
+    yara_max_objects?: number;
+    yara_max_object_bytes?: number;
+    yara_max_total_bytes?: number;
+    yara_max_matches?: number;
+    yara_max_output_bytes?: number;
+    yara_timeout_seconds?: number;
+    yara_memory_mb?: number;
   };
   profiles: Record<ResourceMode, AdaptiveProfile>;
   triage: TriageConfigInfo;
@@ -95,8 +118,11 @@ export interface NativePickResponse {
   cancelled: boolean;
   purpose: NativePickPurpose;
   selected_path: string | null;
+  file_grant_token?: string | null;
   filename?: string | null;
   size_bytes?: number | null;
+  sha256?: string | null;
+  grant_expires_in_seconds?: number | null;
   workspace: WorkspaceConfigState;
 }
 
@@ -134,6 +160,33 @@ export interface CaptureReceipt {
   filename?: string | null;
   source_kind?: string;
   validation: string;
+}
+
+export type BatchItemState = JobSummary["state"];
+export type BatchState = "queued" | "running" | "partial" | "completed" | "failed" | "cancelled";
+
+export interface BatchItemSummary {
+  index: number;
+  capture_id: string;
+  analysis_id: string;
+  sha256: string;
+  size_bytes: number;
+  format: "pcap" | "pcapng";
+  state: BatchItemState;
+  error_code: string | null;
+  evidence_available: boolean;
+}
+
+export interface BatchSummary {
+  batch_id: string;
+  created_at: string;
+  state: BatchState;
+  total_items: number;
+  completed_items: number;
+  failed_items: number;
+  partial_items: number;
+  cancelled_items: number;
+  items: BatchItemSummary[];
 }
 
 export interface ChunkUploadInitResponse {
@@ -175,7 +228,7 @@ export interface BackendCoverage {
 
 export interface BackendEvidence {
   evidence_id: string;
-  kind: "flow" | "dns" | "tls" | "packet" | "arp" | "http" | "icmp" | "wlan";
+  kind: "flow" | "dns" | "tls" | "packet" | "arp" | "http" | "icmp" | "wlan" | "zeek" | "yara";
   summary: string;
   packet_refs: number[];
   attributes: Record<string, string | number | boolean>;
@@ -265,9 +318,9 @@ export interface AIResult {
   prompt_sha256?: string | null;
   usage?: Record<string, number>;
   report?: {
-    summary: string;
+    summary: { claim: string; evidence_ids: string[] }[];
     assessments: { finding_id: string; interpretation: string; confidence: "low" | "medium" | "high"; evidence_ids: string[] }[];
-    limitations: string[];
+    limitations: { claim: string; evidence_ids: string[] }[];
     recommended_actions: { action: string; evidence_ids: string[] }[];
   } | null;
   warnings?: string[];
@@ -289,6 +342,7 @@ export interface JobSummary {
   ai_state: string | null;
   resource_mode?: ResourceMode;
   triage_enabled?: boolean;
+  triage_endpoint_consent?: boolean;
   capture_filename?: string | null;
   capture_size_bytes?: number | null;
   capture_format?: string | null;
@@ -439,11 +493,14 @@ export class PcapApiClient {
     return this.requestJson<LocalBrowseResponse>("/api/v1/captures/local/browse");
   }
 
-  registerLocalCapture(path: string): Promise<CaptureReceipt> {
+  registerLocalCapture(input: { path?: string; fileGrantToken?: string }): Promise<CaptureReceipt> {
     return this.requestJson<CaptureReceipt>("/api/v1/captures/local", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({
+        ...(input.path ? { path: input.path } : {}),
+        ...(input.fileGrantToken ? { file_grant_token: input.fileGrantToken } : {}),
+      }),
     });
   }
 
@@ -462,7 +519,11 @@ export class PcapApiClient {
     const contentType =
       ext === "csv" ? "text/csv" : ext === "tsv" ? "text/tab-separated-values" : "application/vnd.tcpdump.pcap";
 
-    const recommendedChunk = Math.max(1024 * 1024, Math.min(32 * 1024 * 1024, options.chunkSizeBytes ?? 8 * 1024 * 1024));
+    const requestedChunk = options.chunkSizeBytes;
+    if (!Number.isSafeInteger(requestedChunk) || !requestedChunk || requestedChunk <= 0) {
+      throw new ApiProblemError(0, "server_limits_unavailable", "Backend upload limits must be loaded before uploading.");
+    }
+    const recommendedChunk = Math.min(requestedChunk, 32 * 1024 * 1024);
 
     // Fast single-request stream for compact captures under 8 MiB when not resuming
     if (file.size <= Math.min(recommendedChunk, 8 * 1024 * 1024) && !options.resumeUploadId) {
@@ -529,7 +590,10 @@ export class PcapApiClient {
         }),
       });
       uploadId = init.upload_id;
-      chunkSize = Math.max(1024 * 1024, Math.min(32 * 1024 * 1024, init.chunk_size_bytes || recommendedChunk));
+      if (!Number.isSafeInteger(init.chunk_size_bytes) || init.chunk_size_bytes <= 0) {
+        throw new ApiProblemError(502, "invalid_server_chunk_size", "Backend returned an invalid upload chunk size.");
+      }
+      chunkSize = Math.min(init.chunk_size_bytes, 32 * 1024 * 1024);
       offset = init.offset;
       options.onUploadInit?.(uploadId);
     } else {
@@ -610,12 +674,42 @@ export class PcapApiClient {
     return this.requestJson<void>(`/api/v1/captures/uploads/${uploadId}`, { method: "DELETE" });
   }
 
+  uploadBatch(
+    files: File[],
+    options: { idempotencyKey?: string; signal?: AbortSignal } = {},
+  ): Promise<BatchSummary> {
+    const form = new FormData();
+    for (const file of files) form.append("files", file, file.name);
+    const headers: Record<string, string> = {};
+    if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
+    return this.requestJson<BatchSummary>("/api/v1/batches", {
+      method: "POST",
+      signal: options.signal,
+      headers,
+      body: form,
+    });
+  }
+
+  listBatches(limit = 20, signal?: AbortSignal): Promise<BatchSummary[]> {
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+    return this.requestJson<BatchSummary[]>(`/api/v1/batches?limit=${boundedLimit}`, { signal });
+  }
+
+  getBatch(batchId: string, signal?: AbortSignal): Promise<BatchSummary> {
+    return this.requestJson<BatchSummary>(`/api/v1/batches/${batchId}`, { signal });
+  }
+
+  cancelBatch(batchId: string): Promise<BatchSummary> {
+    return this.requestJson<BatchSummary>(`/api/v1/batches/${batchId}/cancel`, { method: "POST" });
+  }
+
   startAnalysis(params: {
     captureId: string;
     aiEnabled: boolean;
     aiConsent: boolean;
     resourceMode: ResourceMode;
     triageEnabled: boolean;
+    triageEndpointConsent: boolean;
     idempotencyKey?: string;
   }): Promise<JobSummary> {
     return this.requestJson<JobSummary>("/api/v1/analyses", {
@@ -630,6 +724,7 @@ export class PcapApiClient {
         ai_consent: params.aiConsent,
         resource_mode: params.resourceMode,
         triage_enabled: params.triageEnabled,
+        triage_endpoint_consent: params.triageEndpointConsent,
       }),
     });
   }

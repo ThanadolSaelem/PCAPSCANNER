@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import fs from "node:fs";
 import test from "node:test";
+import { PcapApiClient } from "../src/api/client.ts";
+import { resolveBatchLimits } from "../src/utils/batchLimits.ts";
 import {
   adaptBackendReport,
-  demoAsWorkspaceReport,
   exportReportJson,
   exportReportMarkdown,
   exportTriageJsonlFallback,
   extractLaunchHashCredentials,
   formatBytes,
+  packetCoverageSummary,
 } from "../src/utils/adapters.ts";
 import {
   WiresharkCsvStreamAnalyzer,
@@ -17,6 +17,47 @@ import {
   inspectCaptureHeaderBytes,
   parseCsvRow,
 } from "../src/utils/localAnalyzer.ts";
+
+test("batch upload uses repeated multipart file parts and stable request headers", async () => {
+  const previousFetch = globalThis.fetch;
+  const client = new PcapApiClient("http://127.0.0.1:8000/", "local-test-token");
+  const files = [new File(["pcap-one"], "one.pcap"), new File(["pcap-two"], "two.pcapng")];
+  globalThis.fetch = async (input, init = {}) => {
+    assert.equal(input, "http://127.0.0.1:8000/api/v1/batches");
+    assert.equal(init.method, "POST");
+    assert.equal(init.headers.Authorization, "Bearer local-test-token");
+    assert.equal(init.headers["Idempotency-Key"], "batch-key-001");
+    assert.equal(init.headers["Content-Type"], undefined);
+    assert.ok(init.body instanceof FormData);
+    const parts = init.body.getAll("files");
+    assert.equal(parts.length, 2);
+    assert.deepEqual(parts.map((part) => part.name), ["one.pcap", "two.pcapng"]);
+    return new Response(JSON.stringify({
+      batch_id: "a".repeat(32), created_at: "2026-11-16T00:00:00Z", state: "queued",
+      total_items: 2, completed_items: 0, failed_items: 0, cancelled_items: 0, items: [],
+    }), { status: 202, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const receipt = await client.uploadBatch(files, { idempotencyKey: "batch-key-001" });
+    assert.equal(receipt.batch_id, "a".repeat(32));
+    assert.equal(receipt.state, "queued");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("batch limit resolver does not invent values before server capabilities load", () => {
+  assert.equal(resolveBatchLimits(null), null);
+  assert.equal(resolveBatchLimits({ batch_max_files: 0, batch_max_total_bytes: 2048, effective_upload_max_bytes: 0 }), null);
+  assert.deepEqual(
+    resolveBatchLimits({ batch_max_files: 8, batch_max_total_bytes: 2048, effective_upload_max_bytes: 0 }),
+    { maxFiles: 8, maxTotalBytes: 2048, maxFileBytes: 2048 },
+  );
+  assert.deepEqual(
+    resolveBatchLimits({ batch_max_files: 4, batch_max_total_bytes: 8192, effective_upload_max_bytes: 1024 }),
+    { maxFiles: 4, maxTotalBytes: 8192, maxFileBytes: 1024 },
+  );
+});
 
 test("inspectCaptureHeaderBytes recognizes PCAPNG, PCAP, CSV/TSV, and rejects invalid headers", () => {
   const pcapng = new Uint8Array([0x0a, 0x0d, 0x0d, 0x0a, 0x00, 0x00]);
@@ -71,34 +112,7 @@ test("WiresharkCsvStreamAnalyzer detects ARP spoofing, port spread, and high-ent
   assert.equal(report.timeline.length, 36);
 });
 
-test("WiresharkCsvStreamAnalyzer detects ARP spoofing in uploaded real folder.zip capture", () => {
-  const zipPath = "/home/antigravity/folder.zip";
-  if (!fs.existsSync(zipPath)) return;
-
-  const csvText = execFileSync("unzip", ["-p", zipPath], { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 });
-  const analyzer = new WiresharkCsvStreamAnalyzer("ARP_Poison.csv", Buffer.byteLength(csvText, "utf8"));
-  for (const line of csvText.split(/\r?\n/)) analyzer.feedLine(line);
-  const report = analyzer.finalize();
-
-  assert.ok(report.packetsAnalyzed > 900);
-  assert.ok(report.findings.some((f) => f.title.includes("192.168.10.1") && f.severity === "high"));
-  assert.ok(report.triage && report.triage.benign_filtered >= 1);
-});
-
 test("adapters export valid JSON, Markdown, and JSONL reports", () => {
-  const sample = demoAsWorkspaceReport(true);
-  const jsonOut = JSON.parse(exportReportJson(sample));
-  assert.equal(jsonOut.case_id, "CASE-2026-041");
-  assert.ok(Array.isArray(jsonOut.findings));
-
-  const mdOut = exportReportMarkdown(sample);
-  assert.match(mdOut, /# PCAPSCANNER Analysis Report/);
-  assert.match(mdOut, /Tier-1 Calibrated Triage/);
-
-  const jsonlOut = exportTriageJsonlFallback(sample);
-  const firstRow = JSON.parse(jsonlOut.trim().split("\n")[0]);
-  assert.ok(firstRow.evidence_id && firstRow.text);
-
   const live = adaptBackendReport({
     analysis_id: "1234567890abcdef",
     status: "completed",
@@ -117,6 +131,21 @@ test("adapters export valid JSON, Markdown, and JSONL reports", () => {
         warnings: ["Streaming unlimited mode"],
         stages: [{ name: "tshark", state: "completed", detail: "2M packets" }],
       },
+      triage: {
+        enabled: true,
+        model: "openjev-cal-tier1",
+        mode: "heuristic_calibrated",
+        total_evaluated: 1,
+        benign_filtered: 1,
+        escalated_count: 0,
+        uncertain_count: 0,
+        reduction_ratio: 1,
+        mean_confidence: 0.95,
+        mean_ppl: 1.02,
+        etbert_scored_count: 0,
+        top_classes: [],
+        escalated_evidence_ids: [],
+      },
       evidence: [
         {
           evidence_id: "EV-000001",
@@ -133,6 +162,69 @@ test("adapters export valid JSON, Markdown, and JSONL reports", () => {
   });
   assert.equal(live.sizeLabel, formatBytes(5_368_709_120));
   assert.equal(live.origin, "live");
+
+  const jsonOut = JSON.parse(exportReportJson(live));
+  assert.equal(jsonOut.case_id, "CASE-12345678");
+  assert.equal(jsonOut.origin, "live");
+  assert.ok(Array.isArray(jsonOut.findings));
+
+  const mdOut = exportReportMarkdown(live);
+  assert.match(mdOut, /# PCAPSCANNER Analysis Report/);
+  assert.match(mdOut, /Tier-1 Calibrated Triage/);
+
+  const jsonlOut = exportTriageJsonlFallback(live);
+  const firstRow = JSON.parse(jsonlOut.trim().split("\n")[0]);
+  assert.equal(firstRow.evidence_id, "EV-000001");
+  assert.ok(firstRow.text);
+
+  const cited = {
+    ...live,
+    ai: {
+      state: "completed",
+      provider: "openai-compatible",
+      model: "test-model",
+      report: {
+        summary: [{ claim: "Observed TCP flow", evidence_ids: ["EV-000001"] }],
+        assessments: [],
+        limitations: [{ claim: "Packet visibility is bounded", evidence_ids: ["EV-000001"] }],
+        recommended_actions: [{ action: "Review the cited flow", evidence_ids: ["EV-000001"] }],
+      },
+    },
+  };
+  const citedMarkdown = exportReportMarkdown(cited);
+  assert.match(citedMarkdown, /Observed TCP flow/);
+  assert.match(citedMarkdown, /Limitation: Packet visibility is bounded/);
+  assert.match(citedMarkdown, /Recommendation: Review the cited flow/);
+  assert.ok((citedMarkdown.match(/EV-000001/g) ?? []).length >= 3);
+
+  assert.ok(live.rawBundle);
+  const capped = adaptBackendReport({
+    analysis_id: live.analysisId,
+    status: "partial",
+    capture_filename: live.fileName,
+    capture_size_bytes: 5_368_709_120,
+    capture_format: "pcapng",
+    evidence: {
+      ...live.rawBundle,
+      coverage: {
+        ...live.rawBundle.coverage,
+        packets_seen: 1001,
+        packets_analyzed: 1000,
+        truncated: true,
+        warnings: ["Packet cap reached; packets_seen is capped at packet_limit+1 and is not the full capture count."],
+      },
+    },
+    disclaimer: "Capped analysis is incomplete.",
+  });
+  assert.equal(capped.packetCapReached, true);
+  assert.equal(capped.parsedPct, "Unknown — packet cap reached");
+  assert.match(packetCoverageSummary(capped), /total and coverage unknown/);
+  const cappedJson = JSON.parse(exportReportJson(capped));
+  assert.equal(cappedJson.packets_seen, null);
+  assert.equal(cappedJson.packets_seen_lower_bound, 1001);
+  assert.equal(cappedJson.packet_cap_reached, true);
+  assert.equal("priority_score" in cappedJson, false);
+  assert.match(exportReportMarkdown(capped), /packet cap was reached/);
 });
 
 test("extractLaunchHashCredentials parses loopback launcher tokens and rejects remote URL overrides", () => {
@@ -155,4 +247,3 @@ test("extractLaunchHashCredentials parses loopback launcher tokens and rejects r
   assert.equal(rejectedRemote.token, "tok_xyz");
   assert.equal(rejectedRemote.backendUrl, undefined);
 });
-

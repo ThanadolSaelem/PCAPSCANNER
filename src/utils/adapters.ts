@@ -5,17 +5,9 @@ import type {
   EvidenceBundle,
   Tier1Summary,
 } from "../api/client.ts";
-import type { Severity } from "../data/demo.ts";
-import {
-  capture as demoCapture,
-  findings as demoFindings,
-  flows as demoFlows,
-  packets as demoPackets,
-  stages as demoStages,
-  timeline as demoTimeline,
-} from "../data/demo.ts";
+export type Severity = "critical" | "high" | "medium" | "low";
 
-export type ReportOrigin = "live" | "local-csv" | "sample";
+export type ReportOrigin = "live" | "local-csv" | "empty";
 
 export interface WorkspaceFinding {
   id: string;
@@ -80,10 +72,9 @@ export interface WorkspaceReport {
   parsedPct: string;
   packetsAnalyzed: number;
   packetsSeen: number;
+  packetCapReached: boolean;
   flowCount: number;
   protocolSummary: string;
-  priorityScore: number;
-  priorityConfidence: string;
   stages: WorkspaceStage[];
   findings: WorkspaceFinding[];
   packets: WorkspacePacket[];
@@ -122,6 +113,16 @@ export function formatDuration(seconds: number): string {
 
 export function formatCompactCount(value: number): string {
   return value.toLocaleString("en-US");
+}
+
+export function packetCoverageSummary(
+  report: Pick<WorkspaceReport, "packetsAnalyzed" | "packetsSeen" | "packetCapReached" | "parsedPct">,
+): string {
+  if (report.packetCapReached) {
+    return `At least ${formatCompactCount(report.packetsSeen)} packets observed; ${formatCompactCount(report.packetsAnalyzed)} analyzed; capture total and coverage unknown because the packet cap was reached.`;
+  }
+  if (report.packetsSeen <= 0) return `${formatCompactCount(report.packetsAnalyzed)} analyzed; total packet count unavailable.`;
+  return `${formatCompactCount(report.packetsAnalyzed)} of ${formatCompactCount(report.packetsSeen)} packets (${report.parsedPct}).`;
 }
 
 function capConfidence(value: string): "High" | "Medium" | "Low" {
@@ -189,6 +190,36 @@ function buildFlowsFromEvidence(evidence: BackendEvidence[]): WorkspaceFlow[] {
   return flows;
 }
 
+export function emptyWorkspaceReport(): WorkspaceReport {
+  return {
+    analysisId: "",
+    origin: "empty",
+    status: "empty",
+    caseId: "—",
+    fileName: "No capture selected",
+    shaShort: "—",
+    fullSha: "",
+    sizeLabel: "—",
+    windowLabel: "—",
+    durationLabel: "—",
+    createdAt: "",
+    parsedPct: "Not available",
+    packetsAnalyzed: 0,
+    packetsSeen: 0,
+    packetCapReached: false,
+    flowCount: 0,
+    protocolSummary: "No protocol records",
+    stages: [],
+    findings: [],
+    packets: [],
+    flows: [],
+    timeline: [],
+    timelineLabels: [],
+    warnings: [],
+    disclaimer: "No analysis is selected. Upload a capture or choose a completed analysis job.",
+  };
+}
+
 export function adaptBackendReport(report: BackendReport): WorkspaceReport {
   const bundle = report.evidence;
   const evMap = new Map<string, BackendEvidence>();
@@ -216,9 +247,10 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
   });
 
   const telemetry = bundle.telemetry;
-  const seen = Math.max(1, bundle.coverage.packets_seen);
+  const seen = bundle.coverage.packets_seen;
   const analyzed = bundle.coverage.packets_analyzed;
-  const coveragePct = bundle.coverage.packets_seen > 0 ? Math.min(100, (analyzed / seen) * 100) : 100;
+  const packetCapReached = bundle.coverage.warnings.some((warning) => /packet cap reached/i.test(warning));
+  const coveragePct = !packetCapReached && seen > 0 ? Math.min(100, (analyzed / seen) * 100) : null;
 
   const protoEntries = telemetry?.protocol_counts ? Object.entries(telemetry.protocol_counts) : [];
   const totalProtoPkts = protoEntries.reduce((acc, [, n]) => acc + n, 0) || 1;
@@ -227,11 +259,11 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
         .slice(0, 3)
         .map(([k, v]) => `${k} ${Math.round((v / totalProtoPkts) * 100)}%`)
         .join(" · ")
-    : "Bounded L2-L7 metadata";
+    : "No protocol records";
 
   const tlBuckets = telemetry?.timeline ?? [];
   const maxBucket = tlBuckets.reduce((m, b) => Math.max(m, b.packets), 0) || 1;
-  const timeline = tlBuckets.length ? tlBuckets.map((b) => Math.max(5, Math.round((b.packets / maxBucket) * 100))) : [10];
+  const timeline = tlBuckets.length ? tlBuckets.map((b) => Math.max(5, Math.round((b.packets / maxBucket) * 100))) : [];
   const timelineLabels = tlBuckets.length
     ? [
         tlBuckets[0]?.label ?? "",
@@ -239,7 +271,7 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
         tlBuckets[Math.floor(tlBuckets.length * 0.66)]?.label ?? "",
         tlBuckets[tlBuckets.length - 1]?.label ?? "",
       ]
-    : ["0s", "", "", "end"];
+    : [];
 
   const samplePackets: WorkspacePacket[] =
     telemetry?.sample_packets?.map((p) => ({
@@ -301,11 +333,6 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
           : "Opt-in advisory narrator disabled",
   });
 
-  const highCount = findings.filter((f) => f.severity === "high").length;
-  const medCount = findings.filter((f) => f.severity === "medium").length;
-  const rawScore = Math.min(96, highCount * 35 + medCount * 16 + Math.min(18, findings.length * 4));
-  const priorityScore = findings.length === 0 ? 12 : Math.max(25, rawScore);
-
   const sha = bundle.capture_sha256;
   const startEnd =
     telemetry?.duration_seconds && telemetry.duration_seconds > 0
@@ -324,13 +351,12 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
     windowLabel: report.created_at ?? bundle.created_at,
     durationLabel: startEnd,
     createdAt: bundle.created_at,
-    parsedPct: `${coveragePct.toFixed(1)}%`,
+    parsedPct: packetCapReached ? "Unknown — packet cap reached" : coveragePct === null ? "Unavailable" : `${coveragePct.toFixed(1)}%`,
     packetsAnalyzed: analyzed,
-    packetsSeen: bundle.coverage.packets_seen,
+    packetsSeen: seen,
+    packetCapReached,
     flowCount: bundle.evidence.length,
     protocolSummary,
-    priorityScore,
-    priorityConfidence: highCount > 0 ? "Medium confidence" : findings.length > 0 ? "Low-Medium confidence" : "Baseline",
     stages,
     findings,
     packets: samplePackets,
@@ -345,85 +371,6 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
   };
 }
 
-export function demoAsWorkspaceReport(aiPreviewEnabled: boolean): WorkspaceReport {
-  return {
-    analysisId: "demo-sample",
-    origin: "sample",
-    status: "completed",
-    caseId: demoCapture.caseId,
-    fileName: demoCapture.fileName,
-    shaShort: demoCapture.sha,
-    fullSha: "b41c0000000000000000000000000000000000000000000000000000000091e2",
-    sizeLabel: demoCapture.size,
-    windowLabel: demoCapture.window,
-    durationLabel: demoCapture.duration,
-    createdAt: "2026-11-12T09:29:00Z",
-    parsedPct: demoCapture.parsed,
-    packetsAnalyzed: 1_248_302,
-    packetsSeen: 1_248_302,
-    flowCount: 8_402,
-    protocolSummary: "TCP 71% · UDP 25% · DNS 4%",
-    priorityScore: 62,
-    priorityConfidence: "Medium confidence",
-    stages: demoStages,
-    findings: demoFindings,
-    packets: demoPackets,
-    flows: demoFlows,
-    timeline: demoTimeline,
-    timelineLabels: ["09:14", "09:18", "09:22", "09:27 UTC"],
-    triage: {
-      enabled: true,
-      model: "openjev-cal-tier1 (sample preview)",
-      mode: "heuristic_calibrated",
-      total_evaluated: 8_402,
-      benign_filtered: 7_990,
-      escalated_count: 412,
-      uncertain_count: 38,
-      reduction_ratio: 0.951,
-      mean_confidence: 0.94,
-      mean_ppl: 1.19,
-      top_classes: [
-        { label: "Benign", count: 7990, avg_confidence: 0.96, escalated: 0 },
-        { label: "C2_Beaconing", count: 14, avg_confidence: 0.72, escalated: 14 },
-        { label: "DNS_Tunnel_DGA", count: 42, avg_confidence: 0.68, escalated: 42 },
-      ],
-      escalated_evidence_ids: ["EV-014", "EV-009", "EV-006", "EV-002"],
-    },
-    ai: aiPreviewEnabled
-      ? {
-          state: "completed",
-          provider: "sample-preview",
-          model: "demo-preview",
-          context_reduction: {
-            raw_evidence_count: 8402,
-            sent_evidence_count: 4,
-            benign_filtered_count: 7990,
-            reduction_pct: 99.95,
-          },
-          report: {
-            summary:
-              "Sample summary: internal host contacted external endpoint periodically (60.2s) and emitted high-entropy DNS labels. Tier-1 pre-filter removed 95.1% benign traffic before LLM synthesis.",
-            assessments: [
-              {
-                finding_id: "F-014",
-                interpretation: "Periodic TLS cadence should be correlated with host scheduled tasks or software updaters.",
-                confidence: "medium",
-                evidence_ids: ["EV-014"],
-              },
-            ],
-            limitations: ["Sample data only — upload or register a real capture to inspect live traffic."],
-            recommended_actions: [{ action: "Verify baseline process owning destination port 443", evidence_ids: ["EV-014"] }],
-          },
-        }
-      : { state: "disabled" },
-    warnings: [
-      "Sample preview mode uses documentation TEST-NET examples.",
-      "Connect the FastAPI backend to analyze multi-GB PCAP/PCAPNG captures with TShark & Tier-1 filtering.",
-    ],
-    disclaimer: "Detector findings are candidates. AI is advisory; missing findings do not certify safety.",
-  };
-}
-
 export function exportReportJson(report: WorkspaceReport): string {
   return JSON.stringify(
     {
@@ -433,7 +380,9 @@ export function exportReportJson(report: WorkspaceReport): string {
       case_id: report.caseId,
       filename: report.fileName,
       sha256: report.fullSha,
-      packets_seen: report.packetsSeen,
+      packets_seen: report.packetCapReached ? null : report.packetsSeen,
+      packets_seen_lower_bound: report.packetCapReached ? report.packetsSeen : null,
+      packet_cap_reached: report.packetCapReached,
       packets_analyzed: report.packetsAnalyzed,
       triage: report.triage ?? null,
       findings: report.findings,
@@ -455,7 +404,7 @@ export function exportReportMarkdown(report: WorkspaceReport): string {
     `- **Status**: ${report.status}`,
     `- **File**: \`${report.fileName}\` (${report.sizeLabel})`,
     `- **SHA-256**: \`${report.fullSha}\``,
-    `- **Coverage**: ${formatCompactCount(report.packetsAnalyzed)} / ${formatCompactCount(report.packetsSeen)} packets (${report.parsedPct})`,
+    `- **Coverage**: ${packetCoverageSummary(report)}`,
     `- **Protocol Mix**: ${report.protocolSummary}`,
     ``,
   ];
@@ -496,9 +445,26 @@ export function exportReportMarkdown(report: WorkspaceReport): string {
     lines.push(
       `## AI-Assisted Narrative (Advisory — ${report.ai.model ?? "provider"})`,
       ``,
-      report.ai.report.summary,
-      ``,
     );
+    for (const claim of report.ai.report.summary) {
+      lines.push(`- ${claim.claim}`, `  - Evidence: ${claim.evidence_ids.map((id) => `\`${id}\``).join(", ")}`);
+    }
+    for (const assessment of report.ai.report.assessments) {
+      lines.push(
+        `- [${assessment.finding_id}] (${assessment.confidence}) ${assessment.interpretation}`,
+        `  - Evidence: ${assessment.evidence_ids.map((id) => `\`${id}\``).join(", ")}`,
+      );
+    }
+    for (const claim of report.ai.report.limitations) {
+      lines.push(`- Limitation: ${claim.claim}`, `  - Evidence: ${claim.evidence_ids.map((id) => `\`${id}\``).join(", ")}`);
+    }
+    for (const recommendation of report.ai.report.recommended_actions) {
+      lines.push(
+        `- Recommendation: ${recommendation.action}`,
+        `  - Evidence: ${recommendation.evidence_ids.map((id) => `\`${id}\``).join(", ")}`,
+      );
+    }
+    lines.push("");
   }
 
   lines.push(`## Coverage Gaps & Disclaimer`, ``, `> ${report.disclaimer}`, ``);
