@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 
 def utcnow() -> str:
@@ -192,6 +192,27 @@ class AnalysisRequest(Contract):
             raise ValueError("AI processing requires explicit consent")
         if self.triage_endpoint_consent and not self.triage_enabled:
             raise ValueError("Tier-1 endpoint consent requires Tier-1 to be enabled")
+        return self
+
+
+class GroundedChatRequest(Contract):
+    question: str = Field(min_length=1, max_length=8_000)
+    consent: StrictBool
+
+
+class OSINTLookupRequest(Contract):
+    operation_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    candidate_ids: list[Annotated[str, Field(pattern=r"^IOC-[a-f0-9]{16}$")]] = Field(min_length=1, max_length=12)
+    providers: list[Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx"]] = Field(min_length=1, max_length=5)
+    consent: StrictBool
+    accept_uncertain_retry_risk: StrictBool = False
+
+    @model_validator(mode="after")
+    def unique_selection(self):
+        if len(set(self.candidate_ids)) != len(self.candidate_ids):
+            raise ValueError("duplicate_osint_candidate")
+        if len(set(self.providers)) != len(self.providers):
+            raise ValueError("duplicate_osint_provider")
         return self
 
 

@@ -39,6 +39,10 @@ from .models import (
     Tier1Summary,
     TimelineBucket,
 )
+from .dns_analysis import DNSObservation, analyze_dns_candidates
+from .beacon_analysis import BeaconObservation, analyze_beacon_candidates
+from .ja3_analysis import fingerprints_from_zeek_attributes
+from .tls_cert_analysis import TLSCertificateObservation, analyze_tls_certificate_metadata
 from .system import probe_capabilities, resolve_adaptive_profile
 from .triage import classify_bundle
 from .zeek import NormalizedZeekRow, bounded_directory_size, parse_zeek_logs
@@ -103,10 +107,16 @@ MAX_PACKET_REFS = 50
 MAX_NUMERIC_SERIES = 50
 MAX_SAMPLE_PACKETS = 200
 MAX_LINE_BYTES = 64 * 1024
+MAX_CSV_PHYSICAL_LINE_BYTES = 64 * 1024
+MAX_CSV_RECORD_BYTES = 256 * 1024
+MAX_CSV_FIELD_BYTES = 64 * 1024
+MAX_CSV_COLUMNS = 256
 DEFAULT_MAX_STDOUT_BYTES = 64 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_DNS_RECORDS = MAX_EVIDENCE
 MAX_ARP_RECORDS = 1500
+MAX_BEACON_FLOW_SAMPLES = 2_048
+MAX_TLS_FINGERPRINT_EVIDENCE = 1_000
 DEFAULT_ZEEK_MAX_ROWS = 2_000
 DEFAULT_ZEEK_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 DEFAULT_ZEEK_TIMEOUT_SECONDS = 45
@@ -126,6 +136,10 @@ TCP_PORT_SPREAD_THRESHOLD = 20
 DNS_NXDOMAIN_THRESHOLD = 3
 DNS_HIGH_ENTROPY_THRESHOLD = 3.5
 DNS_HIGH_ENTROPY_REPEAT_THRESHOLD = 3
+DNS_QUERY_VELOCITY_WINDOW_SECONDS = 60
+DNS_QUERY_VELOCITY_MIN_QUERIES = 60
+DNS_QUERY_VELOCITY_MIN_UNIQUE_NAMES = 40
+MAX_DNS_VELOCITY_GROUPS = 256
 PERIODIC_MIN_STARTS = 4
 PERIODIC_RELATIVE_TOLERANCE = 0.25
 TIMELINE_BUCKETS = 36
@@ -313,6 +327,10 @@ class _Accumulator:
     flow_cap_hit: bool = False
     flow_evictions: int = 0
     dns_cap_hit: bool = False
+    dns_analysis_cap_hit: bool = False
+    dns_velocity_cap_hit: bool = False
+    beacon_analysis_cap_hit: bool = False
+    beacon_observations_examined: int = 0
     syn_field_observed: bool = False
     stream_limited: bool = False
 
@@ -1851,8 +1869,83 @@ def _detect_findings(
                 ],
             )
 
+    # 3a. Adapted DGA/tunneling heuristics operate on bounded request metadata
+    # only. They emit low-confidence candidates linked to the retained DNS rows.
+    dns_analysis = analyze_dns_candidates(
+        DNSObservation(
+            query=record.query,
+            evidence_id=evidence_id,
+            source=record.src,
+            response_code=record.rcode,
+            qtype=record.qtype,
+        )
+        for record, evidence_id in dns_evidence
+    )
+    if dns_analysis.truncated:
+        accumulator.dns_analysis_cap_hit = True
+    for candidate in dns_analysis.candidates:
+        _finding(
+            findings,
+            detector=candidate.detector,
+            title=candidate.title,
+            severity="low",
+            confidence="low",
+            summary=candidate.summary,
+            evidence_ids=candidate.evidence_ids,
+            limitations=list(candidate.limitations),
+        )
+
+    # 3b. High-volume, high-diversity DNS requests in fixed 60-second windows.
+    # Keep only bounded aggregates; query names are used locally for counts and
+    # are never copied into this finding's title or summary.
+    velocity_groups: dict[tuple[str, int], dict[str, Any]] = {}
+    for record, evidence_id in dns_evidence:
+        if record.timestamp is None or record.src is None or record.rcode is not None:
+            continue  # require a timestamped DNS request, not a response row
+        if not math.isfinite(record.timestamp) or record.timestamp < 0:
+            continue
+        window = int(record.timestamp // DNS_QUERY_VELOCITY_WINDOW_SECONDS)
+        key = (record.src, window)
+        group = velocity_groups.get(key)
+        if group is None:
+            if len(velocity_groups) >= MAX_DNS_VELOCITY_GROUPS:
+                accumulator.dns_velocity_cap_hit = True
+                continue
+            group = {"count": 0, "queries": set(), "evidence_ids": []}
+            velocity_groups[key] = group
+        group["count"] += 1
+        query_key = record.query.rstrip(".").lower()
+        if len(group["queries"]) < DNS_QUERY_VELOCITY_MIN_UNIQUE_NAMES:
+            group["queries"].add(query_key)
+        if len(group["evidence_ids"]) < 100:
+            group["evidence_ids"].append(evidence_id)
+
+    for (_source, _window), group in sorted(velocity_groups.items()):
+        query_count = int(group["count"])
+        unique_count = len(group["queries"])
+        if query_count < DNS_QUERY_VELOCITY_MIN_QUERIES or unique_count < DNS_QUERY_VELOCITY_MIN_UNIQUE_NAMES:
+            continue
+        _finding(
+            findings,
+            detector="dns_query_velocity_diversity",
+            title="High-volume, high-diversity DNS query burst",
+            severity="low",
+            confidence="low",
+            summary=(
+                f"A single source emitted {query_count} DNS requests for at least "
+                f"{unique_count} distinct names in one fixed {DNS_QUERY_VELOCITY_WINDOW_SECONDS}-second window."
+            ),
+            evidence_ids=group["evidence_ids"],
+            limitations=[
+                "This low-confidence volume/diversity heuristic is not proof of DNS tunneling or compromise.",
+                "Benign resolvers, software updates, service discovery, and capture duplication can produce bursts.",
+                "Only timestamped DNS request rows retained within configured packet/evidence bounds are evaluated.",
+            ],
+        )
+
     # 4. Periodic SYN-based connection starts (candidate beacon)
     starts_by_target: dict[tuple[str, str, int | None], list[tuple[float, str]]] = {}
+    periodic_cited_evidence: set[str] = set()
     total_starts = 0
     for flow in accumulator.flows.values():
         if flow.proto != 6 or not flow.syn_times:
@@ -1887,6 +1980,7 @@ def _detect_findings(
                 continue
             if all(abs(interval - typical) / typical <= PERIODIC_RELATIVE_TOLERANCE for interval in intervals):
                 candidate_group = True
+                periodic_cited_evidence.update(evidence_id for _, evidence_id in events)
                 _finding(
                     findings,
                     detector="periodic_tcp_connection_starts",
@@ -1905,6 +1999,49 @@ def _detect_findings(
             accumulator.warn(
                 "Periodic TCP detector ran on SYN starts but found no sufficiently regular bounded interval group."
             )
+
+    # 4a. Adapted PCAP-Hunter interval/jitter scoring over retained flow samples.
+    # This complements the stricter SYN-start detector; already-cited groups are
+    # suppressed to avoid emitting duplicate low-confidence findings.
+    beacon_observations: list[BeaconObservation] = []
+    for flow in accumulator.flows.values():
+        evidence_id = flow_evidence.get(flow.key)
+        if evidence_id is None or len(flow.times) < 4:
+            continue
+        if len(beacon_observations) >= MAX_BEACON_FLOW_SAMPLES:
+            accumulator.beacon_analysis_cap_hit = True
+            break
+        protocol = {6: "tcp", 17: "udp", 1: "icmp", 58: "icmpv6"}.get(flow.proto, "other")
+        beacon_observations.append(
+            BeaconObservation(
+                evidence_id=evidence_id,
+                timestamps=flow.times,
+                protocol=protocol,
+                destination_port=flow.dst_port,
+                timestamps_truncated=flow.packets > len(flow.times),
+            )
+        )
+    beacon_analysis = analyze_beacon_candidates(
+        beacon_observations,
+        input_truncated=accumulator.beacon_analysis_cap_hit,
+    )
+    accumulator.beacon_observations_examined = beacon_analysis.observations_examined
+    accumulator.beacon_analysis_cap_hit = accumulator.beacon_analysis_cap_hit or beacon_analysis.truncated
+    for candidate in beacon_analysis.candidates:
+        if set(candidate.evidence_ids).issubset(periodic_cited_evidence):
+            continue
+        _finding(
+            findings,
+            detector=candidate.detector,
+            title=candidate.title,
+            severity="low",
+            confidence="low",
+            summary=candidate.summary,
+            evidence_ids=list(candidate.evidence_ids),
+            limitations=list(candidate.limitations),
+        )
+    if accumulator.beacon_analysis_cap_hit:
+        accumulator.warn("Beacon timing analysis reached a configured observation or timestamp cap; candidate coverage is partial.")
 
     # 5. TLS repeated ClientHello / renegotiation anomaly
     for flow in accumulator.flows.values():
@@ -2031,7 +2168,11 @@ def _build_bundle(
     triage_endpoint_consent: bool = False,
 ) -> EvidenceBundle:
     if yara_stage is None:
-        yara_stage = _stage("yara", "skipped", "Optional HTTP carving/YARA stage is disabled by settings.")
+        yara_stage = _stage(
+            "yara",
+            "skipped",
+            "Disabled by PCAP_YARA_ENABLED; enable only with reviewed local .yar/.yara rules and TShark/YARA installed.",
+        )
     evidence: list[Evidence] = []
     flow_evidence: dict[tuple[int | str, str, int | None, str, int | None], str] = {}
     dns_evidence: list[tuple[_DnsRecord, str]] = []
@@ -2040,6 +2181,7 @@ def _build_bundle(
     zeek_evidence_cap_hit = False
     yara_evidence_cap_hit = False
     yara_evidence_ids: list[str] = []
+    retained_zeek_rows: list[tuple[NormalizedZeekRow, str]] = []
 
     # 1. Include conflicting/high-activity ARP IP->MAC claims first (never buried below huge flows)
     arp_candidates = [
@@ -2167,6 +2309,7 @@ def _build_bundle(
                 attributes=record.attributes,
             )
         )
+        retained_zeek_rows.append((record, evidence_id))
     if zeek_evidence_cap_hit and zeek_stage.state == "completed":
         zeek_stage = zeek_stage.model_copy(
             update={
@@ -2211,18 +2354,109 @@ def _build_bundle(
             }
         )
 
+    tls_fingerprint_count = 0
+    tls_evidence_cap_hit = False
+    tls_observations = [
+        TLSCertificateObservation(
+            evidence_id=evidence_id,
+            source_log=record.log_name,
+            attributes=record.attributes,
+        )
+        for record, evidence_id in retained_zeek_rows
+    ]
+    for record, source_evidence_id in retained_zeek_rows:
+        for fingerprint in fingerprints_from_zeek_attributes(record.attributes):
+            if tls_fingerprint_count >= MAX_TLS_FINGERPRINT_EVIDENCE or len(evidence) >= MAX_EVIDENCE:
+                tls_evidence_cap_hit = True
+                evidence_cap_hit = True
+                break
+            fingerprint_evidence_id = f"EV-{len(evidence) + 1:06d}"
+            metadata = {
+                "protocol": "TLS",
+                "fingerprint_kind": fingerprint.kind,
+                **fingerprint.to_metadata(),
+                "source_log": record.log_name,
+                "source_row": record.source_row,
+                "source_evidence_id": source_evidence_id,
+            }
+            evidence.append(
+                Evidence(
+                    evidence_id=fingerprint_evidence_id,
+                    kind="tls",
+                    summary=(
+                        f"Validated Zeek {fingerprint.kind.upper()} TLS fingerprint metadata "
+                        f"from {record.log_name} row {record.source_row}."
+                    ),
+                    packet_refs=[],
+                    attributes=metadata,
+                )
+            )
+            tls_fingerprint_count += 1
+        if tls_evidence_cap_hit:
+            break
+
+    tls_analysis = analyze_tls_certificate_metadata(tls_observations)
+    tls_cap_hit = tls_analysis.truncated or tls_evidence_cap_hit
+    tls_detail = (
+        f"Offline TLS metadata analysis evaluated {tls_analysis.records_examined} retained Zeek rows; "
+        f"retained {tls_fingerprint_count} validated JA3/JA3S fingerprints and "
+        f"{len(tls_analysis.candidates)} low-confidence certificate metadata candidates. "
+        "No certificate bytes, issuer reputation, or network lookups are used."
+    )
+    if not retained_zeek_rows and zeek_stage.state in {"skipped", "unavailable", "failed"}:
+        tls_stage = _stage("TLS ANALYTICS", zeek_stage.state, f"Requires Zeek TLS/X.509 logs; {zeek_stage.detail}")
+    else:
+        tls_stage = _stage("TLS ANALYTICS", "partial" if tls_cap_hit or zeek_stage.state == "partial" else "completed", tls_detail)
+
     if evidence_cap_hit:
         accumulator.warn("Evidence cap reached; additional normalized flow/DNS/Zeek/YARA evidence was not retained.")
     if zeek_stage.state == "partial":
         accumulator.warn("Zeek stage coverage is partial; inspect the Zeek stage detail and configured bounds.")
     if yara_stage.state == "partial":
         accumulator.warn("YARA stage coverage is partial; inspect the stage detail and configured bounds.")
+    if tls_stage.state == "partial":
+        accumulator.warn("TLS metadata analysis coverage is partial; inspect the Zeek/TLS stage detail and configured caps.")
     if accumulator.flow_evictions > 0:
         accumulator.warn(
             f"Streaming flow table evicted {accumulator.flow_evictions} low-signal ephemeral flows to maintain bounded RAM."
         )
 
     findings = _detect_findings(accumulator, flow_evidence, dns_evidence, arp_evidence)
+    for candidate in tls_analysis.candidates:
+        _finding(
+            findings,
+            detector=candidate.detector,
+            title=candidate.title,
+            severity="low",
+            confidence=candidate.confidence,
+            summary=candidate.summary,
+            evidence_ids=list(candidate.evidence_ids),
+            limitations=list(candidate.limitations),
+        )
+    dns_analytics_partial = accumulator.dns_velocity_cap_hit or accumulator.dns_analysis_cap_hit
+    dns_analysis_stage = _stage(
+        "DNS ANALYTICS",
+        "partial" if dns_analytics_partial else "completed",
+        (
+            "Offline DNS heuristic analysis reached a configured record/domain/source-window cap; "
+            "some groups were not evaluated."
+            if dns_analytics_partial
+            else f"Offline DNS analysis evaluated {len(dns_evidence)} retained records for NXDOMAIN, DGA-like label, tunneling-pattern, and fixed {DNS_QUERY_VELOCITY_WINDOW_SECONDS}-second query-rate candidates; no network lookups were performed."
+        ),
+    )
+    if accumulator.dns_velocity_cap_hit:
+        accumulator.warn("DNS query-rate analysis reached its source/window group cap; some groups were not evaluated.")
+    if accumulator.dns_analysis_cap_hit:
+        accumulator.warn("DNS DGA/tunneling analysis reached its bounded record/group/candidate cap; some groups were not evaluated.")
+    beacon_stage = _stage(
+        "BEACON ANALYTICS",
+        "partial" if accumulator.beacon_analysis_cap_hit else "completed",
+        (
+            "Offline beacon timing analysis reached an observation/timestamp cap; some retained flow samples were not evaluated."
+            if accumulator.beacon_analysis_cap_hit
+            else f"Offline interval/jitter analysis evaluated {accumulator.beacon_observations_examined} retained flow samples; candidates are low-confidence and do not establish C2 activity."
+        ),
+    )
     for evidence_id in yara_evidence_ids:
         _finding(
             findings,
@@ -2256,9 +2490,12 @@ def _build_bundle(
 
     stages = [
         _stage("tshark", parser_state, parser_detail),
+        dns_analysis_stage,
         zeek_stage,
+        beacon_stage,
+        tls_stage,
         yara_stage,
-        _stage("osint", "skipped", "OSINT integration is unsupported and no network lookup was performed."),
+        _stage("osint", "skipped", "No OSINT lookup runs during offline parsing; open the report's OSINT panel to choose configured providers and explicitly consent to an external lookup."),
     ]
     packets_seen = (
         accumulator.rows_seen
@@ -2278,8 +2515,12 @@ def _build_bundle(
             or accumulator.stream_limited
             or accumulator.flow_cap_hit
             or accumulator.dns_cap_hit
+            or accumulator.dns_analysis_cap_hit
+            or accumulator.dns_velocity_cap_hit
+            or accumulator.beacon_analysis_cap_hit
             or evidence_cap_hit
             or zeek_stage.state == "partial"
+            or tls_stage.state == "partial"
             or yara_stage.state == "partial"
         ),
         parser=parser_name,
@@ -2456,9 +2697,17 @@ def _run_yara(
 ) -> tuple[Stage, list[NormalizedYaraMatch]]:
     """Carve bounded HTTP objects and scan them locally; never retain object bytes."""
     if not limits.yara_enabled:
-        return _stage("yara", "skipped", "Optional HTTP carving/YARA stage is disabled by settings."), []
+        return _stage(
+            "yara",
+            "skipped",
+            "Disabled by PCAP_YARA_ENABLED; enable only with reviewed local .yar/.yara rules and TShark/YARA installed.",
+        ), []
     if limits.yara_rules_dir is None:
-        return _stage("yara", "unavailable", "YARA is enabled but no operator rules directory is configured."), []
+        return _stage(
+            "yara",
+            "unavailable",
+            "YARA is enabled but PCAP_YARA_RULES_DIR does not point to an operator rules directory.",
+        ), []
     tshark = shutil.which("tshark")
     yara = shutil.which("yara")
     if not tshark or not yara:
@@ -2738,6 +2987,34 @@ def _looks_like_wireshark_csv(path: Path) -> bool:
     return ("time" in first_line and "source" in first_line and "destination" in first_line)
 
 
+class _BoundedCSVLines:
+    """Binary line source enforcing hard byte budgets while csv.reader consumes a record."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self._record_bytes = 0
+        self._first_line = True
+
+    def __iter__(self) -> _BoundedCSVLines:
+        return self
+
+    def __next__(self) -> str:
+        raw = self._handle.readline(MAX_CSV_PHYSICAL_LINE_BYTES + 1)
+        if not raw:
+            raise StopIteration
+        if len(raw) > MAX_CSV_PHYSICAL_LINE_BYTES:
+            raise PipelineError("PARSER_FAILED", "CSV physical-line byte limit exceeded")
+        self._record_bytes += len(raw)
+        if self._record_bytes > MAX_CSV_RECORD_BYTES:
+            raise PipelineError("PARSER_FAILED", "CSV record byte limit exceeded")
+        encoding = "utf-8-sig" if self._first_line else "utf-8"
+        self._first_line = False
+        return raw.decode(encoding, errors="replace")
+
+    def finish_record(self) -> None:
+        self._record_bytes = 0
+
+
 def _analyze_csv_capture(
     path: Path,
     *,
@@ -2757,16 +3034,28 @@ def _analyze_csv_capture(
     )
     deadline_hit = False
     delimiter = "\t"
-    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-        first_line = handle.readline(MAX_LINE_BYTES)
+    with path.open("rb") as handle:
+        first_line = handle.readline(MAX_CSV_PHYSICAL_LINE_BYTES + 1)
         if not first_line:
             raise PipelineError("PARSER_FAILED", "Capture CSV is empty")
-        delimiter = "\t" if first_line.count("\t") >= first_line.count(",") else ","
+        if len(first_line) > MAX_CSV_PHYSICAL_LINE_BYTES:
+            raise PipelineError("PARSER_FAILED", "CSV header byte limit exceeded")
+        first_line_text = first_line.decode("utf-8-sig", errors="replace")
+        delimiter = "\t" if first_line_text.count("\t") >= first_line_text.count(",") else ","
         handle.seek(0)
-        reader = csv.reader(handle, delimiter=delimiter)
-        header = next(reader, None)
+        bounded_lines = _BoundedCSVLines(handle)
+        reader = csv.reader(bounded_lines, delimiter=delimiter, strict=True)
+        try:
+            header = next(reader, None)
+        except csv.Error as exc:
+            raise PipelineError("PARSER_FAILED", "Malformed CSV header") from exc
+        bounded_lines.finish_record()
         if not header:
             raise PipelineError("PARSER_FAILED", "Capture CSV missing header row")
+        if len(header) > MAX_CSV_COLUMNS:
+            raise PipelineError("PARSER_FAILED", "CSV column limit exceeded")
+        if any(len(value.encode("utf-8", errors="replace")) > MAX_CSV_FIELD_BYTES for value in header):
+            raise PipelineError("PARSER_FAILED", "CSV header field byte limit exceeded")
         col_map = {col.strip().lower().rstrip("."): idx for idx, col in enumerate(header)}
 
         def col(row: list[str], *names: str, default: str = "") -> str:
@@ -2776,7 +3065,19 @@ def _analyze_csv_capture(
                     return row[idx].strip()
             return default
 
-        for row in reader:
+        while True:
+            try:
+                row = next(reader)
+            except StopIteration:
+                break
+            except csv.Error as exc:
+                detail = "CSV field byte limit exceeded" if "field larger than field limit" in str(exc).lower() else "Malformed CSV record"
+                raise PipelineError("PARSER_FAILED", detail) from exc
+            bounded_lines.finish_record()
+            if len(row) > MAX_CSV_COLUMNS:
+                raise PipelineError("PARSER_FAILED", "CSV column limit exceeded")
+            if any(len(value.encode("utf-8", errors="replace")) > MAX_CSV_FIELD_BYTES for value in row):
+                raise PipelineError("PARSER_FAILED", "CSV field byte limit exceeded")
             if is_cancelled():
                 raise PipelineError("CANCELLED", "Offline parser cancelled")
             if accumulator.rows_seen % 500 == 0 and time.monotonic() >= deadline:
@@ -3046,7 +3347,11 @@ def analyze_capture(
             is_cancelled=is_cancelled,
         )
     else:
-        zeek_stage = _stage("zeek", "skipped", "Optional Zeek stage is disabled by settings.")
+        zeek_stage = _stage(
+            "zeek",
+            "skipped",
+            "Disabled by PCAP_ZEEK_ENABLED; set it to 1 to run offline Zeek (requires zeek on PATH).",
+        )
     yara_stage, yara_records = _run_yara(
         path,
         limits=limits,

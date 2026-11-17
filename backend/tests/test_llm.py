@@ -8,7 +8,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from backend.app.config import AIConfig, AppSettings, load_settings
-from backend.app.llm import generate_summary, list_models
+from backend.app.llm import generate_chat_completion, generate_summary, list_models
 from backend.app.models import (
     AISummary,
     Confidence,
@@ -123,6 +123,33 @@ async def test_disabled_never_calls_transport():
     assert called is False
 
 
+@pytest.mark.asyncio
+async def test_grounded_chat_completion_uses_strict_schema_and_bounded_output():
+    requests = []
+    answer = {"claims": [{"claim": "The cited flow is present.", "evidence_ids": ["EV-000001"]}]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(answer)}, "finish_reason": "stop"}]},
+        )
+
+    raw = await generate_chat_completion(
+        "Return one evidence-cited claim.",
+        settings(max_output_tokens=8_000),
+        transport=httpx.MockTransport(handler),
+    )
+    assert json.loads(raw) == answer
+    assert len(requests) == 1
+    request = requests[0]
+    assert request["max_tokens"] == 1_200
+    assert request["response_format"]["json_schema"]["strict"] is True
+    assert request["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
+    assert request["messages"][-1]["content"] == "Return one evidence-cited claim."
+
+
 def test_settings_defaults_secret_and_nonsecret_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config_path = tmp_path / "ai.yaml"
     config_path.write_text(
@@ -229,10 +256,16 @@ async def test_uri_paths_and_uri_derived_metrics_are_not_sent_to_ai():
             "http_host_ip_hits": 15,
         }
     )
+    evidence_bundle.coverage.warnings = ["diagnostic at /private/capture.pcap for sensor.example"]
+    evidence_bundle.coverage.stages[0].detail = "input /Users/operator/secret.pcap from host.example"
     result = await generate_summary(evidence_bundle, settings(), transport=httpx.MockTransport(handler))
     assert result.state == "completed"
     prompt = json.dumps(seen[0])
     assert "AI-URI-SENTINEL" not in prompt
+    assert "/private/capture.pcap" not in prompt
+    assert "/Users/operator/secret.pcap" not in prompt
+    assert "sensor.example" not in prompt
+    assert "host.example" not in prompt
     assert "http_uri_max_len" not in prompt
     assert "http_uri_max_entropy" not in prompt
     for marker in (
@@ -428,6 +461,8 @@ async def test_real_parser_attribute_names_and_v1_paths():
     attrs = context["evidence"][0]["attributes"]
     assert attrs["packets"] == 3 and attrs["bytes"] == 240
     assert attrs["src"].startswith("id_") and "192.0.2.1" not in json.dumps(context)
+    assert context["capture_ref"].startswith("id_")
+    assert b.capture_sha256 not in json.dumps(context)
     assert context["coverage"]["warnings"] == ["untrusted warning"]
     paths = []
     async def handler(request):

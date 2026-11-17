@@ -33,12 +33,12 @@ python -m backend.app.launcher --dev
 
 ## ความสามารถที่มีใน branch นี้
 
-- React/TypeScript workbench เชื่อม FastAPI สำหรับ upload/resumable upload, bounded multi-file batch intake, queue/jobs, reports, evidence, cancellation, AI configuration และ provider-backed AI narrative แบบ opt-in
+- React/TypeScript workbench เชื่อม FastAPI สำหรับ upload/resumable upload, bounded multi-file batch intake, queue/jobs, reports, evidence, cancellation, AI configuration, provider-backed AI narrative และ per-analysis grounded chat แบบ opt-in/per-turn consent
 - Batch API/UI มี bounded multipart upload, server-reported limits, durable per-item status, batch cancellation และ retry รายการที่ล้มเหลว; batch ปิด AI/remote classifier โดยค่าเริ่มต้น
-- TShark ทำงานแบบ offline (`-n -r`) และ deterministic detector ใช้ metadata ที่มีขอบเขต; ไม่ replay traffic หรือเชื่อม IP/URL จาก capture
+- TShark ทำงานแบบ offline (`-n -r`); optional Zeek normalization และ HTTP-object/YARA stages มี resource bounds และปิดโดยค่าเริ่มต้น. Deterministic detectors ครอบคลุม capped DNS velocity/DGA/tunneling candidates, beacon interval/jitter และ Zeek-derived TLS fingerprints/certificate metadata; findings เป็น hypotheses ที่มี evidence citations ไม่ใช่ verdict
 - parser queue และ job/capture metadata เก็บใน SQLite; งานที่ถูกจำกัดหรือไม่สมบูรณ์ต้องแสดง partial/failed/coverage ตามจริง
 - Tier-1 ใช้ heuristic ในเครื่องเป็นค่าเริ่มต้น. การเรียก endpoint แบบ HTTP ต้องผ่าน per-analysis consent แยกจาก AI consent, endpoint allowlist และ request/response/time limits
-- ก่อนส่ง AI narrator ผู้ใช้ต้องยืนยัน consent; provider keys เก็บฝั่ง backend เท่านั้น; AI รับเฉพาะ allowlisted/minimized/pseudonymized structured evidence ไม่รับ PCAP, packet payload, cookies, credentials หรือ raw log bodies
+- ก่อนส่ง AI narrator ผู้ใช้ต้องยืนยัน consent; chat ขอ consent ใหม่ทุกคำถาม; provider keys เก็บฝั่ง backend เท่านั้น; AI รับเฉพาะ allowlisted/minimized/pseudonymized structured evidence ไม่รับ PCAP, packet payload, cookies, credentials หรือ raw log bodies. Chat ไม่เก็บ transcript ฝั่ง backend
 - รายงานแยกผล deterministic กับ AI advisory; ความล้มเหลวของ provider ไม่ควรลบผล deterministic
 
 ## Privacy และการใช้งาน
@@ -52,7 +52,7 @@ python -m backend.app.launcher --dev
 
 ## ขอบเขต parity ที่ยังอยู่ในแผน
 
-การเทียบความสามารถกับ PCAP-Hunter ทำเป็นลำดับ ไม่ถือว่า branch นี้ครบ parity จนกว่าจะมี implementation และผลตรวจแยกตาม subsystem. Batch Intake API/UI พร้อมใช้งาน; Zeek metadata normalization และ optional bounded HTTP-object carving/YARA มี implementation กับ regression tests แล้ว แต่ยังต้องตรวจ Zeek 9.0.1 และ pinned production container build. Advanced DNS/TLS/beacon analytics, cases/IOC search, immutable STIX/CEF/Navigator/PDF exports, contextual AI chat, scoped read-only MCP และ opt-in OSINT/rDNS/WHOIS/RDAP/local GeoIP ยังต้องทำและตรวจตามแผนใน [plan.md](plan.md) และ [TODO.md](TODO.md). ไม่เปิด YARA หรือ OSINT โดยปริยายและไม่ทำ external enrichment โดยปริยาย
+การเทียบความสามารถกับ PCAP-Hunter ทำเป็นลำดับ; ยังไม่อ้างว่า branch นี้ครบ parity. Batch Intake API/UI, Zeek metadata normalization, optional bounded HTTP-object/YARA, low-confidence DNS/DGA/tunneling candidates, capped beacon/TLS candidates, per-analysis grounded chat และ metadata-only STIX 2.1 export มี implementation/regressions ใน worktree นี้. ยังต้องทดสอบ Zeek 9.0.1 และ pinned production image, validate detector accuracy กับ corpus, ทำ local IOC/GeoIP และ OSINT, full cases/cross-filters, full export formats, scoped read-only MCP, และเพิ่ม correlation/ATT&CK. ดู [parity audit](docs/pcap-hunter-parity-audit.md), [plan.md](plan.md) และ [TODO.md](TODO.md). YARA/OSINT ปิดโดยปริยาย; ไม่มี external enrichment หากไม่มี consent.
 
 ## API และ backend
 

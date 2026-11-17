@@ -274,6 +274,7 @@ class AppSettings(BaseModel):
     zeek_max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
     zeek_timeout_seconds: int = Field(default=45, ge=1, le=120)
     zeek_memory_mb: int = Field(default=256, ge=128, le=512)
+    osint_enabled: bool = False
     yara_enabled: bool = False
     yara_rules_dir: Path | None = None
     yara_max_rules_files: int = Field(default=64, ge=1, le=256)
@@ -397,6 +398,7 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_ZEEK_MAX_OUTPUT_BYTES": ("zeek_max_output_bytes", "int"),
         "PCAP_ZEEK_TIMEOUT_SECONDS": ("zeek_timeout_seconds", "int"),
         "PCAP_ZEEK_MEMORY_MB": ("zeek_memory_mb", "int"),
+        "PCAP_OSINT_ENABLED": ("osint_enabled", "bool"),
         "PCAP_YARA_ENABLED": ("yara_enabled", "bool"),
         "PCAP_YARA_RULES_DIR": ("yara_rules_dir", "str"),
         "PCAP_YARA_MAX_RULES_FILES": ("yara_max_rules_files", "int"),

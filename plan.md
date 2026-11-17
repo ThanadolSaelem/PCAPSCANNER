@@ -2,9 +2,9 @@
 
 ## ฐานงานและขอบเขต
 
-ทำงานบน GitHub branch `ThanadolSaelem/PCAPSCANNER:feat/live-workbench-one-click` ซึ่งตรวจพบฐาน HEAD `1ff32fb1a3507c298f526ff2cefb43cf7c9ae82d`; branch นี้นำหน้า `main` หนึ่ง commit. ใช้ working copy แยกจาก Manus canonical; target คือ branch ที่ผู้ใช้เลือกเท่านั้น—ไม่เขียน/ผลักไป `main` และไม่ force-push. เปรียบเทียบ parity กับ upstream `https://github.com/ninedter/pcap-hunter.git` โดย port ความสามารถที่ตรวจสอบได้ ไม่คัดลอกโค้ดหรือเปิด network capabilities โดยไม่ทบทวน security boundary.
+ทำงานบน GitHub branch `ThanadolSaelem/PCAPSCANNER:feat/live-workbench-one-click` ซึ่ง remote baseline ที่ยืนยันล่าสุดคือ `bb93fc6afb17d83d49b04b2869d98bb1801ad7ff`; มี source parity changes ที่ยังไม่ commit ใน working copy. ใช้ working copy แยกจาก Manus canonical; target คือ branch ที่ผู้ใช้เลือกเท่านั้น—ไม่เขียน/ผลักไป `main` และไม่ force-push. เปรียบเทียบกับ upstream `https://github.com/ninedter/pcap-hunter.git` (ตรวจ source commit `cf839a4`; MIT License). อนุญาต reuse/port โค้ด MIT ที่ตรวจสอบแล้วโดยเก็บ copyright และ notice ครบ; ไม่คัดลอกทั้ง runtime/UI stack ทับเป้าหมายเมื่อ schema, dependencies หรือ safety model ไม่เข้ากัน และไม่เปิด network capabilities โดยไม่ทบทวน security boundary.
 
-เป้าหมายคือรับ PCAP/PCAPNG จริง สร้าง durable analysis jobs และแสดงผลจาก capture จริง พร้อมเพิ่ม functional parity กับ PCAP-Hunter เป็น subsystem โดยคง offline-first, deterministic evidence provenance, bounded processing และ privacy guardrails. รอบนี้เชื่อม UI กับข้อมูลจริง, เอาการแสดงผลที่สร้างขึ้นเองออก, แยก consent สำหรับ Tier-1 HTTP endpoint, ลดสิทธิ์ native picker, ผูก local analysis กับ immutable SHA-256 snapshot, เพิ่ม claim-cited AI reports และทำ M1 Safe Batch Intake API/UI. M1 ไม่ใช่ parity ครบทุก subsystem.
+เป้าหมายคือรับ PCAP/PCAPNG จริง สร้าง durable analysis jobs และแสดงผลจาก capture จริง พร้อมเพิ่ม functional parity กับ PCAP-Hunter เป็น subsystem โดยคง offline-first, deterministic evidence provenance, bounded processing และ privacy guardrails. รอบก่อนเชื่อม UI กับข้อมูลจริง, เอาการแสดงผลที่สร้างขึ้นเองออก, แยก consent สำหรับ Tier-1 HTTP endpoint, ลดสิทธิ์ native picker, ผูก local analysis กับ immutable SHA-256 snapshot, เพิ่ม claim-cited AI reports และทำ M1 Safe Batch Intake API/UI. M1 ไม่ใช่ parity ครบทุก subsystem.
 
 ## Implementation architecture
 
@@ -21,7 +21,7 @@ Batch API คือ Bearer-authenticated `POST /api/v1/batches` แบบ `multi
 - `src/` — React application, API-backed UI states, report adapters, architecture scenarios และ styles; `components/BatchIntakePanel.tsx` จัดการ multi-capture intake/status; ไม่มีผลวิเคราะห์จาก fixtures ที่แสดงราวกับเป็น capture จริง.
 - `src/api/client.ts` — typed same-origin REST client สำหรับ uploads, batch/job lifecycle, reports และ AI configuration; ไม่ใส่ provider credentials ใน browser.
 - `src/utils/batchLimits.ts` — ยอมรับเฉพาะ server-reported limits และคืน unknown หากข้อมูลไม่ครบ/ไม่ถูกต้อง.
-- `backend/app/` — configuration, auth/API boundary, streaming upload parser, SQLite store, offline evidence pipeline, workers, Tier-1/AI adapters และ response contracts.
+- `backend/app/` — configuration, auth/API boundary, streaming upload parser, SQLite store, offline evidence pipeline, workers, bounded DNS heuristics adapted from PCAP-Hunter, Tier-1/AI adapters และ response contracts.
 - `backend/tests/` — API/storage/pipeline/provider boundary regressions ด้วย synthetic captures และ fake transports; ไม่ติดต่อ real capture endpoints หรือ live AI/OSINT.
 - `tests/` — frontend logic, export adapters, capture-header parser และ architecture-case structural checks.
 - `docs/`, `README.md`, `backend/README_TH.md`, `SOURCE_PROVENANCE.md` — parity roadmap, API/operator setup, privacy boundary และ branch/SHA provenance.
@@ -55,7 +55,7 @@ Batch API คือ Bearer-authenticated `POST /api/v1/batches` แบบ `multi
 2. **เสร็จใน working branch:** local-file single-use grant และ parser-only immutable SHA-256 snapshot; physical disk reserve, access หรือ digest failure ไม่รายงาน completed.
 3. **เสร็จใน working branch:** M1 Safe Batch Intake API/UI — streaming multipart, manifest, atomic queue/storage admission, process-shared staging budget/locks, status/list/cancel, idempotency, restart cleanup, API-authoritative bounds, partial-vs-failed counts และ retry เฉพาะ failed items.
 4. **เสร็จใน working branch:** UI ใช้ API/capture data จริง, มี empty state; truthful packet-cap coverage; ไม่มี fabricated capture/job/report; grounded AI summary/limitations/recommendations อ้าง evidence IDs และ UI/Markdown export แสดง citations.
-5. **งานต่อไป:** เพิ่ม parity subsystem: evidence/tool-versioning, Zeek normalization, DNS/TLS/beacon/IOC detectors, optional quarantine/YARA, dashboard/filter/packet-flow explorer, cases/search, frozen exports, contextual AI chat, scoped read-only MCP และ opt-in OSINT.
+5. **งานต่อไป:** ปิด parity gaps เป็น subsystem: richer DNS/TLS/beacon/JA3 detectors, dashboard/filter/packet-flow explorer, cases/search, frozen exports/ATT&CK, contextual AI chat, scoped read-only MCP และ opt-in OSINT. มี Zeek normalization, bounded optional HTTP-carving/YARA และ initial low-confidence offline DNS analytics แล้ว; ไม่อ้างว่าเทียบครบจนทุก outcome ที่เหลือมี implementation/validation.
 6. **การส่ง source:** validate ด้วย synthetic inputs/fake providers, auth/migration/concurrency/resource limits/cancellation/restart, typecheck/build; fetch และ preserve remote `feat/live-workbench-one-click`; commit/push แบบ fast-forward เฉพาะ branch นี้; บันทึก SHA จริง. Push source ไม่ใช่ deployment.
 
 ## การรายงานสถานะ

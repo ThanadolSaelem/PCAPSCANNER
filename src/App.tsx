@@ -1,8 +1,9 @@
-import type { ChangeEvent, DragEvent, ReactNode } from "react";
+import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AIConfigResponse,
   AIModelsResponse,
+  GroundedChatResponse,
   JobSummary,
   LocalBrowseResponse,
   NativePickPurpose,
@@ -14,6 +15,7 @@ import type {
 import { ApiProblemError, PcapApiClient, normalizeBaseUrl } from "./api/client";
 import ArchitectureExplorer from "./components/ArchitectureExplorer";
 import BatchIntakePanel from "./components/BatchIntakePanel";
+import OSINTPanel from "./components/OSINTPanel";
 import type {
   WorkspaceFinding,
   WorkspaceFlow,
@@ -660,7 +662,7 @@ function App() {
     navigate("traffic");
   };
 
-  const handleExport = async (kind: "json" | "markdown" | "triage-jsonl") => {
+  const handleExport = async (kind: "json" | "markdown" | "triage-jsonl" | "stix") => {
     if (activeReport.origin === "empty") {
       setToast("ยังไม่มีผลวิเคราะห์จริงให้ส่งออก");
       return;
@@ -674,6 +676,20 @@ function App() {
     if (kind === "markdown") {
       downloadTextFile(`${slug}-report.md`, exportReportMarkdown(activeReport), "text/markdown");
       setToast(`ดาวน์โหลด ${slug}-report.md แล้ว`);
+      return;
+    }
+    if (kind === "stix") {
+      if (activeReport.origin !== "live" || connectionStatus !== "connected") {
+        setToast("STIX 2.1 export ต้องเชื่อมต่อ backend และใช้ผลวิเคราะห์ live");
+        return;
+      }
+      try {
+        const stix = await api.getStixJson(activeReport.analysisId);
+        downloadTextFile(`${slug}-stix-2.1.json`, stix, "application/stix+json");
+        setToast(`ดาวน์โหลด ${slug}-stix-2.1.json แล้ว`);
+      } catch (err) {
+        setToast(safeFormatError(err));
+      }
       return;
     }
     if (activeReport.origin === "live" && connectionStatus === "connected") {
@@ -1108,7 +1124,15 @@ function App() {
           {screen === "reports" && (
             <ReportsPage
               report={activeReport}
+              apiClient={api}
+              connected={connectionStatus === "connected"}
               onExport={(kind) => void handleExport(kind)}
+              onChat={(question, consent) => {
+                if (activeReport.origin !== "live" || connectionStatus !== "connected") {
+                  return Promise.reject(new Error("live_backend_required"));
+                }
+                return api.askGroundedQuestion(activeReport.analysisId, question, consent);
+              }}
               onNavigate={navigate}
               onOpenEvidence={openEvidence}
             />
@@ -3323,17 +3347,63 @@ function TrafficPage({
 
 function ReportsPage({
   report,
+  apiClient,
+  connected,
   onExport,
+  onChat,
   onNavigate,
   onOpenEvidence,
 }: {
   report: WorkspaceReport;
-  onExport: (kind: "json" | "markdown" | "triage-jsonl") => void;
+  apiClient: PcapApiClient;
+  connected: boolean;
+  onExport: (kind: "json" | "markdown" | "triage-jsonl" | "stix") => void;
+  onChat: (question: string, consent: boolean) => Promise<GroundedChatResponse>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
 }) {
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   const aiActive = report.ai?.state === "completed" && Boolean(report.ai.report);
+  const [chatQuestion, setChatQuestion] = useState("");
+  const [chatConsent, setChatConsent] = useState(false);
+  const [chatPending, setChatPending] = useState(false);
+  const [chatError, setChatError] = useState("");
+  const [chatTurns, setChatTurns] = useState<{ question: string; claims: GroundedChatResponse["claims"] }[]>([]);
+  const chatTargetId = useRef(report.analysisId);
+  useEffect(() => {
+    chatTargetId.current = report.analysisId;
+    setChatTurns([]);
+    setChatQuestion("");
+    setChatConsent(false);
+    setChatError("");
+    setChatPending(false);
+  }, [report.analysisId]);
+  const submitChat = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!chatConsent) {
+      setChatError("ต้องยืนยัน consent สำหรับคำถามนี้ก่อนส่งให้ AI");
+      return;
+    }
+    if (!chatQuestion.trim() || chatPending) return;
+    const targetAnalysisId = report.analysisId;
+    setChatPending(true);
+    setChatError("");
+    try {
+      const result = await onChat(chatQuestion, true);
+      if (chatTargetId.current !== targetAnalysisId) return;
+      if (result.state !== "completed" || result.claims.length === 0) {
+        setChatError(result.error_code ?? `chat_${result.state}`);
+        return;
+      }
+      setChatTurns((current) => [...current, { question: chatQuestion.trim(), claims: result.claims }].slice(-12));
+      setChatQuestion("");
+      setChatConsent(false);
+    } catch (error) {
+      if (chatTargetId.current === targetAnalysisId) setChatError(safeFormatError(error));
+    } finally {
+      if (chatTargetId.current === targetAnalysisId) setChatPending(false);
+    }
+  };
 
   return (
     <>
@@ -3349,6 +3419,11 @@ function ReportsPage({
             <button type="button" className="secondary-button" onClick={() => onExport("markdown")}>
               <Icon name="download" size={15} /> Export MD
             </button>
+            {report.origin === "live" && (
+              <button type="button" className="secondary-button" onClick={() => onExport("stix")}>
+                <Icon name="download" size={15} /> Export STIX 2.1
+              </button>
+            )}
             <button type="button" className="primary-button" onClick={() => onExport("json")}>
               <Icon name="download" size={15} /> Export JSON
             </button>
@@ -3530,8 +3605,68 @@ function ReportsPage({
             )}
           </div>
 
+          <div className="report-section grounded-chat-section" id="report-chat">
+            <span className="section-kicker">04 / GROUNDED CONTEXTUAL CHAT</span>
+            <h3>ถาม AI จาก evidence ของ analysis นี้</h3>
+            {report.origin !== "live" ? (
+              <p className="muted">Contextual chat ใช้ได้กับ analysis ที่ประมวลผลโดย backend เท่านั้น</p>
+            ) : (
+              <>
+                <p className="grounded-chat-privacy">
+                  แต่ละคำถามต้องยืนยันแยกกัน · ส่งเฉพาะ structured evidence ที่ pseudonymize แล้ว · URL, path, payload และ transcript จะไม่ถูกเก็บโดย backend
+                </p>
+                {chatTurns.map((turn, turnIndex) => (
+                  <div className="grounded-chat-turn" key={`${report.analysisId}-${turnIndex}`}>
+                    <strong>Q: {turn.question}</strong>
+                    <ul>
+                      {turn.claims.map((claim, claimIndex) => (
+                        <li key={claimIndex}>
+                          {claim.claim}{" "}
+                          {claim.evidence_ids.map((evidenceId) => (
+                            <button key={evidenceId} type="button" className="inline-ev-btn" onClick={() => onOpenEvidence(null, evidenceId)}>
+                              [{evidenceId}]
+                            </button>
+                          ))}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+                <form className="grounded-chat-form" onSubmit={(event) => void submitChat(event)}>
+                  <label htmlFor="grounded-chat-question">Question</label>
+                  <textarea
+                    id="grounded-chat-question"
+                    rows={3}
+                    maxLength={8_000}
+                    value={chatQuestion}
+                    onChange={(event) => setChatQuestion(event.target.value)}
+                    placeholder="Which evidence supports the DNS query-volume finding?"
+                    disabled={chatPending}
+                  />
+                  <label className="grounded-chat-consent">
+                    <input type="checkbox" checked={chatConsent} onChange={(event) => setChatConsent(event.target.checked)} disabled={chatPending} />
+                    I consent to send this question and the privacy-filtered evidence to the configured AI provider for this turn.
+                  </label>
+                  {chatError && <p role="alert" className="grounded-chat-error">{chatError}</p>}
+                  <button type="submit" className="primary-button" disabled={chatPending || !chatQuestion.trim() || !chatConsent}>
+                    {chatPending ? "Analyzing evidence…" : "Ask grounded AI"}
+                  </button>
+                </form>
+              </>
+            )}
+          </div>
+
+          <OSINTPanel
+            api={apiClient}
+            analysisId={report.analysisId}
+            live={report.origin === "live"}
+            connected={connected}
+            initialResult={report.osint}
+            onOpenEvidence={(evidenceId) => onOpenEvidence(null, evidenceId)}
+          />
+
           <div className="report-section coverage-report" id="report-coverage">
-            <span className="section-kicker">04 / COVERAGE &amp; LIMITATIONS</span>
+            <span className="section-kicker">05 / COVERAGE &amp; LIMITATIONS</span>
             <h3>สิ่งที่ควรทราบก่อนสรุป</h3>
             <ul>
               {report.warnings.map((w, idx) => (
@@ -3558,8 +3693,12 @@ function ReportsPage({
                 <span>03</span>Tier-1 &amp; AI narrative
                 <Icon name="arrow" size={14} />
               </button>
+              <button onClick={() => jumpTo("report-chat")}>
+                <span>04</span>Grounded chat
+                <Icon name="arrow" size={14} />
+              </button>
               <button onClick={() => jumpTo("report-coverage")}>
-                <span>04</span>Coverage &amp; limitations
+                <span>05</span>Coverage &amp; limitations
                 <Icon name="arrow" size={14} />
               </button>
             </div>

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import asyncio
 import json
 import mimetypes
 import os
@@ -29,6 +30,8 @@ from .models import (
     AnalysisRequest,
     ChunkUploadInitRequest,
     EvidenceBundle,
+    GroundedChatRequest,
+    OSINTLookupRequest,
     LocalCaptureRequest,
     NativePickRequest,
     ProblemDetails,
@@ -47,6 +50,10 @@ from .picker import (
 from .store import ACTIVE, Store, StoreError
 from .system import build_capabilities_payload, probe_capabilities, recommended_chunk_size_bytes
 from .triage import bundle_to_triage_jsonl
+from .llm import generate_chat_completion
+from .llm.chat import ChatLimits, answer_question
+from .stix_export import export_stix_bundle
+from .osint_service import OSINTService, extract_ioc_candidates, MAX_IOCS_PER_OPERATION
 
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
@@ -263,10 +270,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.openapi_version = "3.1.0"
     app.state.settings, app.state.store = initial_cfg, initial_store
     app.state.local_file_grants = {}
+    app.state.osint_service = OSINTService()
     app.state.local_file_grants_lock = threading.Lock()
     app.state.batch_admission = threading.BoundedSemaphore(initial_cfg.batch_admission_concurrency)
     app.state.batch_admission_active = 0
     app.state.batch_admission_state_lock = threading.Lock()
+    app.state.chat_semaphore = asyncio.Semaphore(2)
     app.add_middleware(BoundaryMiddleware, settings=initial_cfg)
 
     def _cfg() -> AppSettings:
@@ -934,8 +943,219 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "capture_format": meta.get("capture_format"),
             "evidence": bundle.model_dump(mode="json"),
             "ai": json.loads(row["ai_result"]) if row["ai_result"] else {"state": "pending"},
+            "osint": json.loads(row["osint_result"]) if row.get("osint_result") else {"state": "not_requested", "results": []},
             "disclaimer": "Detector findings are candidates. AI is advisory; missing findings do not certify safety.",
         }
+
+    @app.get("/api/v1/osint/capabilities", tags=["OSINT"])
+    def osint_capabilities():
+        return app.state.osint_service.capabilities(enabled=bool(_cfg().osint_enabled))
+
+    @app.get("/api/v1/analyses/{analysis_id}/osint/candidates", tags=["OSINT"])
+    def osint_candidates(analysis_id: str):
+        store_now = _store()
+        row = store_now.job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        pending_operation = store_now.unresolved_osint_operation(analysis_id)
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        if not bundle.evidence:
+            return {
+                "analysis_id": analysis_id,
+                "candidates": [],
+                "candidate_count": 0,
+                "truncated": False,
+                "max_iocs_per_operation": MAX_IOCS_PER_OPERATION,
+                "lookup_is_external": True,
+                "consent_required_for_lookup": True,
+                "pending_operation": pending_operation,
+            }
+        candidates, truncated = extract_ioc_candidates(
+            bundle, [item.evidence_id for item in bundle.evidence]
+        )
+        return {
+            "analysis_id": analysis_id,
+            "candidates": [candidate.public_dict() for candidate in candidates],
+            "candidate_count": len(candidates),
+            "truncated": truncated,
+            "max_iocs_per_operation": MAX_IOCS_PER_OPERATION,
+            "lookup_is_external": True,
+            "consent_required_for_lookup": True,
+            "pending_operation": pending_operation,
+        }
+
+    @app.post("/api/v1/analyses/{analysis_id}/osint", tags=["OSINT"])
+    async def osint_lookup(analysis_id: str, body: OSINTLookupRequest):
+        store_now = _store()
+        row = store_now.job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        if not body.consent:
+            store_now.record_osint_audit(
+                analysis_id,
+                requested_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                providers=list(body.providers),
+                indicator_count=0,
+                outcome="consent_denied",
+                consent=False,
+            )
+            raise HTTPException(428, "osint_consent_required")
+        fingerprint_payload = json.dumps(
+            {"candidate_ids": sorted(body.candidate_ids), "providers": sorted(body.providers)},
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        request_fingerprint = hmac.new(
+            _cfg().api_token.get_secret_value().encode("utf-8"),
+            b"PCAPSCANNER-OSINT-OP-v1\0" + analysis_id.encode("ascii") + b"\0" + fingerprint_payload,
+            hashlib.sha256,
+        ).hexdigest()
+        attempted = store_now.osint_audit_operation(analysis_id, body.operation_id)
+        if attempted is not None:
+            if not hmac.compare_digest(attempted.get("request_fingerprint") or "", request_fingerprint):
+                raise HTTPException(409, "osint_operation_id_conflict")
+            previous = json.loads(row["osint_result"]) if row.get("osint_result") else None
+            if isinstance(previous, dict) and previous.get("operation_id") == body.operation_id:
+                return previous
+            raise HTTPException(409, "osint_operation_already_attempted")
+        previous = json.loads(row["osint_result"]) if row.get("osint_result") else None
+        if isinstance(previous, dict) and previous.get("operation_id") == body.operation_id:
+            raise HTTPException(409, "osint_operation_state_inconsistent")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        all_candidates, _ = extract_ioc_candidates(
+            bundle, [item.evidence_id for item in bundle.evidence]
+        )
+        by_id = {candidate.candidate_id: candidate for candidate in all_candidates}
+        if any(candidate_id not in by_id for candidate_id in body.candidate_ids):
+            raise HTTPException(422, "unknown_osint_candidate")
+        selected = [by_id[candidate_id] for candidate_id in body.candidate_ids]
+        try:
+            with store_now.osint_operation_lock(analysis_id):
+                # Re-read after acquiring the process-shared lock to prevent duplicate API-credit use.
+                current = store_now.job(analysis_id, internal=True)
+                attempted = store_now.osint_audit_operation(analysis_id, body.operation_id)
+                if attempted is not None:
+                    if not hmac.compare_digest(attempted.get("request_fingerprint") or "", request_fingerprint):
+                        raise HTTPException(409, "osint_operation_id_conflict")
+                    prior = json.loads(current["osint_result"]) if current.get("osint_result") else None
+                    if isinstance(prior, dict) and prior.get("operation_id") == body.operation_id:
+                        return prior
+                    raise HTTPException(409, "osint_operation_already_attempted")
+                unresolved = store_now.unresolved_osint_operation(analysis_id)
+                if unresolved is not None:
+                    if not body.accept_uncertain_retry_risk:
+                        raise HTTPException(409, "osint_previous_operation_unresolved")
+                    store_now.resolve_uncertain_osint_operation(analysis_id, unresolved["operation_id"])
+                requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                # Persist consent and operation metadata before any external request.
+                # If the process dies after a provider call but before saving its result,
+                # a retry with this ID must not silently spend credits twice.
+                store_now.record_osint_audit(
+                    analysis_id,
+                    requested_at=requested_at,
+                    providers=list(body.providers),
+                    indicator_count=len(selected),
+                    outcome="started",
+                    consent=True,
+                    operation_id=body.operation_id,
+                    request_fingerprint=request_fingerprint,
+                )
+                result = await app.state.osint_service.enrich(
+                    selected,
+                    body.providers,
+                    consent=True,
+                    enabled=bool(_cfg().osint_enabled),
+                )
+                result["operation_id"] = body.operation_id
+                store_now.save_osint_result(
+                    analysis_id,
+                    json.dumps(result, separators=(",", ":"), ensure_ascii=True),
+                )
+                uncertain_states = {
+                    "provider_timeout", "operation_timeout", "provider_error",
+                    "invalid_provider_response", "response_too_large", "redirect_blocked",
+                }
+                has_uncertain_provider_attempt = any(
+                    item.get("state") in uncertain_states
+                    for item in result.get("results", [])
+                    if isinstance(item, dict)
+                )
+                store_now.finish_osint_audit(
+                    analysis_id,
+                    body.operation_id,
+                    "uncertain" if has_uncertain_provider_attempt else str(result.get("state", "unknown")),
+                )
+                return result
+        except ValueError as exc:
+            code = str(exc)
+            if code not in {
+                "ioc_count_limit_exceeded", "provider_selection_invalid", "unsupported_provider",
+                "lookup_count_limit_exceeded", "invalid_ioc_candidate", "duplicate_ioc_candidate",
+            }:
+                code = "invalid_osint_request"
+            raise HTTPException(422, code) from exc
+
+    @app.post("/api/v1/analyses/{analysis_id}/chat", tags=["AI"])
+    async def grounded_chat(analysis_id: str, body: GroundedChatRequest):
+        row = _store().job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        if not body.consent:
+            result = await answer_question(bundle, body.question, consent=False)
+        else:
+            cfg_now = _cfg()
+            if not cfg_now.ai.enabled:
+                raise HTTPException(409, "ai_disabled_by_operator")
+            if not cfg_now.ai.model:
+                raise HTTPException(409, "ai_model_not_configured")
+            if cfg_now.ai.context_window_tokens <= 513:
+                raise HTTPException(409, "ai_context_window_too_small")
+
+            async def provider_call(prompt: str) -> str:
+                return await generate_chat_completion(prompt, cfg_now)
+
+            max_output_tokens = min(1_200, cfg_now.ai.max_output_tokens, cfg_now.ai.context_window_tokens - 513)
+            limits = ChatLimits(
+                max_question_bytes=min(2_000, cfg_now.ai.input_max_bytes),
+                max_context_bytes=min(24_000, cfg_now.ai.input_max_bytes),
+                max_prompt_bytes=min(32_000, cfg_now.ai.input_max_bytes),
+                max_output_bytes=min(8_000, max_output_tokens * 4),
+                context_window_tokens=cfg_now.ai.context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                timeout_seconds=min(20.0, cfg_now.ai.timeout_seconds),
+                max_claims=20,
+            )
+            async with app.state.chat_semaphore:
+                result = await answer_question(
+                    bundle,
+                    body.question,
+                    consent=True,
+                    provider=provider_call,
+                    limits=limits,
+                )
+        return {
+            "state": result.state,
+            "claims": [claim.model_dump(mode="json") for claim in result.claims],
+            "prompt_sha256": result.prompt_sha256,
+            "error_code": result.error_code,
+            "transcript_persisted": False,
+        }
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.stix.json", tags=["Reports"])
+    def export_stix(analysis_id: str):
+        if not re.fullmatch(r"[a-f0-9]{32}", analysis_id):
+            raise HTTPException(404, "analysis_not_found")
+        row = _store().job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        payload = export_stix_bundle(bundle)
+        return JSONResponse(
+            content=payload,
+            media_type="application/stix+json",
+            headers={"Content-Disposition": f'attachment; filename="pcap-stix-{analysis_id[:8]}.json"'},
+        )
 
     @app.get("/api/v1/ai/config", tags=["AI"])
     def ai_config():

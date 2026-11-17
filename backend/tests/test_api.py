@@ -14,10 +14,10 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from backend.app import store as store_module
 from backend.app import worker as worker_module
-from backend.app.config import AppSettings
+from backend.app.config import AIConfig, AppSettings
 from backend.app import main as main_module
 from backend.app.main import create_app, profile_hash
-from backend.app.models import AnalysisRequest, Coverage, EvidenceBundle, AIResult
+from backend.app.models import AnalysisRequest, Coverage, Evidence, EvidenceBundle, AIResult
 from backend.app.store import Store, StoreError
 
 TOKEN = "test-only-operator-token-32-characters"
@@ -40,6 +40,29 @@ def upload(client):
     response = client.post("/api/v1/captures", content=HEADER, headers={"Content-Type": "application/vnd.tcpdump.pcap"})
     assert response.status_code == 201, response.text
     return response.json()["capture_id"]
+
+
+def persist_evidence_job(app, client):
+    capture_id = upload(client)
+    store = app.state.store
+    analysis_id = store.create_job(AnalysisRequest(capture_id=capture_id), "profile")["id"]
+    lease = store.claim("parser")
+    bundle = EvidenceBundle(
+        capture_sha256=store.capture(capture_id)["sha256"],
+        coverage=Coverage(packets_seen=1, packets_analyzed=1, truncated=False, parser="fixture"),
+        evidence=[
+            Evidence(
+                evidence_id="EV-000001",
+                kind="dns",
+                summary="DNS request for private.example from 192.0.2.44",
+                packet_refs=[1],
+                attributes={"protocol": "DNS", "src": "192.0.2.44", "query": "private.example", "dns_qry_type": 1},
+            )
+        ],
+        findings=[],
+    )
+    assert store.finish(lease, "awaiting_ai", evidence=bundle.model_dump_json())
+    return analysis_id, bundle
 
 
 def test_auth_and_openapi(app):
@@ -231,6 +254,87 @@ def test_evidence_survives_ai_failure_and_retention(app, client):
     assert store.purge_expired(24) == 1
     assert not store.capture_path(cid).exists()
     assert client.get(f"/api/v1/analyses/{jid}").status_code == 404
+
+
+def test_grounded_chat_requires_per_turn_consent_and_cites_privacy_safe_evidence(app, client, monkeypatch):
+    analysis_id, _bundle = persist_evidence_job(app, client)
+    calls = []
+
+    async def fake_chat(prompt, _settings):
+        calls.append(prompt)
+        return json.dumps({"claims": [{"claim": "The retained evidence records one DNS request.", "evidence_ids": ["EV-000001"]}]})
+
+    monkeypatch.setattr(main_module, "generate_chat_completion", fake_chat)
+    denied = client.post(
+        f"/api/v1/analyses/{analysis_id}/chat",
+        json={"question": "What happened?", "consent": False},
+    )
+    assert denied.status_code == 200
+    assert denied.json()["state"] == "consent_required"
+    assert calls == []
+
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "ai": AIConfig(
+                enabled=True,
+                provider="openai_compatible",
+                base_url="http://127.0.0.1:11434",
+                allowed_origins=["http://127.0.0.1:11434"],
+                data_boundary="local",
+                model="test-model",
+            )
+        }
+    )
+    sent = client.post(
+        f"/api/v1/analyses/{analysis_id}/chat",
+        json={"question": "Explain http://203.0.113.9/private/path and private.example", "consent": True},
+    )
+    assert sent.status_code == 200, sent.text
+    payload = sent.json()
+    assert payload["state"] == "completed"
+    assert payload["claims"][0]["evidence_ids"] == ["EV-000001"]
+    assert payload["transcript_persisted"] is False
+    assert len(calls) == 1
+    assert "192.0.2.44" not in calls[0]
+    assert "private.example" not in calls[0]
+    assert "203.0.113.9" not in calls[0]
+    assert "/private/path" not in calls[0]
+    assert "EV-000001" in calls[0]
+    assert "chat" not in app.state.store.job(analysis_id)
+
+    app.state.settings = app.state.settings.model_copy(
+        update={"ai": app.state.settings.ai.model_copy(update={"context_window_tokens": 513})}
+    )
+    too_small = client.post(
+        f"/api/v1/analyses/{analysis_id}/chat",
+        json={"question": "Explain the evidence", "consent": True},
+    )
+    assert too_small.status_code == 409
+    assert too_small.json()["code"] == "ai_context_window_too_small"
+    assert len(calls) == 1
+
+    malformed_consent = client.post(
+        f"/api/v1/analyses/{analysis_id}/chat",
+        json={"question": "test", "consent": "true"},
+    )
+    assert malformed_consent.status_code == 422
+
+
+def test_stix_export_endpoint_is_authenticated_and_metadata_only(app, client):
+    analysis_id, _bundle = persist_evidence_job(app, client)
+    response = client.get(f"/api/v1/analyses/{analysis_id}/export.stix.json")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/stix+json")
+    payload = response.json()
+    assert payload["type"] == "bundle"
+    assert payload["objects"] and all(obj["spec_version"] == "2.1" for obj in payload["objects"])
+    serialized = response.text
+    assert "private.example" in serialized
+    assert "192.0.2.44" in serialized
+    assert "RAW PAYLOAD" not in serialized
+    assert "/private/path" not in serialized
+    unauthenticated = TestClient(app).get(f"/api/v1/analyses/{analysis_id}/export.stix.json")
+    assert unauthenticated.status_code == 401
 
 
 def test_stale_ai_handoff_and_interrupted_narrator(app, client):

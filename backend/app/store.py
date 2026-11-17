@@ -89,6 +89,7 @@ class Store:
               cancel_requested INTEGER NOT NULL DEFAULT 0,
               evidence TEXT,
               ai_result TEXT,
+              osint_result TEXT,
               error_code TEXT,
               idempotency_key TEXT UNIQUE,
               resource_mode TEXT NOT NULL DEFAULT 'auto',
@@ -96,6 +97,18 @@ class Store:
               triage_endpoint_consent INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, created_at);
+            CREATE TABLE IF NOT EXISTS osint_audit (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              analysis_id TEXT NOT NULL,
+              operation_id TEXT,
+              request_fingerprint TEXT,
+              requested_at TEXT NOT NULL,
+              providers TEXT NOT NULL,
+              indicator_count INTEGER NOT NULL,
+              outcome TEXT NOT NULL,
+              consent INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS osint_audit_analysis ON osint_audit(analysis_id, id);
             CREATE TABLE IF NOT EXISTS batches (
               id TEXT PRIMARY KEY,
               request_sha256 TEXT NOT NULL,
@@ -142,10 +155,21 @@ class Store:
             "resource_mode": "TEXT NOT NULL DEFAULT 'auto'",
             "triage_enabled": "INTEGER NOT NULL DEFAULT 1",
             "triage_endpoint_consent": "INTEGER NOT NULL DEFAULT 0",
+            "osint_result": "TEXT",
         }
         for col, ddl in job_migrations.items():
             if col not in job_cols:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+
+        audit_cols = {r[1] for r in db.execute("PRAGMA table_info(osint_audit)").fetchall()}
+        if "operation_id" not in audit_cols:
+            db.execute("ALTER TABLE osint_audit ADD COLUMN operation_id TEXT")
+        if "request_fingerprint" not in audit_cols:
+            db.execute("ALTER TABLE osint_audit ADD COLUMN request_fingerprint TEXT")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS osint_audit_operation "
+            "ON osint_audit(analysis_id, operation_id) WHERE operation_id IS NOT NULL"
+        )
 
     @contextmanager
     def _file_lock(self, path: Path, *, blocking: bool = True):
@@ -996,6 +1020,144 @@ class Store:
                 db.execute("UPDATE jobs SET cancel_requested=1, state=?, ai_result=COALESCE(?,ai_result), updated_at=? WHERE id=?", (state, result, utcnow(), jid))
         return self.job(jid)
 
+    @contextmanager
+    def osint_operation_lock(self, jid: str):
+        """Prevent concurrent provider-credit use for one analysis across processes."""
+        self._validate_id(jid)
+        try:
+            with self._file_lock(self.batch_lock_dir / f"osint-{jid}.lock", blocking=False):
+                yield
+        except StoreError as exc:
+            if exc.code == "batch_admission_busy":
+                raise StoreError("osint_operation_busy", 429) from exc
+            raise
+
+    def record_osint_audit(
+        self,
+        jid: str,
+        *,
+        requested_at: str,
+        providers: list[str],
+        indicator_count: int,
+        outcome: str,
+        consent: bool,
+        operation_id: str | None = None,
+        request_fingerprint: str | None = None,
+    ) -> None:
+        """Record only operation metadata; never persist the queried IoC values or keys."""
+        self._validate_id(jid)
+        if not 0 <= indicator_count <= 12 or len(providers) > 5:
+            raise StoreError("osint_audit_invalid", 400)
+        if operation_id is not None and not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+            raise StoreError("osint_audit_invalid", 400)
+        if (operation_id is None) != (request_fingerprint is None):
+            raise StoreError("osint_audit_invalid", 400)
+        if request_fingerprint is not None and not re.fullmatch(r"[a-f0-9]{64}", request_fingerprint):
+            raise StoreError("osint_audit_invalid", 400)
+        if any(not re.fullmatch(r"[a-z0-9_-]{1,32}", item) for item in providers):
+            raise StoreError("osint_audit_invalid", 400)
+        if not re.fullmatch(r"[a-z0-9_-]{1,48}", outcome):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection(write=True) as db:
+            exists = db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone()
+            if not exists:
+                raise StoreError("job_not_found", 404)
+            if operation_id is not None:
+                count = db.execute(
+                    "SELECT COUNT(*) FROM osint_audit WHERE analysis_id=? AND operation_id IS NOT NULL", (jid,)
+                ).fetchone()[0]
+                if count >= 100:
+                    raise StoreError("osint_operation_limit", 429)
+            db.execute(
+                "INSERT INTO osint_audit(analysis_id, operation_id, request_fingerprint, requested_at, providers, indicator_count, outcome, consent) VALUES(?,?,?,?,?,?,?,?)",
+                (jid, operation_id, request_fingerprint, requested_at, json.dumps(sorted(set(providers))), indicator_count, outcome, int(consent)),
+            )
+            db.execute(
+                "DELETE FROM osint_audit WHERE analysis_id=? AND operation_id IS NULL AND id NOT IN "
+                "(SELECT id FROM osint_audit WHERE analysis_id=? AND operation_id IS NULL ORDER BY id DESC LIMIT 20)",
+                (jid, jid),
+            )
+
+    def osint_audit_operation(self, jid: str, operation_id: str) -> dict | None:
+        self._validate_id(jid)
+        if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM osint_audit WHERE analysis_id=? AND operation_id=? ORDER BY id DESC LIMIT 1",
+                (jid, operation_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def unresolved_osint_operation(self, jid: str) -> dict | None:
+        """Return metadata for an uncertain started operation, never indicator values."""
+        self._validate_id(jid)
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT a.id, a.operation_id, a.requested_at, a.providers, a.indicator_count, a.outcome, j.osint_result "
+                "FROM osint_audit a JOIN jobs j ON j.id=a.analysis_id "
+                "WHERE a.analysis_id=? AND a.outcome IN ('started','uncertain') ORDER BY a.id DESC LIMIT 1",
+                (jid,),
+            ).fetchone()
+            if row is not None and row["osint_result"]:
+                try:
+                    saved_result = json.loads(row["osint_result"])
+                except (TypeError, json.JSONDecodeError):
+                    saved_result = None
+                if (row["outcome"] == "started" and isinstance(saved_result, dict)
+                        and saved_result.get("operation_id") == row["operation_id"]):
+                    return None
+        if row is None:
+            return None
+        return {
+            "operation_id": row["operation_id"],
+            "requested_at": row["requested_at"],
+            "providers": json.loads(row["providers"]),
+            "indicator_count": row["indicator_count"],
+            "state": "uncertain",
+        }
+
+    def resolve_uncertain_osint_operation(self, jid: str, operation_id: str) -> None:
+        """Record explicit operator acceptance of duplicate-charge risk; retain the tombstone."""
+        self._validate_id(jid)
+        if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE osint_audit SET outcome='operator_override' "
+                "WHERE analysis_id=? AND operation_id=? AND outcome IN ('started','uncertain')",
+                (jid, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("osint_audit_not_found", 404)
+
+    def finish_osint_audit(self, jid: str, operation_id: str, outcome: str) -> None:
+        self._validate_id(jid)
+        if not re.fullmatch(r"[a-f0-9]{32}", operation_id) or not re.fullmatch(r"[a-z0-9_-]{1,48}", outcome):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE osint_audit SET outcome=? WHERE analysis_id=? AND operation_id=?",
+                (outcome, jid, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("osint_audit_not_found", 404)
+
+    def save_osint_result(self, jid: str, result_json: str) -> None:
+        """Store only the sanitized, bounded OSINT result; normal job retention purges it."""
+        self._validate_id(jid)
+        if not isinstance(result_json, str) or len(result_json.encode("utf-8")) > 1024 * 1024:
+            raise StoreError("osint_result_too_large", 413)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE jobs SET osint_result=?, updated_at=? WHERE id=? AND evidence IS NOT NULL",
+                (result_json, utcnow(), jid),
+            )
+            if cursor.rowcount != 1:
+                if not db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone():
+                    raise StoreError("job_not_found", 404)
+                raise StoreError("evidence_not_ready", 409)
+
     def recover_stale(self, stale_seconds=600) -> int:
         cutoff = time.time() - stale_seconds
         timestamp = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1022,6 +1184,10 @@ class Store:
               AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.capture_id=c.id AND j.state IN ('queued','parsing','awaiting_ai','generating'))""",
               (cutoff, time.time() - 3600)).fetchall()
             for row in rows:
+                db.execute(
+                    "DELETE FROM osint_audit WHERE analysis_id IN (SELECT id FROM jobs WHERE capture_id=?)",
+                    (row["id"],),
+                )
                 # Never unlink user-owned files referenced via local_ingest_roots
                 if row["source_kind"] != "local":
                     for ext in ("pcap", "csv", "part"):

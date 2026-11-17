@@ -368,7 +368,102 @@ export interface BackendReport {
   capture_format?: string | null;
   evidence: EvidenceBundle;
   ai: AIResult;
+  osint?: OSINTLookupResponse | { state: "not_requested"; results: [] };
   disclaimer: string;
+}
+
+export type OSINTProviderId = "virustotal" | "abuseipdb" | "greynoise" | "shodan" | "otx";
+
+export interface OSINTProviderCapability {
+  id: OSINTProviderId;
+  name: string;
+  ready: boolean;
+  state: string;
+  supports: string[];
+  reference: string;
+}
+
+export interface OSINTCapabilities {
+  enabled: boolean;
+  available: boolean;
+  providers: OSINTProviderCapability[];
+  max_iocs_per_operation: number;
+  max_providers_per_operation: number;
+  max_total_lookups: number;
+  max_response_bytes_per_lookup: number;
+  max_operation_seconds: number;
+  read_only: true;
+  accepted_inputs: string[];
+  excluded_inputs: string[];
+}
+
+export interface IOCCandidate {
+  candidate_id: string;
+  indicator_type: "ipv4" | "ipv6" | "domain" | "md5" | "sha1" | "sha256";
+  indicator: string;
+  evidence_ids: string[];
+}
+
+export interface OSINTCandidatesResponse {
+  analysis_id: string;
+  candidates: IOCCandidate[];
+  candidate_count: number;
+  truncated: boolean;
+  max_iocs_per_operation: number;
+  lookup_is_external: true;
+  consent_required_for_lookup: true;
+  pending_operation?: {
+    operation_id: string | null;
+    requested_at: string;
+    providers: string[];
+    indicator_count: number;
+    state: "uncertain";
+  } | null;
+}
+
+export interface OSINTLookupItem {
+  candidate_id: string;
+  indicator_type: IOCCandidate["indicator_type"];
+  provider: OSINTProviderId;
+  state: string;
+  summary: Record<string, string | number | boolean | string[] | number[]>;
+  source_reference: string;
+  retry_after_seconds?: number;
+}
+
+export interface OSINTLookupResponse {
+  state: "completed" | "partial" | "unavailable" | "disabled" | "consent_required";
+  error_code: string | null;
+  requested_at?: string;
+  operation_id?: string;
+  consent?: true;
+  provider_ids?: OSINTProviderId[];
+  indicator_count?: number;
+  lookup_count?: number;
+  attempted_count?: number;
+  elapsed_ms?: number;
+  results: OSINTLookupItem[];
+}
+
+export interface OSINTLookupPayload {
+  operation_id: string;
+  candidate_ids: string[];
+  providers: OSINTProviderId[];
+  consent: true;
+  accept_uncertain_retry_risk: boolean;
+}
+
+export interface GroundedChatClaim {
+  claim: string;
+  evidence_ids: string[];
+}
+
+export interface GroundedChatResponse {
+  state: "completed" | "consent_required" | "no_evidence" | "budget_exceeded" | "invalid_output" | "unavailable";
+  claims: GroundedChatClaim[];
+  prompt_sha256: string | null;
+  error_code: string | null;
+  transcript_persisted: false;
 }
 
 export interface UploadProgress {
@@ -744,6 +839,45 @@ export class PcapApiClient {
 
   getReport(analysisId: string): Promise<BackendReport> {
     return this.requestJson<BackendReport>(`/api/v1/analyses/${analysisId}/report`);
+  }
+
+  getOSINTCapabilities(): Promise<OSINTCapabilities> {
+    return this.requestJson<OSINTCapabilities>("/api/v1/osint/capabilities");
+  }
+
+  getOSINTCandidates(analysisId: string): Promise<OSINTCandidatesResponse> {
+    return this.requestJson<OSINTCandidatesResponse>(`/api/v1/analyses/${analysisId}/osint/candidates`);
+  }
+
+  async runOSINTLookup(analysisId: string, payload: OSINTLookupPayload): Promise<OSINTLookupResponse> {
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort("osint_client_timeout"), 40_000);
+    try {
+      return await this.requestJson<OSINTLookupResponse>(`/api/v1/analyses/${analysisId}/osint`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
+  }
+
+  askGroundedQuestion(analysisId: string, question: string, consent: boolean): Promise<GroundedChatResponse> {
+    return this.requestJson<GroundedChatResponse>(`/api/v1/analyses/${analysisId}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, consent }),
+    });
+  }
+
+  async getStixJson(analysisId: string): Promise<string> {
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.stix.json`), {
+      headers: this.authHeaders({ Accept: "application/stix+json" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
   }
 
   async getTriageJsonl(analysisId: string): Promise<string> {

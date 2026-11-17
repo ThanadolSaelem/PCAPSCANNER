@@ -2,6 +2,7 @@ import type {
   AIResult,
   BackendEvidence,
   BackendReport,
+  OSINTLookupResponse,
   EvidenceBundle,
   Tier1Summary,
 } from "../api/client.ts";
@@ -28,7 +29,7 @@ export interface WorkspaceFinding {
 export interface WorkspaceStage {
   name: string;
   engine: string;
-  status: "done" | "skipped" | "running" | "queued" | "failed" | "partial";
+  status: "done" | "skipped" | "unavailable" | "running" | "queued" | "failed" | "partial";
   detail: string;
 }
 
@@ -83,6 +84,7 @@ export interface WorkspaceReport {
   timelineLabels: string[];
   triage?: Tier1Summary | null;
   ai?: AIResult | null;
+  osint?: OSINTLookupResponse | { state: "not_requested"; results: [] };
   warnings: string[];
   disclaimer: string;
   rawBundle?: EvidenceBundle;
@@ -141,6 +143,8 @@ function mapStageState(state: string): WorkspaceStage["status"] {
   if (state === "completed") return "done";
   if (state === "failed") return "failed";
   if (state === "partial") return "partial";
+  if (state === "unavailable") return "unavailable";
+  if (state === "skipped") return "skipped";
   return "skipped";
 }
 
@@ -330,7 +334,7 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
         ? `Model ${report.ai.model ?? "configured"} generated evidence-grounded summary`
         : report.ai?.error_code
           ? `Fallback (${report.ai.error_code}) — deterministic findings retained`
-          : "Opt-in advisory narrator disabled",
+          : "Disabled for this analysis; configure and enable a provider/model, then grant per-analysis consent to run the advisory narrator",
   });
 
   const sha = bundle.capture_sha256;
@@ -365,6 +369,7 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
     timelineLabels,
     triage: bundle.triage ?? null,
     ai: report.ai,
+    osint: report.osint,
     warnings: bundle.coverage.warnings,
     disclaimer: report.disclaimer,
     rawBundle: bundle,
@@ -388,6 +393,7 @@ export function exportReportJson(report: WorkspaceReport): string {
       findings: report.findings,
       evidence: report.rawBundle?.evidence ?? report.flows,
       ai: report.ai ?? null,
+      osint: report.osint ?? null,
       warnings: report.warnings,
       disclaimer: report.disclaimer,
     },
