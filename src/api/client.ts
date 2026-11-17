@@ -74,6 +74,7 @@ export interface SystemCapabilities {
     batch_max_total_bytes: number;
     batch_admission_concurrency: number;
     zeek_enabled: boolean;
+    osint_enabled?: boolean;
     zeek_max_rows: number;
     zeek_max_output_bytes: number;
     zeek_timeout_seconds: number;
@@ -213,7 +214,7 @@ export interface LocalBrowseResponse {
 
 export interface BackendStage {
   name: string;
-  state: "completed" | "partial" | "failed" | "skipped" | "unavailable";
+  state: "completed" | "partial" | "failed" | "skipped" | "unavailable" | "awaiting_consent";
   detail: string;
 }
 

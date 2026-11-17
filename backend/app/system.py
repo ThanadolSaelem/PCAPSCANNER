@@ -404,11 +404,14 @@ def build_capabilities_payload(settings: object) -> dict[str, object]:
             "batch_max_total_bytes": int(getattr(settings, "batch_max_total_bytes", 2 * 1024 * 1024 * 1024)),
             "batch_admission_concurrency": int(getattr(settings, "batch_admission_concurrency", 2)),
             "zeek_enabled": bool(getattr(settings, "zeek_enabled", False)),
+            "osint_enabled": bool(getattr(settings, "osint_enabled", False)),
             "zeek_max_rows": int(getattr(settings, "zeek_max_rows", 2_000)),
             "zeek_max_output_bytes": int(getattr(settings, "zeek_max_output_bytes", 32 * 1024 * 1024)),
             "zeek_timeout_seconds": int(getattr(settings, "zeek_timeout_seconds", 45)),
             "zeek_memory_mb": int(getattr(settings, "zeek_memory_mb", 256)),
             "yara_enabled": bool(getattr(settings, "yara_enabled", False)),
+            # This reports only that a path is configured. The network-capable API
+            # deliberately cannot inspect the parser's read-only rule mount.
             "yara_rules_configured": bool(getattr(settings, "yara_rules_dir", None)),
             "yara_max_rules_files": int(getattr(settings, "yara_max_rules_files", 64)),
             "yara_max_rules_bytes": int(getattr(settings, "yara_max_rules_bytes", 16 * 1024 * 1024)),

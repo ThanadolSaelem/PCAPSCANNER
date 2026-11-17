@@ -168,6 +168,7 @@ class _Limits:
     zeek_max_output_bytes: int = DEFAULT_ZEEK_MAX_OUTPUT_BYTES
     zeek_timeout_seconds: int = DEFAULT_ZEEK_TIMEOUT_SECONDS
     zeek_memory_mb: int = DEFAULT_ZEEK_MEMORY_MB
+    osint_enabled: bool = False
     yara_enabled: bool = False
     yara_rules_dir: Path | None = None
     yara_max_rules_files: int = DEFAULT_YARA_MAX_RULES_FILES
@@ -1098,6 +1099,7 @@ def _yara_limit_values(settings: object, parser_memory_mb: int) -> dict[str, obj
         minimum=1024 * 1024, maximum=256 * 1024 * 1024,
     )
     return {
+        "osint_enabled": bool(getattr(settings, "osint_enabled", False)),
         "yara_enabled": bool(getattr(settings, "yara_enabled", False)),
         "yara_rules_dir": rules_dir,
         "yara_max_rules_files": _setting_int(settings, "yara_max_rules_files", DEFAULT_YARA_MAX_RULES_FILES, minimum=1, maximum=256),
@@ -2159,6 +2161,7 @@ def _build_bundle(
     parser_state: str,
     parser_detail: str,
     zeek_stage: Stage,
+    osint_enabled: bool = False,
     zeek_records: Sequence[NormalizedZeekRow] = (),
     yara_stage: Stage | None = None,
     yara_records: Sequence[NormalizedYaraMatch] = (),
@@ -2488,6 +2491,15 @@ def _build_bundle(
         if warning not in deduped_warnings and len(deduped_warnings) < 100:
             deduped_warnings.append(warning)
 
+    osint_stage = (
+        _stage(
+            "osint",
+            "awaiting_consent",
+            "Provider panel is available; no external lookup is sent during parsing. Select indicators/providers and confirm each operation in Reports.",
+        )
+        if osint_enabled
+        else _stage("osint", "skipped", "OSINT provider capability is disabled by PCAP_OSINT_ENABLED=0.")
+    )
     stages = [
         _stage("tshark", parser_state, parser_detail),
         dns_analysis_stage,
@@ -2495,7 +2507,7 @@ def _build_bundle(
         beacon_stage,
         tls_stage,
         yara_stage,
-        _stage("osint", "skipped", "No OSINT lookup runs during offline parsing; open the report's OSINT panel to choose configured providers and explicitly consent to an external lookup."),
+        osint_stage,
     ]
     packets_seen = (
         accumulator.rows_seen
@@ -2960,7 +2972,20 @@ def _run_yara(
             return _stage("yara", "completed", detail), matches
     except PipelineError:
         raise
-    except YaraRulesError:
+    except YaraRulesError as exc:
+        reason = str(exc)
+        if reason == "ruleset_empty":
+            return _stage(
+                "yara",
+                "skipped",
+                "YARA is enabled, but no .yar/.yara signatures are present in the configured local rules directory.",
+            ), []
+        if reason == "rules_directory_unavailable":
+            return _stage(
+                "yara",
+                "unavailable",
+                "YARA is enabled, but the configured local rules directory is unavailable.",
+            ), []
         return _stage("yara", "failed", "The operator YARA ruleset is invalid, unsafe, or exceeds its configured bounds."), []
     except (OSError, ValueError, subprocess.SubprocessError):
         return _stage("yara", "failed", "HTTP carving or local YARA scanning failed; TShark evidence was retained."), []
@@ -3249,6 +3274,7 @@ def _analyze_csv_capture(
         parser_state=parser_state,
         parser_detail=parser_detail,
         zeek_stage=zeek_stage,
+        osint_enabled=limits.osint_enabled,
         yara_stage=yara_stage,
         parser_name="wireshark-csv-offline",
         triage_cfg=triage_cfg,
@@ -3364,6 +3390,7 @@ def analyze_capture(
         parser_state=parser_state,
         parser_detail=parser_detail,
         zeek_stage=zeek_stage,
+        osint_enabled=limits.osint_enabled,
         zeek_records=zeek_records,
         yara_stage=yara_stage,
         yara_records=yara_records,

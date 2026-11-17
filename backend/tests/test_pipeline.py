@@ -447,7 +447,7 @@ def test_real_synthetic_capture_is_offline_and_normalized(tmp_path) -> None:
     if shutil.which("tshark") is None:
         pytest.skip("TShark is not installed in this environment")
     capture = write_synthetic_pcap(tmp_path / "tiny.pcap")
-    bundle = analyze_capture(capture, HASH, settings(packet_limit=10))
+    bundle = analyze_capture(capture, HASH, settings(packet_limit=10, osint_enabled=True))
     assert bundle.coverage.packets_seen == 3
     assert bundle.coverage.packets_analyzed == 3
     assert bundle.coverage.truncated is False
@@ -459,12 +459,17 @@ def test_real_synthetic_capture_is_offline_and_normalized(tmp_path) -> None:
     dns_stage = next(stage for stage in bundle.coverage.stages if stage.name == "DNS ANALYTICS")
     assert dns_stage.state == "completed"
     osint_stage = next(stage for stage in bundle.coverage.stages if stage.name == "osint")
-    assert osint_stage.state == "skipped"
-    assert "report's OSINT panel" in osint_stage.detail
-    assert "explicitly consent" in osint_stage.detail
+    assert osint_stage.state == "awaiting_consent"
+    assert "no external lookup is sent during parsing" in osint_stage.detail
+    assert "confirm each operation" in osint_stage.detail
     yara_stage = next(stage for stage in bundle.coverage.stages if stage.name == "yara")
     assert yara_stage.state == "skipped"
     assert "PCAP_YARA_ENABLED" in yara_stage.detail
+
+    disabled_bundle = analyze_capture(capture, HASH, settings(packet_limit=10, osint_enabled=False))
+    disabled_osint = next(stage for stage in disabled_bundle.coverage.stages if stage.name == "osint")
+    assert disabled_osint.state == "skipped"
+    assert "PCAP_OSINT_ENABLED=0" in disabled_osint.detail
 
 
 def test_capture_hash_is_supplied_not_recomputed(tmp_path, monkeypatch) -> None:

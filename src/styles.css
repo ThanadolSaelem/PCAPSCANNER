@@ -172,6 +172,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .stage-number { width: 22px; height: 22px; display: grid; place-items: center; flex: none; border: 1px solid rgba(111,207,151,.18); border-radius: 50%; color: var(--green); background: rgba(111,207,151,.06); font: 8px var(--mono); }
 .stage-skipped .stage-number { border-color: rgba(229,184,92,.2); color: var(--amber); background: rgba(229,184,92,.05); }
 .stage-unavailable .stage-number { border-color: rgba(155,175,192,.24); color: #9bafc0; background: rgba(155,175,192,.07); }
+.stage-awaiting_consent .stage-number { border-color: rgba(80,190,215,.3); color: var(--cyan-2); background: rgba(50,189,209,.08); }
 .stage-copy { min-width: 0; display: flex; align-items: center; justify-content: space-between; flex: 1; gap: 10px; }
 .stage-copy > div { min-width: 0; }
 .stage-copy strong, .stage-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -180,6 +181,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .stage-state { flex: none; color: #80c99b; font: 8px var(--mono); letter-spacing: .06em; }
 .stage-state.skipped { color: #d4b65f; }
 .stage-state.unavailable { color: #9bafc0; }
+.stage-state.awaiting_consent { color: var(--cyan-2); }
 .panel-footer-link { width: calc(100% + 32px); min-height: 34px; display: flex; align-items: center; justify-content: space-between; margin: 3px -16px 0; padding: 0 16px; border: 0; border-top: 1px solid rgba(46,62,76,.7); border-radius: 0 0 8px 8px; color: #8bb7c5; background: rgba(11,19,27,.17); font-size: 9px; font-weight: 600; }
 .panel-footer-link:hover { color: var(--cyan-2); background: rgba(50,189,209,.035); }
 .subtle-link { padding: 3px; color: #8baebc; font-size: 9px; }

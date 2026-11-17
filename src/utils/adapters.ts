@@ -29,7 +29,7 @@ export interface WorkspaceFinding {
 export interface WorkspaceStage {
   name: string;
   engine: string;
-  status: "done" | "skipped" | "unavailable" | "running" | "queued" | "failed" | "partial";
+  status: "done" | "skipped" | "unavailable" | "awaiting_consent" | "running" | "queued" | "failed" | "partial";
   detail: string;
 }
 
@@ -144,6 +144,7 @@ function mapStageState(state: string): WorkspaceStage["status"] {
   if (state === "failed") return "failed";
   if (state === "partial") return "partial";
   if (state === "unavailable") return "unavailable";
+  if (state === "awaiting_consent") return "awaiting_consent";
   if (state === "skipped") return "skipped";
   return "skipped";
 }

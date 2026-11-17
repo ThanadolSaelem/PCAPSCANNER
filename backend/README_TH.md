@@ -21,25 +21,19 @@ Backend นี้รับ PCAP/PCAPNG วิเคราะห์ metadata แ�
 
 จาก project root ใช้ Python 3.12 และติดตั้ง TShark ให้เรียกได้ด้วย `tshark --version`. macOS สามารถใช้ TShark ที่มากับ Wireshark หรือ package manager ที่องค์กรอนุญาต; Linux ใช้ package ของ distribution. แนะนำ Linux/Docker สำหรับ subprocess limits; native Windows selectors/process-group behavior ยังไม่ได้ทดสอบและไม่ใช่ runtime ที่รับรองในรอบนี้
 
-### เปิดใช้ offline Zeek/YARA บน macOS
+### Offline Zeek/YARA บน macOS
 
-Zeek และ YARA เป็น optional stages จึงไม่รันเมื่อปิดค่าตั้งต้น. Homebrew มี formula สำหรับทั้งสองเครื่องมือ; ติดตั้งได้ด้วย `brew install zeek yara` แล้วตรวจ `zeek --version` และ `yara --version`. เวอร์ชันใน Homebrew เปลี่ยนตามเวลา; ตรวจ formula ปัจจุบันที่ [Zeek](https://formulae.brew.sh/formula/zeek) และ [YARA](https://formulae.brew.sh/formula/yara). `Start PCAPSCANNER.command` เพิ่ม Homebrew paths ให้ backend แต่การตั้งค่าตัวแปรข้างล่างให้รันจาก Terminal.
+Zeek และ YARA เปิดใช้งานโดยปริยาย; แต่ stage จะรายงาน `UNAVAILABLE` หาก executable ไม่มี และ YARA จะรายงาน `SKIPPED` หากไม่พบ signatures. ติดตั้ง Homebrew formula ด้วย `brew install zeek yara`, แล้วตรวจ `zeek --version` และ `yara --version`. เวอร์ชัน Homebrew เปลี่ยนตามเวลา; ดู [Zeek formula](https://formulae.brew.sh/formula/zeek) และ [YARA formula](https://formulae.brew.sh/formula/yara). `Start PCAPSCANNER.command` เพิ่ม Homebrew paths ให้ backend.
 
-เปิด Zeek offline สำหรับการเริ่มโปรแกรมครั้งนั้น:
+PCAP-Hunter เองก็ไม่ได้ bundle YARA signature pack; YARA เป็น scanner ที่อ่าน rules จากผู้ดูแล. PCAPSCANNER ใช้ `yara-rules/` เป็น path เริ่มต้น แต่ repository มีเพียง README ไม่มี signatures. วางเฉพาะ `.yar`/`.yara` ที่ผ่านการตรวจและมีสิทธิ์ใช้งานในโฟลเดอร์นั้น หรือกำหนด path ภายนอกด้วย `PCAP_YARA_RULES_DIR` ก่อนเปิด backend. อย่าดึง signature pack โดยอัตโนมัติจากแหล่งที่ยังไม่ได้ทบทวน license, rule quality และ false-positive rate.
 
-```bash
-PCAP_ZEEK_ENABLED=1 ./"Start PCAPSCANNER.command"
-```
-
-YARA จะต้องมีไฟล์ rule แบบ source `.yar`/`.yara` ที่ผู้ดูแลตรวจและมีสิทธิ์ใช้งานก่อน; repository นี้ไม่ได้บรรจุ third-party rules และโฟลเดอร์ `yara-rules/` เริ่มต้นมีเพียงคำแนะนำ. เมื่อเตรียม rule directory นอก Git แล้ว ให้รัน:
+ไม่ต้องตั้งค่า `PCAP_ZEEK_ENABLED=1` หรือ `PCAP_YARA_ENABLED=1` เพื่อเริ่มใช้งาน; ใช้ `0` เมื่อต้องการปิดชั่วคราว:
 
 ```bash
-PCAP_YARA_ENABLED=1 \
-PCAP_YARA_RULES_DIR="$HOME/path/to/reviewed-rules" \
-./"Start PCAPSCANNER.command"
+PCAP_ZEEK_ENABLED=0 PCAP_YARA_ENABLED=0 ./"Start PCAPSCANNER.command"
 ```
 
-เปิดทั้งสอง stage ในคำสั่งเดียวได้โดยรวม `PCAP_ZEEK_ENABLED=1` ไว้ด้วย. ทุก capture ที่ส่งเข้าโปรแกรมจะถูก parse ตามขีดจำกัดของ profile; Zeek/YARA ยังถูกจำกัดเวลา, memory, rows/objects, bytes และพื้นที่ temporary. YARA วิเคราะห์เฉพาะ HTTP objects ใน binary PCAP/PCAPNG; exported bytes ถูกลบทิ้งหลัง scan และไม่ถูกส่งให้ AI. CSV/TSV ไม่ใช้ Zeek/YARA binary stages.
+ทุก capture ยังถูก parse ภายใต้ resource profile; Zeek/YARA มี time, memory, row/object, byte และ temporary-disk caps. YARA วิเคราะห์เฉพาะ HTTP objects จาก binary PCAP/PCAPNG; object bytes ถูกลบทิ้งหลัง scan และไม่เข้า EvidenceBundle/AI. CSV/TSV ไม่ใช้ Zeek/YARA binary stages.
 
 ```bash
 python3 -m venv .venv-backend
@@ -223,15 +217,15 @@ python -m backend.examples.smoke_backend --live --model EXACT_CURRENT_MANUS_MODE
 
 ## Optional OSINT provider enrichment
 
-ระบบมี authenticated capability/candidate/lookup routes สำหรับ VirusTotal, AbuseIPDB, GreyNoise, Shodan และ AlienVault OTX. ปิดด้วย `PCAP_OSINT_ENABLED=0` โดยปริยาย; เปิดแล้วก็ยังต้องเลือก IOC/provider และติ๊กยินยอม **ทุก operation** ในหน้า Reports. Candidate preview ทำในเครื่อง; เมื่อกดยืนยัน backend ส่งเฉพาะ IP/FQDN/hash ที่เลือกตาม contract ของ provider (ไม่ส่ง PCAP, payload, URI/path, headers, credentials, logs หรือ AI context). เก็บผลเฉพาะ metadata allowlist ไม่เก็บ raw banners/comments/results; ผลไม่ถูกส่งต่อให้ AI. ถ้าผู้ใช้หรือองค์กรไม่มีสิทธิ์ส่ง IOC นั้นไปยัง third party ห้ามกด lookup.
+ระบบมี authenticated capability/candidate/lookup routes สำหรับ VirusTotal, AbuseIPDB, GreyNoise, Shodan และ AlienVault OTX; provider panel/capability เปิดเป็นค่าเริ่มต้น. ปิดความสามารถทั้งหมดด้วย `PCAP_OSINT_ENABLED=0`. การเปิดนี้ **ไม่ส่ง network request อัตโนมัติ**: ต้องเลือก IOC/provider และติ๊กยินยอม **ทุก operation** ในหน้า Reports. Candidate preview ทำในเครื่อง; เมื่อกดยืนยัน backend ส่งเฉพาะ IP/FQDN/hash ที่เลือกตาม contract ของ provider (ไม่ส่ง PCAP, payload, URI/path, headers, credentials, logs หรือ AI context). เก็บผลเฉพาะ metadata allowlist ไม่เก็บ raw banners/comments/results; ผลไม่ถูกส่งต่อให้ AI. ถ้าผู้ใช้หรือองค์กรไม่มีสิทธิ์ส่ง IOC นั้นไปยัง third party ห้ามกด lookup.
 
 ตั้งค่าแบบ Docker Compose โดยไม่ใส่ secret ใน Git:
 
 ```bash
 cp backend/examples/osint.env.example .env.osint
 chmod 600 .env.osint
-# แก้ .env.osint ในเครื่อง: เปิด PCAP_OSINT_ENABLED=1,
-# ใส่เฉพาะ API keys/ack ที่องค์กรมีสิทธิ์ใช้
+# แก้ .env.osint ในเครื่อง: ใส่เฉพาะ API keys/ack ที่องค์กรมีสิทธิ์ใช้;
+# OSINT panel เปิดโดยค่าเริ่มต้นแต่ไม่มี external lookup จนกว่าจะยินยอม
 $EDITOR .env.osint
 docker compose --env-file .env.osint -f infra/docker-compose.backend.yml up -d --build
 ```

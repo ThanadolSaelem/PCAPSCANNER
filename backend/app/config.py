@@ -269,14 +269,18 @@ class AppSettings(BaseModel):
     flow_limit: int = Field(default=5_000, ge=1)
     parser_timeout_seconds: int = Field(default=120, ge=1)
     parser_memory_mb: int = Field(default=512, ge=1)
-    zeek_enabled: bool = False
+    # Offline analyzers are enabled by default when their binaries are installed.
+    # Their hard runtime/resource bounds remain enforced by the pipeline.
+    zeek_enabled: bool = True
     zeek_max_rows: int = Field(default=2_000, ge=1, le=10_000)
     zeek_max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
     zeek_timeout_seconds: int = Field(default=45, ge=1, le=120)
     zeek_memory_mb: int = Field(default=256, ge=128, le=512)
-    osint_enabled: bool = False
-    yara_enabled: bool = False
-    yara_rules_dir: Path | None = None
+    # OSINT provider capability is available by default, but each outbound IOC
+    # lookup still requires explicit per-operation user consent.
+    osint_enabled: bool = True
+    yara_enabled: bool = True
+    yara_rules_dir: Path | None = Path("./yara-rules")
     yara_max_rules_files: int = Field(default=64, ge=1, le=256)
     yara_max_rules_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     yara_max_objects: int = Field(default=100, ge=1, le=500)

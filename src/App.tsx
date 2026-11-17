@@ -1442,7 +1442,7 @@ function StageRow({ stage, index }: { stage: WorkspaceStage; index: number }) {
           <small>{stage.detail}</small>
         </div>
         <span className={`stage-state ${stage.status}`}>
-          {stage.status === "done" ? "DONE" : stage.status.toUpperCase()}
+          {stage.status === "done" ? "DONE" : stage.status === "awaiting_consent" ? "AWAITING CONSENT" : stage.status.toUpperCase()}
         </span>
       </div>
     </div>

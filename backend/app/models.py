@@ -21,7 +21,7 @@ Severity = Literal["info", "low", "medium", "high"]
 
 class Stage(Contract):
     name: str = Field(max_length=80)
-    state: Literal["completed", "partial", "failed", "skipped", "unavailable"]
+    state: Literal["completed", "partial", "failed", "skipped", "unavailable", "awaiting_consent"]
     detail: str = Field(max_length=500)
 
 

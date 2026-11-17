@@ -4,10 +4,11 @@
 
 ## เหตุผลที่เห็น `SKIPPED` / `UNAVAILABLE`
 
-- **Zeek**: มี stage normalize log แบบ offline และ bounded แล้ว แต่ปิดด้วยค่า config เริ่มต้น; ต้องมี executable `zeek` และตั้ง `PCAP_ZEEK_ENABLED=1`.
-- **YARA**: มี HTTP carving และ local CLI scan แบบ bounded แล้ว แต่ปิดโดยปริยาย; ต้องติดตั้ง `tshark`/`yara`, เตรียม operator-managed `.yar`/`.yara` rules ที่ตรวจแล้ว และตั้ง `PCAP_YARA_ENABLED=1` cùng `PCAP_YARA_RULES_DIR`. ไม่มี signature pack แถมมา.
-- **OSINT**: ยังไม่มี implementation ใน PCAPSCANNER branch นี้ จึงแสดงว่าไม่รองรับในรายละเอียด stage และไม่ส่ง network lookup.
-- **AI narrative**: เป็น opt-in และต้องตั้ง provider/model ก่อน จากนั้นผู้ใช้ต้องยินยอมสำหรับ analysis นั้น; parser/deterministic analysis ทำงานได้โดยไม่ต้องต่อ AI.
+- **Upstream defaults**: PCAP-Hunter's UI/API defaults request Zeek, carving and YARA stages on; it does not bundle `.yar` signatures, but discovers operator rules and reports no-rule conditions. Its OSINT panel defaults enabled and requires provider credentials; its AI report checkbox defaults on but still needs a usable endpoint/model.
+- **Zeek**: PCAPSCANNER's bounded offline normalizer is now enabled by default when the `zeek` executable is present; missing executable is `UNAVAILABLE`, not a parser failure. Disable with `PCAP_ZEEK_ENABLED=0`.
+- **YARA**: bounded HTTP carving/local CLI scanning is now enabled by default when tools are present. The repository intentionally contains no third-party signature pack; the default `yara-rules/` folder has instructions only, so the stage clearly says `SKIPPED` until reviewed `.yar/.yara` rules are supplied. Disable with `PCAP_YARA_ENABLED=0`.
+- **OSINT**: authenticated candidate/provider/API panel is implemented and enabled by default; candidate preview is local. It sends no network request until the operator selects IOC/provider and confirms the per-operation external disclosure. Disable the capability with `PCAP_OSINT_ENABLED=0`.
+- **AI narrative**: PCAPSCANNER still requires a configured provider/model and explicit per-analysis consent; it remains disabled before configuration. Deterministic/offline analysis runs independently of AI.
 
 ## ยืนยัน gap ตาม subsystem
 
@@ -25,7 +26,7 @@ PCAP-Hunter มีรายงานผ่าน LM Studio/OpenAI/Anthropic แ�
 
 ### OSINT และ enrichment
 
-PCAP-Hunter มี optional provider enrichment สำหรับ VirusTotal, AbuseIPDB, GreyNoise, Shodan และ OTX พร้อม PTR/GeoIP/WHOIS workflows [5] [9] [10]. PCAPSCANNER ยังไม่มี OSINT provider/API/config/consent. ห้ามนำ default-enabled behavior ของ upstream มาใช้โดยตรง: การเปิด provider lookup เผย IOCs ให้บุคคลที่สาม. ขั้นถัดไปควรเริ่ม local IOC/GeoIP แบบ offline; external lookup ต้องรอการออกแบบ per-operation consent, public-IP-only indicators, fixed origins, secret handling and strict caps.
+PCAP-Hunter มี provider enrichment สำหรับ VirusTotal, AbuseIPDB, GreyNoise, Shodan และ OTX พร้อม PTR/GeoIP/WHOIS workflows [5] [9] [10]. PCAPSCANNER now has default-available provider/API/UI for those five services, local candidate selection, public/special-use screening, provider-specific consent/terms acknowledgments, fixed HTTPS origins, credential isolation, bounded request/response/rate limits, audit, HMAC idempotency and timeout uncertainty handling. Each network request is user-confirmed; default availability does not mean automatic lookup. Still missing: PTR, WHOIS/RDAP and local GeoIP databases, provider cache/key rotation and live-account verification.
 
 ### UI, cases และ exports
 
@@ -34,7 +35,7 @@ PCAP-Hunter มี interactive dashboard/cross-filters, persistent cases/tags/no
 ## Roadmap ที่ควรตามลำดับ
 
 1. Finish fast-flux/NXDOMAIN-ratio and Zeek/TShark correlation; validate DNS/TLS/beacon thresholds against reviewed benign/malicious corpora and add broader TLS/certificate/ATT&CK candidates.
-2. Add local IOC/GeoIP correlation without network lookups; decide separately whether an external provider may receive public indicators under explicit per-operation consent.
+2. Add local IOC/GeoIP correlation, PTR and WHOIS/RDAP workflows; add provider cache/key-rotation operations and verify live account behavior.
 3. Complete local YARA artifact inventory/review with opaque IDs and authenticated bounded downloads; keep payload bytes and paths out of AI context.
 4. Complete cases and shared dashboard/cross-filters; make STIX an immutable versioned snapshot and add the remaining export formats.
 5. Validate chat against supported providers' refusal, timeout, token and JSON-schema behaviors without sending real capture data during tests.

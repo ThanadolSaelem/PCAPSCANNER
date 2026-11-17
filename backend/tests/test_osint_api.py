@@ -74,14 +74,14 @@ def _payload(
     }
 
 
-def test_osint_routes_require_auth_and_capabilities_hide_credentials(tmp_path: Path):
+def test_osint_routes_require_auth_and_capabilities_default_on_without_leaking_credentials(tmp_path: Path):
     app, client = _make_app(tmp_path)
     unauthenticated = TestClient(app)
     assert unauthenticated.get("/api/v1/osint/capabilities").status_code == 401
     app.state.osint_service = OSINTService(env={"PCAP_OSINT_VIRUSTOTAL_API_KEY": "should-never-appear"})
     response = client.get("/api/v1/osint/capabilities")
     assert response.status_code == 200
-    assert response.json()["enabled"] is False
+    assert response.json()["enabled"] is True
     assert response.json()["available"] is False
     assert "should-never-appear" not in response.text
 
@@ -161,6 +161,7 @@ def test_lookup_request_schema_fails_closed(tmp_path: Path, malformed: dict[str,
 
 def test_admin_switch_off_never_calls_provider_and_result_is_retained(tmp_path: Path):
     app, client = _make_app(tmp_path)
+    app.state.settings.osint_enabled = False
     analysis_id, candidate_id = _persist_public_ip_job(app, client)
     calls = 0
 
