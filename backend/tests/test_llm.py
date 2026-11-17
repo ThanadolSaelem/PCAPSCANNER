@@ -91,7 +91,7 @@ def settings(**kwargs) -> AppSettings:
 
 def summary_payload(*, confidence: str = "low", evidence_id: str = "EV-000001") -> dict:
     return {
-        "summary": "Evidence-only summary",
+        "summary": [{"claim": "Evidence-only summary", "evidence_ids": [evidence_id]}],
         "assessments": [
             {
                 "finding_id": "F-0001",
@@ -100,7 +100,9 @@ def summary_payload(*, confidence: str = "low", evidence_id: str = "EV-000001") 
                 "evidence_ids": [evidence_id],
             }
         ],
-        "limitations": ["AI interpretation is not proof of compromise"],
+        "limitations": [
+            {"claim": "AI interpretation is not proof of compromise", "evidence_ids": [evidence_id]}
+        ],
         "recommended_actions": [{"action": "Review the cited flow", "evidence_ids": [evidence_id]}],
     }
 
@@ -194,6 +196,7 @@ async def test_redaction_pseudonymization_and_no_raw_capture():
 
     result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(handler))
     assert result.state == "completed"
+    assert result.prompt_version == "2.0"
     prompt = json.dumps(seen[0])
     assert "RAW PAYLOAD" not in prompt
     assert "bearer totally-secret" not in prompt
@@ -203,6 +206,46 @@ async def test_redaction_pseudonymization_and_no_raw_capture():
     assert "secret.example" not in prompt
     assert "id_" in prompt
     assert "F-0001" in prompt and "EV-000001" in prompt
+
+@pytest.mark.asyncio
+async def test_uri_paths_and_uri_derived_metrics_are_not_sent_to_ai():
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(summary_payload())}, "finish_reason": "stop"}]})
+
+    evidence_bundle = bundle()
+    evidence_bundle.evidence[0].attributes.update(
+        {
+            "http_path": "/admin/reset?token=AI-URI-SENTINEL",
+            "http_uri_max_len": 987654,
+            "http_uri_max_entropy": 7.125,
+            "http_xss_hits": 11,
+            "http_crlf_hits": 12,
+            "http_sqli_hits": 13,
+            "http_shell_hits": 14,
+            "http_host_ip_hits": 15,
+        }
+    )
+    result = await generate_summary(evidence_bundle, settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    prompt = json.dumps(seen[0])
+    assert "AI-URI-SENTINEL" not in prompt
+    assert "http_uri_max_len" not in prompt
+    assert "http_uri_max_entropy" not in prompt
+    for marker in (
+        "http_xss_hits",
+        "http_crlf_hits",
+        "http_sqli_hits",
+        "http_shell_hits",
+        "http_host_ip_hits",
+    ):
+        assert marker not in prompt
+    # Filtering applies only to the provider context; local deterministic evidence remains intact.
+    assert evidence_bundle.evidence[0].attributes["http_xss_hits"] == 11
+    assert evidence_bundle.findings[0].finding_id == "F-0001"
 
 
 @pytest.mark.asyncio
@@ -243,6 +286,34 @@ async def test_fabricated_refs_and_excess_confidence_are_invalid():
     )
     assert result.state == "invalid_output"
     assert result.error_code == "confidence_exceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate, expected_error",
+    [
+        (lambda payload: payload["summary"][0].pop("evidence_ids"), "invalid_output"),
+        (lambda payload: payload["limitations"][0].pop("evidence_ids"), "invalid_output"),
+        (lambda payload: payload["recommended_actions"][0].pop("evidence_ids"), "invalid_output"),
+        (lambda payload: payload["summary"][0].update(evidence_ids=["EV-999999"]), "invalid_refs"),
+        (lambda payload: payload["limitations"][0].update(evidence_ids=["EV-999999"]), "invalid_refs"),
+        (lambda payload: payload["recommended_actions"][0].update(evidence_ids=["EV-999999"]), "invalid_refs"),
+        (lambda payload: payload["assessments"][0].update(evidence_ids=["EV-000002"]), "invalid_refs"),
+    ],
+)
+async def test_uncited_unknown_and_mismatched_citations_fail_closed(mutate, expected_error):
+    payload = summary_payload()
+    mutate(payload)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    original = bundle()
+    result = await generate_summary(original, settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "invalid_output"
+    assert result.report is None
+    assert result.error_code == expected_error
+    assert original.findings[0].finding_id == "F-0001"
 
 
 @pytest.mark.asyncio

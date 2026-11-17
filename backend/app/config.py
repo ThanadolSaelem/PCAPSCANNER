@@ -204,6 +204,49 @@ class AIConfig(BaseModel):
         return self
 
 
+class TriageConfig(BaseModel):
+    """Non-secret configuration for the Tier-1 fast calibrated classifier."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    enabled: bool = True
+    mode: Literal["heuristic_calibrated", "http_openjev", "hybrid", "etbert_openjev"] = "heuristic_calibrated"
+    endpoint_url: str | None = None
+    etbert_enabled: bool = False
+    etbert_endpoint_url: str | None = None
+    data_boundary: DataBoundary = "local"
+    allowed_origins: list[str] = Field(default_factory=list, max_length=20)
+    model_name: str = Field(default="openjev-cal-tier1", min_length=1, max_length=120)
+    etbert_model_name: str = Field(default="etbert-l7-datagram", min_length=1, max_length=120)
+    high_confidence_threshold: float = Field(default=0.90, ge=0.5, le=0.999)
+    low_confidence_threshold: float = Field(default=0.35, ge=0.01, le=0.9)
+    compact_for_ai: bool = True
+    timeout_seconds: int = Field(default=10, ge=1, le=60)
+    etbert_timeout_seconds: int = Field(default=8, ge=1, le=60)
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def validate_triage_origins(cls, value: list[str]) -> list[str]:
+        checked = [_validate_origin(origin) for origin in value]
+        if len(set(checked)) != len(checked):
+            raise ValueError("duplicate_triage_allowed_origin")
+        return checked
+
+    @model_validator(mode="after")
+    def validate_triage_endpoint(self) -> "TriageConfig":
+        if self.endpoint_url is not None:
+            _validate_endpoint(self.endpoint_url, data_boundary=self.data_boundary)
+            if _origin(self.endpoint_url) not in self.allowed_origins:
+                raise ValueError("triage_endpoint_origin_not_allowed")
+        if self.etbert_endpoint_url is not None:
+            _validate_endpoint(self.etbert_endpoint_url, data_boundary=self.data_boundary)
+            if _origin(self.etbert_endpoint_url) not in self.allowed_origins:
+                raise ValueError("triage_endpoint_origin_not_allowed")
+        if self.low_confidence_threshold >= self.high_confidence_threshold:
+            raise ValueError("triage_thresholds_invalid")
+        return self
+
+
 class AppSettings(BaseModel):
     """Application settings used by the backend and AI layer."""
 
@@ -211,18 +254,57 @@ class AppSettings(BaseModel):
 
     data_dir: Path = Path("./data/pcapscanner")
     api_token: SecretStr | None = None
-    upload_max_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
-    storage_max_bytes: int = Field(default=1024 * 1024 * 1024, ge=1)
-    storage_max_captures: int = Field(default=100, ge=1)
+    resource_mode: Literal["auto", "fast", "deep", "unlimited", "legacy"] = "auto"
+    # 0 means dynamically bounded only by free disk minus disk_reserve_bytes.
+    upload_max_bytes: int = Field(default=0, ge=0)
+    storage_max_bytes: int = Field(default=0, ge=0)
+    disk_reserve_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    storage_max_captures: int = Field(default=500, ge=1)
     api_json_max_bytes: int = Field(default=1024 * 1024, ge=1)
     queue_limit: int = Field(default=8, ge=1)
-    packet_limit: int = Field(default=20_000, ge=1)
+    batch_max_files: int = Field(default=8, ge=1, le=64)
+    batch_max_total_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1, le=100 * 1024 * 1024 * 1024)
+    batch_admission_concurrency: int = Field(default=2, ge=1, le=8)
+    packet_limit: int = Field(default=20_000, ge=0)
     flow_limit: int = Field(default=5_000, ge=1)
     parser_timeout_seconds: int = Field(default=120, ge=1)
     parser_memory_mb: int = Field(default=512, ge=1)
     zeek_enabled: bool = False
+    zeek_max_rows: int = Field(default=2_000, ge=1, le=10_000)
+    zeek_max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
+    zeek_timeout_seconds: int = Field(default=45, ge=1, le=120)
+    zeek_memory_mb: int = Field(default=256, ge=128, le=512)
+    yara_enabled: bool = False
+    yara_rules_dir: Path | None = None
+    yara_max_rules_files: int = Field(default=64, ge=1, le=256)
+    yara_max_rules_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    yara_max_objects: int = Field(default=100, ge=1, le=500)
+    yara_max_object_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=128 * 1024 * 1024)
+    yara_max_total_bytes: int = Field(default=64 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
+    yara_max_matches: int = Field(default=200, ge=1, le=2_000)
+    yara_max_output_bytes: int = Field(default=1024 * 1024, ge=64 * 1024, le=16 * 1024 * 1024)
+    yara_timeout_seconds: int = Field(default=30, ge=1, le=120)
+    yara_memory_mb: int = Field(default=256, ge=128, le=512)
     retention_hours: int = Field(default=24, ge=1)
+    local_ingest_roots: list[str] = Field(default_factory=list, max_length=20)
     ai: AIConfig = Field(default_factory=AIConfig)
+    triage: TriageConfig = Field(default_factory=TriageConfig)
+
+    @model_validator(mode="after")
+    def validate_yara_caps(self) -> "AppSettings":
+        if self.yara_max_object_bytes > self.yara_max_total_bytes:
+            raise ValueError("yara_object_limit_exceeds_total")
+        # Rules, temporary carved objects, scan-list and result output share one
+        # per-analysis /tmp directory. Keep headroom below the Compose tmpfs cap.
+        if (
+            self.yara_max_total_bytes
+            + self.yara_max_rules_bytes
+            + self.yara_max_output_bytes
+            + 4 * 1024 * 1024
+            > 224 * 1024 * 1024
+        ):
+            raise ValueError("yara_scratch_budget_exceeds_limit")
+        return self
 
 
 _SECRET_CONFIG_KEYS = {
@@ -293,19 +375,41 @@ def _parse_list(value: str, field: str) -> list[str]:
 def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
     top: dict[str, Any] = {}
     ai: dict[str, Any] = {}
+    triage: dict[str, Any] = {}
     top_map: dict[str, tuple[str, str]] = {
         "PCAP_DATA_DIR": ("data_dir", "str"),
+        "PCAP_RESOURCE_MODE": ("resource_mode", "str"),
         "PCAP_UPLOAD_MAX_BYTES": ("upload_max_bytes", "int"),
         "PCAP_STORAGE_MAX_BYTES": ("storage_max_bytes", "int"),
+        "PCAP_DISK_RESERVE_BYTES": ("disk_reserve_bytes", "int"),
         "PCAP_STORAGE_MAX_CAPTURES": ("storage_max_captures", "int"),
         "PCAP_API_JSON_MAX_BYTES": ("api_json_max_bytes", "int"),
-        "PCAP_QUEUE_LIMIT": ("queue_limit", "int"),
+  "PCAP_QUEUE_LIMIT": ("queue_limit", "int"),
+        "PCAP_BATCH_MAX_FILES": ("batch_max_files", "int"),
+        "PCAP_BATCH_MAX_TOTAL_BYTES": ("batch_max_total_bytes", "int"),
+        "PCAP_BATCH_ADMISSION_CONCURRENCY": ("batch_admission_concurrency", "int"),
         "PCAP_PACKET_LIMIT": ("packet_limit", "int"),
         "PCAP_FLOW_LIMIT": ("flow_limit", "int"),
         "PCAP_PARSER_TIMEOUT_SECONDS": ("parser_timeout_seconds", "int"),
         "PCAP_PARSER_MEMORY_MB": ("parser_memory_mb", "int"),
         "PCAP_ZEEK_ENABLED": ("zeek_enabled", "bool"),
+        "PCAP_ZEEK_MAX_ROWS": ("zeek_max_rows", "int"),
+        "PCAP_ZEEK_MAX_OUTPUT_BYTES": ("zeek_max_output_bytes", "int"),
+        "PCAP_ZEEK_TIMEOUT_SECONDS": ("zeek_timeout_seconds", "int"),
+        "PCAP_ZEEK_MEMORY_MB": ("zeek_memory_mb", "int"),
+        "PCAP_YARA_ENABLED": ("yara_enabled", "bool"),
+        "PCAP_YARA_RULES_DIR": ("yara_rules_dir", "str"),
+        "PCAP_YARA_MAX_RULES_FILES": ("yara_max_rules_files", "int"),
+        "PCAP_YARA_MAX_RULES_BYTES": ("yara_max_rules_bytes", "int"),
+        "PCAP_YARA_MAX_OBJECTS": ("yara_max_objects", "int"),
+        "PCAP_YARA_MAX_OBJECT_BYTES": ("yara_max_object_bytes", "int"),
+        "PCAP_YARA_MAX_TOTAL_BYTES": ("yara_max_total_bytes", "int"),
+        "PCAP_YARA_MAX_MATCHES": ("yara_max_matches", "int"),
+        "PCAP_YARA_MAX_OUTPUT_BYTES": ("yara_max_output_bytes", "int"),
+        "PCAP_YARA_TIMEOUT_SECONDS": ("yara_timeout_seconds", "int"),
+        "PCAP_YARA_MEMORY_MB": ("yara_memory_mb", "int"),
         "PCAP_RETENTION_HOURS": ("retention_hours", "int"),
+        "PCAP_LOCAL_INGEST_ROOTS": ("local_ingest_roots", "list"),
     }
     for env_name, (field_name, kind) in top_map.items():
         if env_name not in env:
@@ -318,8 +422,47 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
                 raise ValueError(f"invalid_{field_name}") from exc
         elif kind == "bool":
             top[field_name] = _parse_bool(raw, field_name)
+        elif kind == "list":
+            top[field_name] = _parse_list(raw, field_name)
         else:
             top[field_name] = raw
+
+    triage_map: dict[str, tuple[str, str]] = {
+        "PCAP_TRIAGE_ENABLED": ("enabled", "bool"),
+        "PCAP_TRIAGE_MODE": ("mode", "str"),
+        "PCAP_TRIAGE_ENDPOINT_URL": ("endpoint_url", "str"),
+        "PCAP_TRIAGE_ETBERT_ENABLED": ("etbert_enabled", "bool"),
+        "PCAP_TRIAGE_ETBERT_ENDPOINT_URL": ("etbert_endpoint_url", "str"),
+        "PCAP_TRIAGE_ETBERT_MODEL": ("etbert_model_name", "str"),
+        "PCAP_TRIAGE_ETBERT_TIMEOUT_SECONDS": ("etbert_timeout_seconds", "int"),
+        "PCAP_TRIAGE_DATA_BOUNDARY": ("data_boundary", "str"),
+        "PCAP_TRIAGE_ALLOWED_ORIGINS": ("allowed_origins", "list"),
+        "PCAP_TRIAGE_MODEL": ("model_name", "str"),
+        "PCAP_TRIAGE_HIGH_CONF": ("high_confidence_threshold", "float"),
+        "PCAP_TRIAGE_LOW_CONF": ("low_confidence_threshold", "float"),
+        "PCAP_TRIAGE_COMPACT_FOR_AI": ("compact_for_ai", "bool"),
+        "PCAP_TRIAGE_TIMEOUT_SECONDS": ("timeout_seconds", "int"),
+    }
+    for env_name, (field_name, kind) in triage_map.items():
+        if env_name not in env:
+            continue
+        raw = env[env_name]
+        if kind == "int":
+            try:
+                triage[field_name] = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid_triage_{field_name}") from exc
+        elif kind == "float":
+            try:
+                triage[field_name] = float(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid_triage_{field_name}") from exc
+        elif kind == "bool":
+            triage[field_name] = _parse_bool(raw, f"triage_{field_name}")
+        else:
+            triage[field_name] = raw
+    if triage:
+        top["triage"] = triage
 
     ai_map: dict[str, tuple[str, str]] = {
         "PCAP_AI_ENABLED": ("enabled", "bool"),
@@ -381,12 +524,14 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_settings() -> AppSettings:
-    """Load non-secret YAML/JSON config and environment overrides.
+    """Load non-secret YAML/JSON config, optional desktop workspace, and environment overrides.
 
     ``PCAP_API_TOKEN`` is intentionally read only from the environment.  The
     AI API key itself is likewise looked up at request time through the
     configured environment-variable *name* and is never placed in this model.
     """
+    from .picker import load_workspace_config, resolve_workspace_config_path
+
     env = dict(os.environ)
     file_overlay: dict[str, Any] = {}
     config_path = env.get("PCAP_AI_CONFIG")
@@ -395,7 +540,27 @@ def load_settings() -> AppSettings:
         # Permit a concise AI-only file while retaining the full settings form.
         if "ai" not in file_overlay and any(key in AIConfig.model_fields for key in file_overlay):
             file_overlay = {"ai": file_overlay}
-    merged = _merge(file_overlay, _env_overlay(env))
+
+    env_overlay = _env_overlay(env)
+    ws_path = resolve_workspace_config_path()
+    if ws_path is not None and ws_path.is_file():
+        ws_raw = load_workspace_config(ws_path)
+        ws_overlay: dict[str, Any] = {}
+        if ws_raw.get("data_dir"):
+            ws_overlay["data_dir"] = ws_raw["data_dir"]
+        if isinstance(ws_raw.get("local_ingest_roots"), list):
+            ws_overlay["local_ingest_roots"] = ws_raw["local_ingest_roots"]
+        if ws_raw.get("resource_mode"):
+            ws_overlay["resource_mode"] = ws_raw["resource_mode"]
+        _assert_nonsecret(ws_overlay)
+        if ws_raw.get("prefer_workspace"):
+            # Desktop UI-picked paths take precedence over ambient shell defaults.
+            merged = _merge(_merge(file_overlay, env_overlay), ws_overlay)
+        else:
+            merged = _merge(_merge(file_overlay, ws_overlay), env_overlay)
+    else:
+        merged = _merge(file_overlay, env_overlay)
+
     if env.get("PCAP_API_TOKEN", ""):
         merged["api_token"] = SecretStr(env["PCAP_API_TOKEN"])
     else:
@@ -403,4 +568,4 @@ def load_settings() -> AppSettings:
     return AppSettings.model_validate(merged)
 
 
-__all__ = ["AIConfig", "AppSettings", "ProviderName", "load_settings"]
+__all__ = ["AIConfig", "AppSettings", "ProviderName", "TriageConfig", "load_settings"]

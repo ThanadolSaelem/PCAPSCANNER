@@ -2,13 +2,13 @@
 
 Backend นี้รับ PCAP/PCAPNG วิเคราะห์ metadata แบบ offline และสร้างรายงาน AI จาก structured evidence ที่ลดข้อมูลแล้ว ไม่ส่งไฟล์จับแพ็กเก็ตหรือ raw payload ไปยัง AI โดยปริยาย ผล detector อยู่แยกจากคำอธิบาย AI เสมอ
 
-**ขอบเขตรอบนี้:** Backend code และ API รันได้จริง แต่หน้า React ยังเป็น mockup ไม่มี live upload หรือ AI settings form ที่เชื่อม API นี้. Source ถูกนำมายัง `ThanadolSaelem/PCAPSCANNER` ตามคำอนุมัติให้ push ของผู้ใช้ ไม่ใช่การ deploy backend หรือเผยแพร่เว็บไซต์เวอร์ชัน live
+**สถานะ branch:** หน้า React เชื่อมกับ API จริงสำหรับ capture, queue, report, AI/Tier‑1 และ bounded multi-file batch intake. Batch รับ PCAP/PCAPNG แบบ multipart, สร้าง manifest และ child analysis jobs แยกกัน; remote AI/classifier ไม่ได้รับ consent จาก batch. Parity subsystem อื่นยังอยู่ระหว่างพัฒนา. Source นี้อยู่บน branch `feat/live-workbench-one-click`; การ push ไม่ใช่การ deploy.
 
 ## Flow ที่ implement
 
 1. Client ส่งไฟล์แบบ streaming ไป `POST /api/v1/captures` ระบบตรวจขนาดและ magic/header, สร้าง UUID และ SHA-256 แล้วเก็บใน private directory. Header ผ่านยังไม่แปลว่าไฟล์ทั้งไฟล์ parse ได้
 2. Client ส่ง `capture_id` ไป `POST /api/v1/analyses`. ระบบรับเป็น `202 Accepted` และเก็บ job ใน SQLite queue. เมื่อคิวหรือ storage เต็มจะปฏิเสธอย่างชัดเจน ไม่รับแล้วทิ้งเงียบ ๆ
-3. Offline parser worker claim งาน → TShark `-n -r` → flow/DNS metadata และ frame refs → detector candidates → evidence bundle. ไม่ probe, replay หรือเปิด browser ไปยัง IP/URL ใน capture
+3. Offline parser worker claim งาน → TShark `-n -r` → flow/DNS metadata และ frame refs → detector candidates → evidence bundle. หากเปิด Zeek จะรัน `zeek -r` ใน private temporary directory แยกต่อ analysis แล้ว normalize เฉพาะ `conn.log`, `dns.log`, `ssl.log`, `x509.log` เป็น `kind=zeek` พร้อม `source_log`/`source_row`; ไม่อ่าน payload หรือ `http.log`. ไม่ probe, replay หรือเปิด browser ไปยัง IP/URL ใน capture
 4. หากไม่เลือก AI ระบบคืน evidence report ได้ทันที. ถ้าเลือก AI พร้อม consent งานเข้าสู่ `awaiting_ai` และ narrator worker ที่แยกจาก parser จะรับต่อ
 5. Narrator ส่งเฉพาะ fields ที่ allowlist, pseudonymize IP/domain identifiers ด้วย per-call HMAC salt และตัด raw summaries/payload/cookie/filename/arbitrary attributes. Model ต้องคืน JSON ตาม schema; backend ตรวจ finding IDs, evidence IDs, ความสัมพันธ์กับ finding และห้ามยกระดับ confidence สูงกว่า detector
 6. หาก AI timeout, refusal, invalid JSON, fabricated refs, context เกิน หรือ worker หาย ระบบคง evidence และแสดง AI state/error code แยก. ไม่ตีความ error เป็นรายงานสำเร็จ. Worker recovery/cancellation มี lease fencing เพื่อไม่ให้ process เก่าทับผลใหม่
@@ -51,7 +51,7 @@ python -m backend.app.ai_worker
 
 ## ตัวอย่าง upload และสร้างงาน
 
-ไม่ใช้ multipart ใน API รุ่นนี้: ส่งเนื้อไฟล์เป็น body โดยตรง เพื่อให้ size cap ถูกบังคับขณะ stream และไม่ต้องพึ่ง filename จากผู้ใช้
+Single-file upload ส่งเนื้อไฟล์เป็น body โดยตรง เพื่อบังคับ size cap ระหว่าง stream โดยไม่ต้องพึ่ง filename; multi-file batch ใช้ streaming multipart parser แยกต่างหากและไม่ใช้ client filename เป็น path.
 
 ```bash
 curl --fail-with-body -X POST http://127.0.0.1:8000/api/v1/captures \
@@ -67,12 +67,38 @@ curl --fail-with-body -X POST http://127.0.0.1:8000/api/v1/analyses \
   -H "Authorization: Bearer $PCAP_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: case-001-analysis-001' \
-  -d '{"capture_id":"REPLACE_WITH_CAPTURE_ID","ai_enabled":false,"ai_consent":false}'
+  -d '{"capture_id":"REPLACE_WITH_CAPTURE_ID","ai_enabled":false,"ai_consent":false,"triage_enabled":true,"triage_endpoint_consent":false}'
 ```
 
 หากต้องใช้ AI ให้ operator เปิด `ai.enabled`, เลือก model และตั้ง provider ก่อน แล้วเปลี่ยนทั้ง `ai_enabled` และ `ai_consent` เป็น `true`. Consent ผูกกับ configuration fingerprint ของ endpoint/model/data policy; หาก API กับ narrator config ต่างกัน narrator จะไม่ส่งข้อมูลและคืน `ai_consent_or_policy_changed`
 
+`triage_endpoint_consent` เป็น consent แยกจาก AI narrator: ค่า `false` ใช้ deterministic local Tier‑1 เท่านั้น แม้จะตั้ง endpoint ไว้. การส่ง network classifier ต้องเปิด endpoint ผ่าน config และ allowlist ก่อน แล้วผู้ใช้ยินยอมต่อ analysis นั้น; ส่งเฉพาะ anonymized, allowlisted flow features ไม่ส่ง capture หรือ packet payload.
+
 อ่านงานด้วย `GET /api/v1/analyses/{id}`, อ่าน `/evidence` หรือ `/report` เมื่อ evidence พร้อม, และยกเลิกด้วย `POST /api/v1/analyses/{id}/cancel`. ตัวอย่างเส้นทางทั้งหมดอยู่ใน `backend/openapi.json`. รุ่นนี้ยังไม่มี report-only refresh endpoint; หากต้องการ regenerating โดยไม่ parse ซ้ำให้เพิ่ม endpoint/state transition ในขั้นต่อไป
+
+### Batch intake หลายไฟล์
+
+`POST /api/v1/batches` รับ repeated multipart field ชื่อ `files`; Authorization ถูกตรวจสอบก่อนอ่าน body. ระบบ stream ไป private staging ทีละส่วน, ตรวจจำนวน/ขนาดรวม/ขนาดต่อไฟล์, suffix, PCAP/PCAPNG magic และ SHA-256; ชื่อไฟล์จาก client ใช้ตรวจ suffix ชั่วคราวเท่านั้น ไม่บันทึกหรือสะท้อนกลับเป็น path. เมื่อผ่านจึง admission แบบ atomic ของ manifest, capture และ analysis jobs ทั้ง batch; หากโควตา, disk reserve, storage หรือ queue ไม่พอ จะปฏิเสธทั้งชุด. `Idempotency-Key` ที่เหมือนกันและรายการเดียวกันคืน manifest เดิมโดยไม่สร้างงานซ้ำ.
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:8000/api/v1/batches \\
+  -H "Authorization: Bearer $PCAP_API_TOKEN" \\
+  -H 'Idempotency-Key: case-001-batch-001' \\
+  -F 'files=@capture-01.pcap' \\
+  -F 'files=@capture-02.pcapng'
+
+# อ่าน aggregate/per-item state
+curl --fail-with-body http://127.0.0.1:8000/api/v1/batches/BATCH_ID \\
+  -H "Authorization: Bearer $PCAP_API_TOKEN"
+
+# ขอ cancel ทั้ง batch; งานที่เสร็จแล้วและ evidence จะไม่ถูกลบ
+curl --fail-with-body -X POST http://127.0.0.1:8000/api/v1/batches/BATCH_ID/cancel \\
+  -H "Authorization: Bearer $PCAP_API_TOKEN"
+```
+
+ค่าเริ่มต้นคือสูงสุด 8 ไฟล์, 2 GiB รวม และ admission concurrency 2; override ด้วย `PCAP_BATCH_MAX_FILES`, `PCAP_BATCH_MAX_TOTAL_BYTES` และ `PCAP_BATCH_ADMISSION_CONCURRENCY`. ขนาดต่อไฟล์ถูกจำกัดด้วย `PCAP_UPLOAD_MAX_BYTES` เมื่อกำหนด หรือ batch aggregate cap เมื่อเป็น 0; disk reserve, storage quota, capture history และ queue cap ยังคงมีผล. Queue/admission busy ตอบ `429` และ `Retry-After`. Batch ใช้ resource mode `auto`, AI ปิด และ remote Tier‑1 endpoint consent ปิด; การวิเคราะห์ local/deterministic เท่านั้น.
+
+UI poll batch manifest จาก API, แสดงแต่ละ item ตาม state จริง, ยกเลิกทั้ง batch, เปิด evidence ของ item ที่พร้อม และส่งเฉพาะไฟล์ที่ล้มเหลวซ้ำเป็น batch ใหม่. ระหว่าง browser upload แสดงสถานะ indeterminate เท่านั้น เพราะ endpoint ยังไม่รายงาน byte-progress; ไม่มีการคำนวณเปอร์เซ็นต์จากเวลา. หาก request ขาดการเชื่อมต่อหลัง server รับ body ครบ ให้ retry ด้วยรายการเดิมและ idempotency key เดิม.
 
 ## AI configuration ที่เป็นมาตรฐานและย้าย provider ได้
 
@@ -139,9 +165,9 @@ export PCAP_CONFIG_PATH="$PWD/backend/examples/ai-config.example.yaml"
 docker compose -f infra/docker-compose.backend.yml up -d --build
 ```
 
-Sample แยก `api`, `parser`, `narrator`: non-root, read-only root, cap_drop ALL, no-new-privileges, CPU/RAM/PID/tmpfs limits. Parser อยู่ Docker internal network ไม่มี default external egress; raw capture volume mount เฉพาะ API/parser ไม่ mount ให้ network-capable narrator. มี private metadata/evidence volume ร่วมกันสำหรับ SQLite และ job state
+Sample แยก `api`, `parser`, `narrator`: non-root, read-only root, cap_drop ALL, no-new-privileges, CPU/RAM/PID/tmpfs limits. Parser อยู่ Docker internal network ไม่มี default external egress; raw capture volume mount เฉพาะ API/parser ไม่ mountให้ network-capable narrator. มี private metadata/evidence volume ร่วมกันสำหรับ SQLite และ job state. Backend image ติดตั้ง Zeek 9.0.1 จาก official OBS package ที่ pin เป็น `9.0.1-0` และ YARA CLI 4.2.3-4 จาก Debian Bookworm.
 
-**Local endpoint ใน Docker:** `127.0.0.1` หมายถึง container เอง ไม่ใช่ Ollama บนเครื่อง host. ต้องเปลี่ยน base URL และ allowlist เป็นชื่อ service/host endpoint ที่เข้าถึงได้จริง หรือรัน narrator บน host. Sample ไม่ได้ติดตั้ง Ollama/LM Studio/Zeek ให้อัตโนมัติ
+**Local endpoint ใน Docker:** `127.0.0.1` หมายถึง container เอง ไม่ใช่ Ollama บนเครื่อง host. ต้องเปลี่ยน base URL และ allowlist เป็นชื่อ service/host endpoint ที่เข้าถึงได้จริง หรือรัน narrator บน host. Zeek ถูกติดตั้งใน backend image แต่ปิดเป็นค่าเริ่มต้น; เปิดด้วย `PCAP_ZEEK_ENABLED=1` เมื่อต้องการ. การติดตั้ง native ต้องมี `zeek` บน `PATH`; ส่วน CSV/TSV จะไม่เรียก Zeek. YARA ปิดเป็นค่าเริ่มต้น; สำหรับ Compose ให้เตรียมไฟล์ source `.yar`/`.yara` ที่ตรวจและ pin โดย operator ใน rules directory จากนั้นตั้ง `PCAP_YARA_ENABLED=1` และเลือก `PCAP_YARA_RULES_HOST_DIR` (ค่าเริ่มต้น `../yara-rules`). โฟลเดอร์ mount แบบ read-only ให้ API/parser เท่านั้น ไม่ mountให้นักเล่า AI. YARA ทำงานเฉพาะ binary PCAP/PCAPNG และ native ต้องมี `tshark` กับ `yara` บน `PATH`.
 
 API publish port เฉพาะ `127.0.0.1:8000`; หากเปิดให้หน่วยงานใช้ผ่านเครือข่าย ให้ตั้ง TLS reverse proxy, access controls และ secret manager เอง. SQLite/volume sample เป็น **single-host/single-tenant** ไม่ใช่ multi-pod SaaS หรือ enterprise OIDC/RBAC. Docker build/cgroups/egress ยังไม่ได้ live-test ใน sandbox นี้เพราะไม่มี Docker daemon; image tag pin แต่ apt packages ยังไม่เป็น immutable digest/reproducible build ต้อง pin digest/package mirror ก่อน production ที่ต้อง reproducibility
 
@@ -149,11 +175,11 @@ Origin allowlist เป็นขอบเขต configuration ไม่ใช่
 
 ## Limits และสิ่งที่ยังไม่ครบ
 
-Default: 100 MiB/ไฟล์, raw capture quota 1 GiB/100 captures, queue 8 งาน, TShark packet cap 20,000 + sentinel, flow/evidence cap 5,000, refs 50/record, parser deadline 120 วินาที และ Linux child memory bound 512 MiB. ชน cap จะมี warnings/partial ไม่อ้าง full capture coverage. ระบบจำกัด job history 500 รายการและ purge capture/associated terminal job evidence เมื่อหมดอายุ 24 ชั่วโมง; active jobs ไม่ถูกลบ
+Default upload/storage byte cap `0` หมายถึงใช้ free disk ที่เหลือหลังหัก disk reserve 256 MiB; raw capture history สูงสุด 500 captures, queue 8 jobs. Batch จำกัด 8 ไฟล์และ 2 GiB รวม พร้อม admission concurrency 2; ต่อไฟล์ไม่เกิน `PCAP_UPLOAD_MAX_BYTES` หากตั้งค่ามากกว่า 0 มิฉะนั้นไม่เกิน batch aggregate cap. Limits จริงยังถูกตัดด้วย free disk, storage quota, queue slots ที่ว่าง และ capture-history quota; การตรวจ UI เป็นเพียงตัวช่วยและ server เป็นผู้ตัดสิน admission. TShark packet cap 20,000 + sentinel, flow/evidence cap 5,000, refs 50/record, parser deadline 120 วินาที และ Linux child memory bound 512 MiB. Zeek ปิดโดยปริยาย; เมื่อเปิดจะจำกัด 2,000 rows, output logs 32 MiB, deadline/CPU 45 วินาที, memory 256 MiB และ per-file output โดย `PCAP_ZEEK_MAX_ROWS`, `PCAP_ZEEK_MAX_OUTPUT_BYTES`, `PCAP_ZEEK_TIMEOUT_SECONDS`, `PCAP_ZEEK_MEMORY_MB` (สูงสุด 10,000 rows/256 MiB/120 วินาที/512 MiB). YARA ปิดโดยปริยาย; เมื่อเปิดจะ carve เฉพาะ HTTP objects แบบ offline และ scan ด้วย local operator rules. ค่าเริ่มต้นจำกัด 64 rule files/16 MiB, 100 objects, object/aggregate bytes 16/64 MiB, 200 matches, output 1 MiB, timeout 30 วินาที และ memory 256 MiB; ใช้ `PCAP_YARA_ENABLED=1`, `PCAP_YARA_RULES_HOST_DIR` และปรับได้ด้วย `PCAP_YARA_MAX_RULES_FILES`, `PCAP_YARA_MAX_RULES_BYTES`, `PCAP_YARA_MAX_OBJECTS`, `PCAP_YARA_MAX_OBJECT_BYTES`, `PCAP_YARA_MAX_TOTAL_BYTES`, `PCAP_YARA_MAX_MATCHES`, `PCAP_YARA_MAX_OUTPUT_BYTES`, `PCAP_YARA_TIMEOUT_SECONDS`, `PCAP_YARA_MEMORY_MB`. Backend ตรวจผลรวมพื้นที่ temporary ของ rules, objects, scan list, output และ 4 MiB overhead ไม่เกิน 224 MiB เพื่อเหลือ headroom จาก `/tmp` tmpfs 256 MiB. Ruleset ถูก snapshot/hash ต่อ run; ห้ามใช้ `include`; ไม่มี archive expansion; raw object และ diagnostics อยู่ใน temp ที่ลบทิ้งและไม่เข้า EvidenceBundle/AI. หากชนเพดาน coverage จะเป็น partial ไม่อ้าง full capture. ระบบจำกัด job history 500 รายการและ purge capture/associated terminal job evidence เมื่อหมดอายุ 24 ชั่วโมง; active jobs ไม่ถูกลบ
 
 การลบเป็น logical deletion ของไฟล์/SQLite rows ไม่รับรอง physical secure erasure, backup deletion หรือ encrypted-at-rest. ควรตั้ง encrypted volume, backup lifecycle และ retention ตาม policy ขององค์กร
 
-มี detector candidates ขั้นพื้นฐาน: TCP destination port spread, DNS repeated NXDOMAIN/long-label entropy และ periodic SYN-based connection starts. เป็น low-confidence heuristics ไม่ยืนยัน intrusion. TLS มี handshake metadata ไม่ใช่ complete certificate validation. Optional Zeek แค่รัน artifact stage ใน isolated temporary directoryและลบทิ้ง ยังไม่ normalize logs เข้า evidence; YARA, OSINT, carving, JA3, MITRE enrichment และ detector parity กับ PCAP-Hunter **ยังไม่ implement**
+มี detector candidates ขั้นพื้นฐาน: TCP destination port spread, DNS repeated NXDOMAIN/long-label entropy และ periodic SYN-based connection starts. เป็น low-confidence heuristics ไม่ยืนยัน intrusion. Zeek 9.0.1 เมื่อเปิดจะ normalize allowlisted metadata จาก `conn.log`, `dns.log`, `ssl.log`, `x509.log` เป็น evidence พร้อม `source_log`/`source_row`; ไม่อ่าน raw payload หรือ `http.log`. Zeek logs ไม่ได้สร้าง intrusion verdict และยังไม่มี detector ที่ใช้ Zeek โดยตรง. TLS handshake metadata ไม่ใช่ complete certificate validation. YARA เมื่อเปิดจะ carve เฉพาะ HTTP objects offline และ scan ด้วย operator rules; match สร้าง finding ที่อ้าง evidence ID แต่ยังต้องตรวจ rule quality/context และไม่ถือเป็นหลักฐานยืนยัน compromise. Advanced DNS/TLS/beacon analytics, local IOC correlation, Zeek-derived JA3, MITRE enrichment, OSINT/rDNS/WHOIS/RDAP, cases/chat/exports และ parity เต็มรูปแบบกับ PCAP-Hunter **ยังไม่ implement**
 
 การ sanitize/schema/ref validation ลดความเสี่ยง prompt injection และ fabricated references แต่ **ไม่พิสูจน์ความจริงของทุกประโยค AI** ผู้ตรวจยังต้องเทียบ baseline, packet context และ evidence. ผลไม่พบสัญญาณไม่ใช่ใบรับรองว่าปลอดภัยทั้งหมด
 

@@ -6,7 +6,8 @@ from .config import load_settings
 from .models import EvidenceBundle, AIResult
 from .main import profile_hash
 from .llm import generate_summary
-from .worker import make_store
+from .picker import resolve_workspace_config_path
+from .worker import _workspace_stamp, make_store
 
 
 async def run_once(store, settings) -> bool:
@@ -56,7 +57,20 @@ async def run_once(store, settings) -> bool:
 async def main():
     settings = load_settings()
     store = make_store(settings)
+    ws_path = resolve_workspace_config_path()
+    ws_stamp = _workspace_stamp(ws_path)
     while True:
+        current_stamp = _workspace_stamp(ws_path)
+        if current_stamp != ws_stamp:
+            ws_stamp = current_stamp
+            try:
+                new_settings = load_settings()
+                settings = new_settings
+                new_store = make_store(new_settings)
+                if new_store.root != store.root:
+                    store = new_store
+            except Exception:
+                pass
         store.recover_stale(600)
         if not await run_once(store, settings):
             await asyncio.sleep(0.5)

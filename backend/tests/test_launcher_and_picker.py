@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from unittest import mock
+
+try:
+    import pydantic
+
+    HAS_PYDANTIC_V2 = int(getattr(pydantic, "__version__", "1").split(".")[0]) >= 2
+except Exception:
+    HAS_PYDANTIC_V2 = False
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from backend.app import launcher, picker  # noqa: E402
+
+
+class NativePickerUnitTests(unittest.TestCase):
+    def test_workspace_config_isolated_unless_opted_in(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(picker.resolve_workspace_config_path())
+        with mock.patch.dict(os.environ, {"PCAP_WORKSPACE_CONFIG": "/tmp/custom-ws.json"}, clear=True):
+            self.assertEqual(picker.resolve_workspace_config_path(), Path("/tmp/custom-ws.json").resolve())
+        with mock.patch.dict(os.environ, {"PCAP_ENABLE_NATIVE_PICKER": "1"}, clear=True):
+            self.assertIsNotNone(picker.resolve_workspace_config_path())
+
+    def test_sanitize_and_atomic_save_with_0600_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ws_file = Path(tmp) / "cfg" / "workspace.json"
+            dirty = {
+                "data_dir": str(Path(tmp) / "data"),
+                "local_ingest_roots": [str(Path(tmp) / "pcaps"), str(Path(tmp) / "pcaps"), "bad\x00path", ""],
+                "resource_mode": "unlimited",
+                "prefer_workspace": True,
+                "api_token": "should-never-persist",
+                "secret": "drop-me",
+            }
+            saved = picker.save_workspace_config(dirty, ws_file)
+            self.assertEqual(saved, ws_file)
+            mode = stat.S_IMODE(ws_file.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+            loaded = picker.load_workspace_config(ws_file)
+            self.assertNotIn("api_token", loaded)
+            self.assertNotIn("secret", loaded)
+            self.assertEqual(loaded["resource_mode"], "unlimited")
+            self.assertEqual(loaded["local_ingest_roots"], [str((Path(tmp) / "pcaps").resolve())])
+            self.assertTrue(loaded["prefer_workspace"])
+
+    def test_is_loopback_client(self) -> None:
+        for addr in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost", "testclient"):
+            self.assertTrue(picker.is_loopback_client(addr), addr)
+        for addr in (None, "", "10.0.0.12", "192.168.1.5", "8.8.8.8", "example.com"):
+            self.assertFalse(picker.is_loopback_client(addr), str(addr))
+
+    def test_pick_native_path_disabled_unavailable_cancel_and_mocked_selection(self) -> None:
+        with mock.patch.dict(os.environ, {"PCAP_ENABLE_NATIVE_PICKER": "0"}):
+            with self.assertRaises(picker.PickerDisabledError):
+                picker.pick_native_path("data_dir")
+
+        with (
+            mock.patch.dict(os.environ, {"PCAP_ENABLE_NATIVE_PICKER": "1"}),
+            mock.patch.object(picker, "detect_picker_backend", return_value=None),
+        ):
+            with self.assertRaises(picker.PickerUnavailableError):
+                picker.pick_native_path("data_dir")
+
+        cancel_proc = subprocess.CompletedProcess(
+            args=["osascript"],
+            returncode=1,
+            stdout="",
+            stderr="execution error: User canceled. (-128)",
+        )
+        with (
+            mock.patch.dict(os.environ, {"PCAP_ENABLE_NATIVE_PICKER": "1"}),
+            mock.patch.object(picker, "detect_picker_backend", return_value="osascript"),
+            mock.patch("subprocess.run", return_value=cancel_proc),
+        ):
+            self.assertIsNone(picker.pick_native_path("capture_file"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chosen = Path(tmp) / "trace.pcapng"
+            ok_proc = subprocess.CompletedProcess(
+                args=["osascript"],
+                returncode=0,
+                stdout=f"{chosen}\n",
+                stderr="",
+            )
+            with (
+                mock.patch.dict(os.environ, {"PCAP_ENABLE_NATIVE_PICKER": "1"}),
+                mock.patch.object(picker, "detect_picker_backend", return_value="osascript"),
+                mock.patch("subprocess.run", return_value=ok_proc) as mocked_run,
+            ):
+                picked = picker.pick_native_path("capture_file", initial_dir=tmp)
+            self.assertEqual(picked, chosen.resolve())
+            self.assertFalse(mocked_run.call_args.kwargs.get("shell", False))
+
+
+class LauncherUnitTests(unittest.TestCase):
+    def test_ensure_local_token_creates_0600_and_reuses_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tok_path = Path(tmp) / "pcap" / "local_token.secret"
+            with mock.patch.dict(os.environ, {"PCAP_API_TOKEN": ""}):
+                first = launcher.ensure_local_token(tok_path)
+                self.assertGreaterEqual(len(first), 32)
+                self.assertEqual(stat.S_IMODE(tok_path.stat().st_mode), 0o600)
+                second = launcher.ensure_local_token(tok_path)
+                self.assertEqual(first, second)
+
+            with mock.patch.dict(os.environ, {"PCAP_API_TOKEN": "explicit-env-token-123456"}):
+                self.assertEqual(launcher.ensure_local_token(tok_path), "explicit-env-token-123456")
+
+    def test_ensure_workspace_initialized_and_launch_url_uses_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ws_path = Path(tmp) / "workspace.json"
+            data_path = Path(tmp) / "my-data"
+            with mock.patch.dict(os.environ, {}, clear=True):
+                out_path = launcher.ensure_workspace_initialized(ws_path, default_data_dir=data_path)
+            self.assertEqual(out_path, ws_path.resolve())
+            loaded = json.loads(ws_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["data_dir"], str(data_path.resolve()))
+
+            cli_dir = Path(tmp) / "ssd-data"
+            launcher.ensure_workspace_initialized(ws_path, cli_data_dir=str(cli_dir))
+            updated = json.loads(ws_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated["data_dir"], str(cli_dir.resolve()))
+            self.assertTrue(updated["prefer_workspace"])
+
+        url = launcher.build_launch_url(8000, "secret+tok/en=", backend_url="")
+        self.assertIn("#token=", url)
+        self.assertNotIn("?token=", url)
+
+    def test_probe_pcapscanner_health_distinguishes_services(self) -> None:
+        class _Handler(BaseHTTPRequestHandler):
+            payload = {"status": "ok", "api_version": "1"}
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(self.payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            self.assertTrue(launcher.probe_pcapscanner_health(port))
+            _Handler.payload = {"status": "ok"}  # Not PCAPSCANNER (missing api_version)
+            self.assertFalse(launcher.probe_pcapscanner_health(port))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+@unittest.skipUnless(HAS_PYDANTIC_V2, "requires pydantic>=2 + fastapi TestClient")
+class WorkspaceApiAndSpaTests(unittest.TestCase):
+    def test_workspace_mutation_picker_and_single_port_spa(self) -> None:
+        from fastapi.testclient import TestClient
+        from backend.app import config, main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ws_file = tmp_path / "workspace.json"
+            data_dir_a = tmp_path / "data-a"
+            data_dir_b = tmp_path / "data-b"
+            cap_dir = tmp_path / "captures"
+            cap_dir.mkdir(parents=True)
+            sample_pcap = cap_dir / "trace.pcap"
+            sample_pcap.write_bytes(b"\xd4\xc3\xb2\xa1" + b"\x00" * 24)
+
+            dist_dir = tmp_path / "dist"
+            assets_dir = dist_dir / "assets"
+            assets_dir.mkdir(parents=True)
+            (dist_dir / "index.html").write_text("<html><body>PCAPSCANNER-SPA</body></html>", encoding="utf-8")
+            (assets_dir / "main.js").write_text("console.log('ok');", encoding="utf-8")
+            (tmp_path / "secret.txt").write_text("do-not-leak", encoding="utf-8")
+
+            env = {
+                "PCAP_API_TOKEN": "test-workspace-token-32-characters",
+                "PCAP_WORKSPACE_CONFIG": str(ws_file),
+                "PCAP_ENABLE_NATIVE_PICKER": "1",
+                "PCAP_SERVE_UI": "1",
+                "PCAP_DATA_DIR": str(data_dir_a),
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(main, "REPO_ROOT", tmp_path),
+            ):
+                settings = config.load_settings()
+                app = main.create_app(settings)
+                client = TestClient(app, headers={"Authorization": "Bearer test-workspace-token-32-characters"})
+
+                # Single-port SPA serving checks
+                self.assertIn("PCAPSCANNER-SPA", client.get("/").text)
+                self.assertIn("PCAPSCANNER-SPA", client.get("/analyze").text)
+                self.assertEqual(client.get("/assets/main.js").status_code, 200)
+                self.assertEqual(client.get("/assets/missing.js").status_code, 404)
+                self.assertEqual(client.get("/api/v1/nonexistent").status_code, 404)
+                self.assertNotIn("do-not-leak", client.get("/../secret.txt").text)
+
+                # Initial workspace GET
+                ws = client.get("/api/v1/system/workspace").json()
+                self.assertEqual(ws["data_dir"], str(data_dir_a.resolve()))
+                self.assertEqual(ws["native_picker_available"], main.detect_picker_backend() is not None)
+
+                # Switch data_dir live via PUT /workspace
+                sw = client.put("/api/v1/system/workspace", json={"data_dir": str(data_dir_b)})
+                self.assertEqual(sw.status_code, 200, sw.text)
+                self.assertEqual(app.state.settings.data_dir, data_dir_b.resolve())
+                self.assertEqual(client.get("/api/v1/system/capabilities").json()["limits"]["data_dir"], str(data_dir_b.resolve()))
+
+                # A selected file grants one-time access to exactly that file; no folder is added.
+                with mock.patch.object(main, "pick_native_path", return_value=sample_pcap):
+                    picked = client.post("/api/v1/system/pick-path", json={"purpose": "capture_file"})
+                self.assertEqual(picked.status_code, 200, picked.text)
+                body = picked.json()
+                self.assertFalse(body["cancelled"])
+                self.assertIsNone(body["selected_path"])
+                self.assertTrue(body["file_grant_token"])
+                self.assertEqual(
+                    body["sha256"],
+                    __import__("hashlib").sha256(sample_pcap.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(body["workspace"]["local_ingest_roots"], [])
+                registered = client.post(
+                    "/api/v1/captures/local",
+                    json={"file_grant_token": body["file_grant_token"]},
+                )
+                self.assertEqual(registered.status_code, 201, registered.text)
+                self.assertEqual(registered.json()["sha256"], body["sha256"])
+                replay = client.post(
+                    "/api/v1/captures/local",
+                    json={"file_grant_token": body["file_grant_token"]},
+                )
+                self.assertEqual(replay.status_code, 409)
+                self.assertEqual(client.get("/api/v1/system/workspace").json()["local_ingest_roots"], [])
+
+                with mock.patch.object(main, "pick_native_path", return_value=sample_pcap):
+                    picked_again = client.post("/api/v1/system/pick-path", json={"purpose": "capture_file"})
+                self.assertEqual(picked_again.status_code, 200, picked_again.text)
+                sample_pcap.write_bytes(sample_pcap.read_bytes() + b"\x01")
+                tampered = client.post(
+                    "/api/v1/captures/local",
+                    json={"file_grant_token": picked_again.json()["file_grant_token"]},
+                )
+                self.assertEqual(tampered.status_code, 409)
+
+                # Cancel path keeps workspace unchanged
+                with mock.patch.object(main, "pick_native_path", return_value=None):
+                    cancelled = client.post("/api/v1/system/pick-path", json={"purpose": "data_dir"})
+                self.assertEqual(cancelled.status_code, 200)
+                self.assertTrue(cancelled.json()["cancelled"])
+
+
+if __name__ == "__main__":
+    unittest.main()

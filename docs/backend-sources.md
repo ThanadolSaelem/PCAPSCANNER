@@ -8,9 +8,18 @@ API ของ PCAPSCANNER ใช้ OpenAPI 3.1 และ Pydantic-generated JSO
 
 Structured Outputs ยังต้องจัดการ refusal, incomplete output, API errors และตรวจ business rules นอก schema เช่น evidence IDs [5]. การใช้ schema ไม่ได้พิสูจน์ว่าข้อความ AI เป็นข้อเท็จจริงหรือยืนยันการถูก compromise
 
+Zeek ประกาศรุ่น 9.0.1 เป็น LTS เมื่อ 26 ตุลาคม 2026 [6]. คู่มือติดตั้งของ Zeek ระบุ repository แพ็กเกจ Linux ที่ดูแลผ่าน openSUSE Build Service และแพ็กเกจ Debian 12 ใช้ `/opt/zeek`; metadata ของ repository ทางการในวันที่ 16 พฤศจิกายน 2026 ระบุ `zeek` และ `zeek-9.0` เป็นรุ่น `9.0.1-0` [7] [8]. Dockerfile จึงเพิ่ม key ของ repository ด้วย keyring ที่ระบุ source, pin `zeek=9.0.1-0` และตรวจเวอร์ชันที่ติดตั้ง แทนการใช้ tag/package แบบลอย.
+
+YARA CLI ใช้ source rules file กับ target file/directory, รองรับ scan-list, thread/timeout/match-count options [9]. ระบบใช้ Debian Bookworm `yara` 4.2.3-4 ที่ตรวจจาก package catalog [10]. การใช้งานใหม่จำกัดกฎเป็น operator-managed source files, ปิด include, snapshot/read-only hash, scan เฉพาะ HTTP objects ที่ TShark export แบบ offline, ไม่ขยาย archive และไม่เก็บไฟล์ดิบใน evidence. Rule/object/match/output/time/memory/disk bounds ถูกกำหนดใน application config; parser container ใช้ internal network.
+
 ## References
 [1]: https://github.com/ninedter/pcap-hunter/blob/main/app/llm/providers.py "PCAP-Hunter provider dispatch and grounding contract"
 [2]: https://github.com/ninedter/pcap-hunter/blob/main/LICENSE "PCAP-Hunter MIT license"
 [3]: https://spec.openapis.org/oas/v3.1.1.html "OpenAPI 3.1.1 specification"
 [4]: https://docs.ollama.com/api/openai-compatibility "Ollama OpenAI compatibility subset"
 [5]: https://developers.openai.com/api/docs/guides/structured-outputs "OpenAI structured outputs and application validation"
+[6]: https://zeek.org/get-zeek/ "Zeek official release and LTS page"
+[7]: https://docs.zeek.org/en/v9.0.1/install.html "Zeek 9.0.1 installation documentation"
+[8]: https://download.opensuse.org/repositories/security:/zeek/Debian_12/Packages.gz "Official Zeek OBS Debian 12 package index"
+[9]: https://yara.readthedocs.io/en/stable/commandline.html "Official YARA command-line documentation"
+[10]: https://packages.debian.org/bookworm/amd64/yara "Debian Bookworm YARA package metadata"

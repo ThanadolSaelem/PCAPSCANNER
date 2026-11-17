@@ -3,12 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import errno
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from backend.app import store as store_module
+from backend.app import worker as worker_module
 from backend.app.config import AppSettings
+from backend.app import main as main_module
 from backend.app.main import create_app, profile_hash
 from backend.app.models import AnalysisRequest, Coverage, EvidenceBundle, AIResult
 from backend.app.store import Store, StoreError
@@ -45,6 +52,16 @@ def test_auth_and_openapi(app):
     assert schema["openapi"].startswith("3.1")
     assert schema["paths"]["/api/v1/analyses"]["post"]["security"] == [{"OperatorBearer": []}]
     assert TOKEN not in json.dumps(schema)
+
+
+def test_batch_limits_are_exposed_from_runtime_settings(client, app):
+    app.state.settings.batch_max_files = 3
+    app.state.settings.batch_max_total_bytes = 4096
+    app.state.settings.batch_admission_concurrency = 1
+    limits = client.get("/api/v1/system/capabilities").json()["limits"]
+    assert limits["batch_max_files"] == 3
+    assert limits["batch_max_total_bytes"] == 4096
+    assert limits["batch_admission_concurrency"] == 1
 
 
 def test_missing_credentials_fail_closed(tmp_path):
@@ -97,6 +114,81 @@ def test_storage_reservations(client):
     for _ in range(4):
         upload(client)
     assert client.post("/api/v1/captures", content=HEADER, headers={"Content-Type": "application/octet-stream"}).status_code == 507
+
+
+def test_physical_disk_reserve_serializes_all_service_managed_writers(app, monkeypatch):
+    store = app.state.store
+    store.disk_reserve_bytes = 64
+    state_lock = threading.Lock()
+    remaining = [120]
+
+    def fake_disk_usage(_path):
+        with state_lock:
+            return SimpleNamespace(free=remaining[0])
+
+    monkeypatch.setattr(store_module.shutil, "disk_usage", fake_disk_usage)
+
+    class _TrackedWriter:
+        def __init__(self, path: Path):
+            self.handle = path.open("wb")
+
+        def write(self, data: bytes) -> int:
+            written = self.handle.write(data)
+            with state_lock:
+                remaining[0] -= written
+            return written
+
+        def flush(self):
+            return self.handle.flush()
+
+        def fileno(self) -> int:
+            return self.handle.fileno()
+
+        def close(self) -> None:
+            self.handle.close()
+
+    writers = {
+        "upload": _TrackedWriter(store.captures_dir / ("a" * 32 + ".pcap")),
+        "batch": _TrackedWriter(store.batch_staging_dir / ("b" * 32 + ".upload")),
+        "snapshot": _TrackedWriter(store.worker_scratch_dir / "reserve-test.bin"),
+    }
+    data = b"x" * 40
+
+    def write_one(item):
+        name, writer = item
+        try:
+            if name == "upload":
+                store.write_capture_chunk(writer, data)
+            elif name == "batch":
+                store.write_batch_staging_chunk(writer, data, 1024)
+            else:
+                store.write_worker_snapshot_chunk(writer, data)
+            return "ok"
+        except StoreError as exc:
+            return exc.code
+        finally:
+            writer.close()
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        outcomes = list(pool.map(write_one, writers.items()))
+    assert outcomes.count("ok") == 1
+    assert outcomes.count("insufficient_disk_space") == 2
+
+
+def test_capture_write_maps_fsync_enospc_to_fail_closed_storage_error(app, monkeypatch):
+    path = app.state.store.captures_dir / ("c" * 32 + ".pcap")
+    handle = path.open("wb")
+
+    def fail_fsync(_fd):
+        raise OSError(errno.ENOSPC, "synthetic disk full")
+
+    monkeypatch.setattr(store_module.os, "fsync", fail_fsync)
+    try:
+        with pytest.raises(StoreError) as exc_info:
+            app.state.store.write_capture_chunk(handle, b"bounded")
+    finally:
+        handle.close()
+    assert exc_info.value.code == "insufficient_disk_space"
 
 
 def test_atomic_queue_admission_and_fencing(app, client):
@@ -196,3 +288,407 @@ def test_cancel_race_does_not_publish_completed_ai_result(app, client):
     store.finish(job, "completed", ai_result=result.model_dump_json())
     assert store.job(jid)["state"] == "cancelled"
     assert store.job(jid)["ai_state"] == "cancelled"
+
+
+def test_batch_intake_is_atomic_idempotent_and_uses_opaque_paths(client, app):
+    files = [("files", ("../../operator-secret.pcap", HEADER, "application/octet-stream"))]
+    first = client.post("/api/v1/batches", files=files, headers={"Idempotency-Key": "batch-once"})
+    assert first.status_code == 202, first.text
+    manifest = first.json()
+    assert manifest["state"] == "queued"
+    assert manifest["total_items"] == 1
+    item = manifest["items"][0]
+    assert item["format"] == "pcap"
+    assert item["sha256"] == hashlib.sha256(HEADER).hexdigest()
+    assert "filename" not in item
+    assert "operator-secret" not in first.text
+    capture = app.state.store.capture(item["capture_id"])
+    assert capture["filename"].startswith("batch-")
+    assert "operator-secret" not in capture["filename"]
+    assert app.state.store.capture_path(item["capture_id"]).stat().st_mode & 0o777 == 0o600
+
+    repeated = client.post("/api/v1/batches", files=files, headers={"Idempotency-Key": "batch-once"})
+    assert repeated.status_code == 202, repeated.text
+    assert repeated.json()["batch_id"] == manifest["batch_id"]
+    with app.state.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 1
+
+    changed = client.post(
+        "/api/v1/batches",
+        files=[("files", ("other.pcap", HEADER + b"x", "application/octet-stream"))],
+        headers={"Idempotency-Key": "batch-once"},
+    )
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "idempotency_conflict"
+    assert client.get(f"/api/v1/batches/{manifest['batch_id']}").json()["items"][0]["analysis_id"] == item["analysis_id"]
+
+    too_many_for_queue = client.post(
+        "/api/v1/batches",
+        files=[
+            ("files", ("one.pcap", HEADER, "application/octet-stream")),
+            ("files", ("two.pcap", HEADER, "application/octet-stream")),
+        ],
+    )
+    assert too_many_for_queue.status_code == 429
+    assert too_many_for_queue.headers["retry-after"] == "5"
+    with app.state.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 1
+    assert list(app.state.store.batch_staging_dir.iterdir()) == []
+
+
+def test_batch_auth_precedes_body_and_invalid_uploads_leave_no_staging_files(app):
+    unauthenticated = TestClient(app)
+    denied = unauthenticated.post(
+        "/api/v1/batches",
+        files=[("files", ("cap.pcap", HEADER, "application/octet-stream"))],
+    )
+    assert denied.status_code == 401
+    assert list(app.state.store.batch_staging_dir.iterdir()) == []
+
+    client = TestClient(app, headers={"Authorization": "Bearer " + TOKEN})
+    bad_suffix = client.post(
+        "/api/v1/batches",
+        files=[("files", ("cap.txt", HEADER, "application/octet-stream"))],
+    )
+    assert bad_suffix.status_code == 400
+    assert bad_suffix.json()["code"] == "invalid_capture_suffix"
+
+    bad_magic = client.post(
+        "/api/v1/batches",
+        files=[("files", ("cap.pcap", b"not-a-capture", "application/octet-stream"))],
+    )
+    assert bad_magic.status_code == 400
+    assert bad_magic.json()["code"] == "invalid_capture_magic"
+
+    too_large = client.post(
+        "/api/v1/batches",
+        files=[("files", ("large.pcap", HEADER + b"x" * 1025, "application/octet-stream"))],
+    )
+    assert too_large.status_code == 413
+    assert list(app.state.store.batch_staging_dir.iterdir()) == []
+    with app.state.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+
+
+def test_batch_cancel_obeys_running_worker_fence(client, app):
+    created = client.post(
+        "/api/v1/batches",
+        files=[("files", ("cap.pcap", HEADER, "application/octet-stream"))],
+    )
+    assert created.status_code == 202, created.text
+    batch_id = created.json()["batch_id"]
+    worker_claim = app.state.store.claim("parser")
+    assert worker_claim is not None
+
+    cancel_response = client.post(f"/api/v1/batches/{batch_id}/cancel")
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["items"][0]["state"] == "parsing"
+    assert app.state.store.job(worker_claim["id"])["cancel_requested"] is True
+
+    assert app.state.store.finish(worker_claim, "completed")
+    final = client.get(f"/api/v1/batches/{batch_id}")
+    assert final.status_code == 200
+    assert final.json()["state"] == "cancelled"
+    assert final.json()["items"][0]["state"] == "cancelled"
+
+
+def test_batch_partial_count_is_not_reported_as_failed(client, app):
+    created = client.post(
+        "/api/v1/batches",
+        files=[("files", ("cap.pcap", HEADER, "application/octet-stream"))],
+    )
+    assert created.status_code == 202, created.text
+    batch_id = created.json()["batch_id"]
+    item = created.json()["items"][0]
+    store = app.state.store
+    job = store.claim("parser")
+    assert job is not None
+    bundle = EvidenceBundle(
+        capture_sha256=item["sha256"],
+        coverage=Coverage(packets_seen=0, packets_analyzed=0, truncated=True, parser="test"),
+        evidence=[],
+        findings=[],
+    )
+    assert store.finish(job, "partial", evidence=bundle.model_dump_json())
+
+    result = client.get(f"/api/v1/batches/{batch_id}")
+    assert result.status_code == 200
+    assert result.json()["state"] == "partial"
+    assert result.json()["partial_items"] == 1
+    assert result.json()["failed_items"] == 0
+    listed = client.get("/api/v1/batches?limit=5")
+    assert listed.status_code == 200
+    assert listed.json()[0]["batch_id"] == batch_id
+
+
+def test_batch_restart_cleanup_preserves_live_files_and_removes_crash_orphans(client, app):
+    created = client.post(
+        "/api/v1/batches",
+        files=[("files", ("cap.pcap", HEADER, "application/octet-stream"))],
+    )
+    assert created.status_code == 202, created.text
+    live_id = created.json()["items"][0]["capture_id"]
+    store = app.state.store
+    live_path = store.capture_path(live_id)
+    assert live_path.exists()
+
+    orphan_id = "f" * 32
+    orphan_path = store.capture_path(orphan_id)
+    orphan_path.write_bytes(b"orphaned rename before SQLite commit")
+    stale_stage = store.batch_staging_dir / ("e" * 32 + ".upload")
+    active_stage = store.batch_staging_dir / ("d" * 32 + ".upload")
+    stale_stage.write_bytes(b"staged before process crash")
+    active_stage.write_bytes(b"belongs to an uploader holding a slot")
+    settings = app.state.settings
+
+    def reopen_store():
+        return Store(
+            settings.data_dir,
+            queue_limit=settings.queue_limit,
+            storage_max_bytes=settings.storage_max_bytes,
+            storage_max_captures=settings.storage_max_captures,
+            disk_reserve_bytes=settings.disk_reserve_bytes,
+            batch_admission_concurrency=settings.batch_admission_concurrency,
+        )
+
+    with store.batch_upload_slot(settings.batch_admission_concurrency):
+        reopen_store()
+        assert stale_stage.exists() and active_stage.exists()
+    recovered = reopen_store()
+    assert live_path.exists()
+    assert not orphan_path.exists()
+    assert not stale_stage.exists()
+    assert not active_stage.exists()
+    assert recovered.capture(live_id)["sha256"] == created.json()["items"][0]["sha256"]
+
+
+def test_batch_staging_writer_enforces_global_quota_and_disk_reserve(monkeypatch, app):
+    store = app.state.store
+    staged = store.batch_staging_dir / ("a" * 32 + ".upload")
+    monkeypatch.setattr(
+        store_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=store.disk_reserve_bytes + 1),
+    )
+    with pytest.raises(StoreError) as capture_error:
+        store.reserve_capture(2)
+    assert capture_error.value.code == "insufficient_disk_space"
+    with store.batch_upload_slot(app.state.settings.batch_admission_concurrency):
+        with staged.open("wb") as handle:
+            with pytest.raises(StoreError) as disk_error:
+                store.write_batch_staging_chunk(handle, b"two", 16)
+        assert disk_error.value.code == "insufficient_disk_space"
+        assert staged.stat().st_size == 0
+
+        monkeypatch.setattr(
+            store_module.shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(free=store.disk_reserve_bytes + 1024),
+        )
+        with staged.open("wb") as handle:
+            with pytest.raises(StoreError) as quota_error:
+                store.write_batch_staging_chunk(handle, b"two", 1)
+        assert quota_error.value.code == "batch_staging_quota"
+        assert staged.stat().st_size == 0
+
+
+def test_chunked_upload_preserves_physical_disk_reserve_with_storage_quota(monkeypatch, app):
+    store = app.state.store
+    upload_id = store.init_chunk_upload("chunked.pcap", 2, "pcap")
+    monkeypatch.setattr(
+        store_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=store.disk_reserve_bytes),
+    )
+    with pytest.raises(StoreError) as error:
+        store.append_upload_chunk(upload_id, 0, b"x")
+    assert error.value.code == "insufficient_disk_space"
+    assert store.pending_upload(upload_id)["bytes_received"] == 0
+
+
+def test_local_capture_worker_parses_verified_snapshot_not_mutable_source(app, tmp_path, monkeypatch):
+    settings = app.state.settings
+    store = app.state.store
+    source_path = tmp_path / "local-source.pcap"
+    source_path.write_bytes(HEADER)
+    digest = hashlib.sha256(HEADER).hexdigest()
+    capture = store.register_local_capture(source_path, source_path.name, "pcap", len(HEADER), digest)
+    job_id = store.create_job(AnalysisRequest(capture_id=capture["id"]), "profile")["id"]
+    parsed_bytes: list[bytes] = []
+    parsed_paths: list[Path] = []
+    bundle = EvidenceBundle(
+        capture_sha256=digest,
+        coverage=Coverage(packets_seen=1, packets_analyzed=1, truncated=False, parser="snapshot-test"),
+        evidence=[],
+        findings=[],
+    )
+
+    def fake_analyze_capture(path, _digest, _settings, **_kwargs):
+        parsed_path = Path(path)
+        parsed_paths.append(parsed_path)
+        source_path.write_bytes(b"tampered while parser is opening input")
+        parsed_bytes.append(parsed_path.read_bytes())
+        source_path.write_bytes(HEADER)
+        return bundle
+
+    monkeypatch.setattr(worker_module, "analyze_capture", fake_analyze_capture)
+    assert worker_module.run_once(store, settings)
+    assert parsed_bytes == [HEADER]
+    assert parsed_paths[0] != source_path
+    assert store.job(job_id)["state"] == "completed"
+    assert list(store.worker_scratch_dir.iterdir()) == []
+
+
+def test_unknown_length_direct_upload_charges_actual_bytes_against_storage_quota(client, app):
+    app.state.settings.upload_max_bytes = 0
+    app.state.store.storage_max_bytes = len(HEADER) + 2
+    response = client.post(
+        "/api/v1/captures",
+        content=iter((HEADER, b"over")),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert response.status_code == 507, response.text
+    assert response.json()["code"] == "capture_storage_quota"
+    with app.state.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+    assert list(app.state.store.captures_dir.iterdir()) == []
+
+
+def test_direct_upload_enforces_declared_content_length(client, app):
+    response = client.post(
+        "/api/v1/captures",
+        content=HEADER,
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(HEADER) + 1),
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "content_length_mismatch"
+    with app.state.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM captures").fetchone()[0] == 0
+
+
+def _init_chunk_upload(client, expected_bytes: int):
+    response = client.post(
+        "/api/v1/captures/uploads",
+        json={"filename": "chunked.pcap", "total_bytes": expected_bytes},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["upload_id"]
+
+
+def test_incomplete_chunk_upload_cannot_be_marked_ready(client, app):
+    upload_id = _init_chunk_upload(client, len(HEADER))
+    appended = client.put(
+        f"/api/v1/captures/uploads/{upload_id}/chunk?offset=0",
+        content=HEADER[:-1],
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert appended.status_code == 200, appended.text
+    incomplete = client.post(f"/api/v1/captures/uploads/{upload_id}/complete")
+    assert incomplete.status_code == 409
+    assert incomplete.json()["code"] == "chunked_upload_incomplete"
+    assert client.get(f"/api/v1/captures/uploads/{upload_id}").json()["offset"] == len(HEADER) - 1
+    with pytest.raises(StoreError):
+        app.state.store.capture(upload_id)
+
+
+def test_restart_restores_chunked_file_moved_before_ready_transition(app):
+    store = app.state.store
+    upload_id = store.init_chunk_upload("crash-window.pcap", len(HEADER), "pcap")
+    assert store.append_upload_chunk(upload_id, 0, HEADER) == len(HEADER)
+    part = store.upload_part_path(upload_id)
+    finalized = store.capture_path(upload_id, "pcap")
+    with store.upload_lock(upload_id):
+        part.replace(finalized)
+
+    recovered = Store(
+        store.root,
+        storage_max_bytes=store.storage_max_bytes,
+        storage_max_captures=store.storage_max_captures,
+        disk_reserve_bytes=store.disk_reserve_bytes,
+    )
+    assert not finalized.exists()
+    assert recovered.upload_part_path(upload_id).read_bytes() == HEADER
+    assert recovered.pending_upload(upload_id)["bytes_received"] == len(HEADER)
+    with pytest.raises(StoreError):
+        recovered.capture(upload_id)
+
+
+def test_chunked_completion_serializes_against_concurrent_append(client, app, monkeypatch):
+    upload_id = _init_chunk_upload(client, len(HEADER))
+    appended = client.put(
+        f"/api/v1/captures/uploads/{upload_id}/chunk?offset=0",
+        content=HEADER,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert appended.status_code == 200, appended.text
+
+    hashing_started = threading.Event()
+    allow_hash = threading.Event()
+    append_lock_attempted = threading.Event()
+    real_hash = main_module._hash_and_peek_file
+    real_upload_lock = app.state.store.upload_lock
+    lock_call_count = 0
+    lock_call_guard = threading.Lock()
+
+    @store_module.contextmanager
+    def tracked_upload_lock(lock_upload_id, *, blocking=True):
+        nonlocal lock_call_count
+        with lock_call_guard:
+            lock_call_count += 1
+            if lock_call_count == 2:
+                append_lock_attempted.set()
+        with real_upload_lock(lock_upload_id, blocking=blocking):
+            yield
+
+    def pause_hash(path):
+        hashing_started.set()
+        assert allow_hash.wait(5), "test did not release the finalizer"
+        return real_hash(path)
+
+    monkeypatch.setattr(main_module, "_hash_and_peek_file", pause_hash)
+    monkeypatch.setattr(app.state.store, "upload_lock", tracked_upload_lock)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        completion = pool.submit(client.post, f"/api/v1/captures/uploads/{upload_id}/complete")
+        assert hashing_started.wait(3)
+        append_during_hash = pool.submit(
+            client.put,
+            f"/api/v1/captures/uploads/{upload_id}/chunk?offset={len(HEADER)}",
+            content=b"x",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert append_lock_attempted.wait(3)
+        assert not append_during_hash.done()
+        allow_hash.set()
+        complete_response = completion.result(timeout=5)
+        append_response = append_during_hash.result(timeout=5)
+    assert complete_response.status_code == 200, complete_response.text
+    assert append_response.status_code == 404
+    capture_path = app.state.store.capture_path(upload_id)
+    assert capture_path.read_bytes() == HEADER
+    assert app.state.store.capture(upload_id)["ready"] == 1
+
+
+def test_abort_after_ready_preserves_capture_file(client, app):
+    upload_id = _init_chunk_upload(client, len(HEADER))
+    assert client.put(
+        f"/api/v1/captures/uploads/{upload_id}/chunk?offset=0",
+        content=HEADER,
+        headers={"Content-Type": "application/octet-stream"},
+    ).status_code == 200
+    completed = client.post(f"/api/v1/captures/uploads/{upload_id}/complete")
+    assert completed.status_code == 200, completed.text
+    capture_path = app.state.store.capture_path(upload_id)
+    original = capture_path.read_bytes()
+    aborted = client.delete(f"/api/v1/captures/uploads/{upload_id}")
+    assert aborted.status_code == 204
+    assert capture_path.read_bytes() == original == HEADER
+    assert app.state.store.capture(upload_id)["ready"] == 1
