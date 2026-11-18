@@ -447,3 +447,85 @@
   background: rgba(229, 184, 92, .06);
 }
 
+/* Tabbed ConnectionModal & compact Reports Export Menu */
+.modal-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f1821;
+}
+.modal-tab-btn {
+  flex: 1 1 130px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 33px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 600;
+  transition: background .16s, color .16s, border-color .16s;
+}
+.modal-tab-btn:hover:not(.modal-tab-active) { color: var(--ink); background: rgba(255, 255, 255, .03); }
+.modal-tab-active {
+  border-color: rgba(50, 189, 209, .4);
+  color: #e4f2f6;
+  background: rgba(50, 189, 209, .14);
+}
+.modal-tab-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.modal-tab-dot.dot-warn { background: var(--amber); }
+
+.export-menu-wrap { position: relative; }
+.export-dropdown {
+  position: absolute;
+  z-index: 45;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 215px;
+  display: grid;
+  gap: 3px;
+  padding: 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: #131e29;
+  box-shadow: var(--shadow-float);
+  animation: pop .2s var(--spring) backwards;
+}
+.export-dropdown button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--ink-2);
+  background: transparent;
+  font-size: 10px;
+  text-align: left;
+  transition: background .15s, color .15s;
+}
+.export-dropdown button:hover { background: rgba(50, 189, 209, .12); color: var(--cyan-2); }
+.export-dropdown button small { color: var(--muted); font: 8.5px var(--mono); }
+
+.chat-submit-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.chat-helper-hint { color: var(--muted); font-size: 9.5px; }
+

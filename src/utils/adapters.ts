@@ -900,3 +900,125 @@ export function resolveLayer2DraftStatus({
   };
 }
 
+export interface RunConsentInput {
+  connected: boolean;
+  isCsvSelected?: boolean;
+  triageEnabled: boolean;
+  triageEndpointConfigured: boolean;
+  triageEndpointConsent: boolean;
+  layer1Kind: Layer1Kind;
+  aiEnabled: boolean;
+  aiConsent: boolean;
+  canStartBackendAi: boolean;
+  aiBackendEnabled?: boolean;
+}
+
+export type RunSubmitBlockReason = "none" | "ai_setup" | "ai_consent";
+export type StageBadgeTone = "required" | "optional" | "warn";
+
+export interface RunConsentSummary {
+  needsTriageEndpointConsent: boolean;
+  needsAiSetup: boolean;
+  needsAiConsent: boolean;
+  hasAnyConsentPrompt: boolean;
+  submitBlockedReason: RunSubmitBlockReason;
+  stage04Label: string;
+  stage04Tone: StageBadgeTone;
+  stage04Note: string;
+  stage05Label: string;
+  stage05Tone: StageBadgeTone;
+  stage05Note: string;
+}
+
+export function resolveRunConsentState({
+  connected,
+  isCsvSelected = false,
+  triageEnabled,
+  triageEndpointConfigured,
+  triageEndpointConsent,
+  layer1Kind,
+  aiEnabled,
+  aiConsent,
+  canStartBackendAi,
+  aiBackendEnabled,
+}: RunConsentInput): RunConsentSummary {
+  const needsTriageEndpointConsent = Boolean(
+    !isCsvSelected && triageEnabled && triageEndpointConfigured && !triageEndpointConsent,
+  );
+  const needsAiSetup = Boolean(!isCsvSelected && connected && aiEnabled && !canStartBackendAi);
+  const needsAiConsent = Boolean(!isCsvSelected && aiEnabled && !needsAiSetup && !aiConsent);
+  const hasAnyConsentPrompt = needsTriageEndpointConsent || needsAiConsent || needsAiSetup;
+
+  let submitBlockedReason: RunSubmitBlockReason = "none";
+  if (needsAiSetup) {
+    submitBlockedReason = "ai_setup";
+  } else if (needsAiConsent) {
+    submitBlockedReason = "ai_consent";
+  }
+
+  let stage04Label = "HEURISTIC";
+  let stage04Tone: StageBadgeTone = "required";
+  let stage04Note = "ใช้ Heuristic Tier-1 ในเครื่อง (Offline)";
+  if (!triageEnabled) {
+    stage04Label = "OFF";
+    stage04Tone = "optional";
+    stage04Note = "ปิด Tier-1 classifier";
+  } else if (triageEndpointConfigured && triageEndpointConsent) {
+    stage04Label = "SIDECAR ON";
+    stage04Tone = "required";
+    stage04Note = "เรียก Tier-1 Neural Sidecar พร้อม consent";
+  } else if (triageEndpointConfigured && !triageEndpointConsent) {
+    stage04Label = "CONSENT?";
+    stage04Tone = "warn";
+    stage04Note =
+      layer1Kind === "bin_classifier_ready" || layer1Kind === "bin_encoder_only"
+        ? "ยังไม่ยินยอม Sidecar HTTP — ใช้ .bin ในเครื่องแทน"
+        : "ยังไม่ยินยอม Sidecar HTTP — ใช้ local heuristic แทน";
+  } else if (layer1Kind === "bin_classifier_ready" || layer1Kind === "bin_encoder_only") {
+    stage04Label = "LOCAL .BIN";
+    stage04Tone = "required";
+    stage04Note = "ใช้โมเดล ET-BERT .bin ในเครื่อง (Offline)";
+  }
+
+  let stage05Label = "OFF";
+  let stage05Tone: StageBadgeTone = "optional";
+  let stage05Note = "ปิด Layer-2 LLM — ใช้ผล Tier-1 & detectors";
+  if (isCsvSelected) {
+    stage05Label = "LOCAL CSV";
+    stage05Tone = "optional";
+    stage05Note = "สแกน CSV ในเบราว์เซอร์ 100% Offline";
+  } else if (aiEnabled) {
+    if (needsAiSetup) {
+      stage05Label = "SETUP?";
+      stage05Tone = "warn";
+      stage05Note =
+        aiBackendEnabled === false
+          ? "Backend ปิด AI อยู่ — เปิดใช้งานหรือปิด LLM ชั่วคราว"
+          : "ยังไม่ได้เลือก Model บน Backend — เลือกโมเดลก่อนส่งงาน";
+    } else if (needsAiConsent) {
+      stage05Label = "CONSENT?";
+      stage05Tone = "warn";
+      stage05Note = "รอติ๊กยืนยัน consent ก่อนส่งสรุปรายงาน";
+    } else {
+      stage05Label = "OPT-IN ON";
+      stage05Tone = "required";
+      stage05Note = "ยืนยันส่ง redacted summary แล้ว";
+    }
+  }
+
+  return {
+    needsTriageEndpointConsent,
+    needsAiSetup,
+    needsAiConsent,
+    hasAnyConsentPrompt,
+    submitBlockedReason,
+    stage04Label,
+    stage04Tone,
+    stage04Note,
+    stage05Label,
+    stage05Tone,
+    stage05Note,
+  };
+}
+
+

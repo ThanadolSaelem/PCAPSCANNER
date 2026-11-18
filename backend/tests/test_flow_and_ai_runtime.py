@@ -386,3 +386,43 @@ def test_runtime_ai_config_and_probe_endpoints_with_workspace_persistence(tmp_pa
     assert denied_cfg.json()["code"] == "ai_config_mutation_loopback_only"
     assert denied_probe.status_code == 403
     assert denied_probe.json()["code"] == "ai_probe_loopback_only"
+
+
+def test_triage_falls_back_to_local_bin_when_etbert_http_returns_empty(tmp_path, monkeypatch):
+    ckpt = _make_dummy_etbert_bin(tmp_path)
+    bundle = EvidenceBundle(
+        capture_sha256="d" * 64,
+        coverage=Coverage(packets_seen=2, packets_analyzed=2, truncated=False, parser="fixture"),
+        evidence=[
+            Evidence(
+                evidence_id="EV-000010",
+                kind="flow",
+                summary="TLS flow",
+                packet_refs=[1],
+                attributes={
+                    "protocol": "TLS",
+                    "src": "192.0.2.10",
+                    "dst": "198.51.100.20",
+                    "src_port": 51000,
+                    "dst_port": 443,
+                    "packets": 6,
+                    "bytes": 4200,
+                    "data_len_sum": 3600,
+                    "tls_handshake_types": "1,2",
+                },
+            ),
+        ],
+        findings=[],
+    )
+
+    monkeypatch.setattr(triage, "score_with_etbert_http", lambda *_args, **_kwargs: {})
+    cfg = TriageConfig(
+        etbert_enabled=True,
+        etbert_endpoint_url="http://127.0.0.1:9000/etbert/score",
+        allowed_origins=["http://127.0.0.1:9000"],
+        etbert_checkpoint_path=ckpt,
+    )
+    report = triage.classify_bundle(bundle, cfg, allow_network=True)
+    assert report.etbert_scored_count == 1
+    assert report.decisions[0].etbert_label is not None
+

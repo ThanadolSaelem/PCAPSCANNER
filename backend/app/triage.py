@@ -901,10 +901,17 @@ def classify_bundle(
             deadline_monotonic=network_deadline,
             cancellation_check=cancellation_check,
         )
-    elif enabled and etbert_ckpt and evidence_list and (
-        etbert_enabled or mode == "etbert_openjev" or not is_etbert_explicitly_disabled(triage_cfg)
+    if (
+        not etbert_scores
+        and not _cancel_requested(cancellation_check)
+        and enabled
+        and etbert_ckpt
+        and evidence_list
+        and (
+            etbert_enabled or mode == "etbert_openjev" or not is_etbert_explicitly_disabled(triage_cfg)
+        )
     ):
-        # Local offline ET-BERT .bin checkpoint does not transmit data over the network
+        # Local offline ET-BERT .bin checkpoint acts as offline primary or HTTP-failure fallback
         etbert_scores = score_with_etbert_local_bin(
             evidence_list,
             checkpoint_path=etbert_ckpt,

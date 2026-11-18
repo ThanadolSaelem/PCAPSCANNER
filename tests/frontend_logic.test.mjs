@@ -12,6 +12,7 @@ import {
   packetCoverageSummary,
   resolveLayer1Status,
   resolveLayer2DraftStatus,
+  resolveRunConsentState,
 } from "../src/utils/adapters.ts";
 import {
   WiresharkCsvStreamAnalyzer,
@@ -622,3 +623,76 @@ test("resolveLayer2DraftStatus highlights missing model, unsaved edits, and acti
   assert.equal(disabledSaved.pillTone, "neutral");
   assert.match(disabledSaved.badgeLabel, /Disabled/);
 });
+
+test("resolveRunConsentState surfaces AI setup, AI consent, and Tier-1 sidecar consent without hidden traps", () => {
+  const aiSetupPending = resolveRunConsentState({
+    connected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: true,
+    triageEndpointConsent: false,
+    layer1Kind: "sidecar_ready",
+    aiEnabled: true,
+    aiConsent: false,
+    canStartBackendAi: false,
+    aiBackendEnabled: true,
+  });
+  assert.equal(aiSetupPending.needsAiSetup, true);
+  assert.equal(aiSetupPending.needsAiConsent, false);
+  assert.equal(aiSetupPending.needsTriageEndpointConsent, true);
+  assert.equal(aiSetupPending.submitBlockedReason, "ai_setup");
+  assert.equal(aiSetupPending.stage04Label, "CONSENT?");
+  assert.equal(aiSetupPending.stage04Tone, "warn");
+  assert.equal(aiSetupPending.stage05Label, "SETUP?");
+  assert.equal(aiSetupPending.stage05Tone, "warn");
+
+  const aiConsentPending = resolveRunConsentState({
+    connected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: true,
+    triageEndpointConsent: true,
+    layer1Kind: "sidecar_ready",
+    aiEnabled: true,
+    aiConsent: false,
+    canStartBackendAi: true,
+    aiBackendEnabled: true,
+  });
+  assert.equal(aiConsentPending.needsAiSetup, false);
+  assert.equal(aiConsentPending.needsAiConsent, true);
+  assert.equal(aiConsentPending.needsTriageEndpointConsent, false);
+  assert.equal(aiConsentPending.submitBlockedReason, "ai_consent");
+  assert.equal(aiConsentPending.stage04Label, "SIDECAR ON");
+  assert.equal(aiConsentPending.stage05Label, "CONSENT?");
+
+  const allReady = resolveRunConsentState({
+    connected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: false,
+    triageEndpointConsent: false,
+    layer1Kind: "bin_classifier_ready",
+    aiEnabled: true,
+    aiConsent: true,
+    canStartBackendAi: true,
+    aiBackendEnabled: true,
+  });
+  assert.equal(allReady.hasAnyConsentPrompt, false);
+  assert.equal(allReady.submitBlockedReason, "none");
+  assert.equal(allReady.stage04Label, "LOCAL .BIN");
+  assert.equal(allReady.stage05Label, "OPT-IN ON");
+  assert.equal(allReady.stage05Tone, "required");
+
+  const csvLocal = resolveRunConsentState({
+    connected: false,
+    isCsvSelected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: true,
+    triageEndpointConsent: false,
+    layer1Kind: "heuristic_only",
+    aiEnabled: true,
+    aiConsent: false,
+    canStartBackendAi: false,
+  });
+  assert.equal(csvLocal.hasAnyConsentPrompt, false);
+  assert.equal(csvLocal.submitBlockedReason, "none");
+  assert.equal(csvLocal.stage05Label, "LOCAL CSV");
+});
+

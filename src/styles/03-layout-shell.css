@@ -258,26 +258,34 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .crumb svg { color: #586b7a; }
 
 .connection-pill {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 7px;
-  padding: 5px 9px;
-  border: 1px solid rgba(229, 184, 92, .22);
-  border-radius: 6px;
+  min-height: 31px;
+  padding: 5px 10px;
+  border: 1px solid rgba(229, 184, 92, .24);
+  border-radius: 7px;
   color: #cdb579;
   background: rgba(229, 184, 92, .07);
-  font-size: 8px;
+  font-size: 9px;
   font-weight: 700;
-  letter-spacing: .08em;
-  transition: transform .22s var(--ease), border-color .22s;
+  letter-spacing: .06em;
+  transition: transform .22s var(--ease), border-color .22s, background .18s;
 }
-.connection-pill:hover { transform: translateY(-1px); }
-.pulse-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 8px rgba(229, 184, 92, .45); }
+.connection-pill:hover {
+  transform: translateY(-1px);
+  border-color: rgba(229, 184, 92, .42);
+  background: rgba(229, 184, 92, .12);
+}
+.pulse-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 8px rgba(229, 184, 92, .45); flex: none; }
+.pill-divider { width: 1px; height: 12px; background: currentColor; opacity: .28; }
+.pill-action { font-weight: 600; letter-spacing: .02em; opacity: .92; }
 .connection-pill.status-live { border-color: rgba(111, 207, 151, .28); color: #8adba8; background: rgba(111, 207, 151, .09); }
+.connection-pill.status-live:hover { border-color: rgba(111, 207, 151, .48); background: rgba(111, 207, 151, .14); }
 .connection-pill.status-live .pulse-dot { background: var(--green); animation: live-ping 1.8s ease-out infinite; }
 .connection-pill.status-local { border-color: rgba(50, 189, 209, .3); color: #7cdbe7; background: rgba(50, 189, 209, .09); }
+.connection-pill.status-local:hover { border-color: rgba(50, 189, 209, .5); background: rgba(50, 189, 209, .15); }
 .connection-pill.status-local .pulse-dot { background: var(--cyan); animation: live-ping 1.8s ease-out infinite; }
-.top-connect { min-height: 31px; padding: 0 10px; font-size: 10px; }
 
 .menu-button { display: none; }
 .top-search { border-color: #293846; }

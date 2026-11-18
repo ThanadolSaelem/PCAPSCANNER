@@ -45,6 +45,7 @@ import {
   packetCoverageSummary,
   resolveLayer1Status,
   resolveLayer2DraftStatus,
+  resolveRunConsentState,
 } from "./utils/adapters";
 import type { CaptureHeaderInspection } from "./utils/localAnalyzer";
 import { analyzeLocalCsvFile, inspectCaptureFile } from "./utils/localAnalyzer";
@@ -83,10 +84,12 @@ type IconName =
   | "menu"
   | "close"
   | "file"
-  | "external";
+  | "external"
+  | "sliders";
 
 type ConnectionStatus = "checking" | "connected" | "auth_required" | "offline";
-type SourceTab = "upload" | "local";
+type SourceTab = "upload" | "local" | "batch";
+type SettingsTab = "ai" | "storage" | "connection";
 
 const STORAGE_URL_KEY = "pcapscanner.backendUrl";
 const SESSION_TOKEN_KEY = "pcapscanner.token";
@@ -126,6 +129,7 @@ const ICON_PATH: Record<IconName, string> = {
   close: "m6 6 12 12M18 6 6 18",
   file: "M6 3h8l5 5v13H6z M14 3v5h5M9 13h7m-7 4h7",
   external: "M14 4h6v6m0-6-9 9M18 13v6H4V5h6",
+  sliders: "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
 };
 
 const NAV_GROUPS: { group: string; items: { id: Screen; label: string; icon: IconName }[] }[] = [
@@ -275,6 +279,7 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [connectionError, setConnectionError] = useState<string>("");
   const [connectionModalOpen, setConnectionModalOpen] = useState(false);
+  const [connectionModalTab, setConnectionModalTab] = useState<SettingsTab>("ai");
   const [caseDropdownOpen, setCaseDropdownOpen] = useState(false);
 
   // Live backend metadata & queue
@@ -309,6 +314,7 @@ function App() {
   const [triageEndpointConsent, setTriageEndpointConsent] = useState(false);
   const [aiEnabled, setAiEnabled] = useState(false);
   const [aiConsent, setAiConsent] = useState(false);
+  const [consentPromptNonce, setConsentPromptNonce] = useState(0);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [uploadPaused, setUploadPaused] = useState(false);
   const [resumeUploadId, setResumeUploadId] = useState<string | null>(null);
@@ -317,6 +323,14 @@ function App() {
   const [localCsvProgress, setLocalCsvProgress] = useState<number | null>(null);
 
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  const openConnectionModal = useCallback(
+    (tab?: SettingsTab) => {
+      setConnectionModalTab(tab ?? (connectionStatus === "connected" ? "ai" : "connection"));
+      setConnectionModalOpen(true);
+    },
+    [connectionStatus],
+  );
 
   const uploadAbortRef = useRef<AbortController | null>(null);
   const pauseRequestedRef = useRef(false);
@@ -599,21 +613,27 @@ function App() {
 
   const handleUploadAndAnalyze = async () => {
     if (!selectedFile || isSubmitting) return;
-    if (aiEnabled && !aiConsent) {
-      pushToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์", "warn");
+    if (connectionStatus !== "connected") {
+      openConnectionModal("connection");
+      pushToast("เชื่อมต่อ Backend API ก่อนอัปโหลดไฟล์ไบนารี", "warn", "หรือใช้โหมด Local CSV ในเบราว์เซอร์");
       return;
     }
     if (aiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
+      setConsentPromptNonce((n) => n + 1);
       pushToast(
         "Layer-2 AI ยังไม่พร้อมใช้งาน",
         "warn",
-        "Backend ยังไม่เปิดใช้ AI provider หรือยังไม่ระบุ model — เปิด Workspace เพื่อตั้งค่า",
+        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'ปิด LLM (ใช้ Offline ทันที)' เพื่อวิเคราะห์ทันที",
       );
       return;
     }
-    if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
-      pushToast("เชื่อมต่อ Backend API ก่อนอัปโหลดไฟล์ไบนารี", "warn", "หรือใช้โหมด Local CSV ในเบราว์เซอร์");
+    if (aiEnabled && !aiConsent) {
+      setConsentPromptNonce((n) => n + 1);
+      pushToast(
+        "กรุณาติ๊กยืนยัน Consent สำหรับ AI Narrative",
+        "warn",
+        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'ไม่ใช้ LLM รอบนี้' เพื่อวิเคราะห์ Offline ทันที",
+      );
       return;
     }
 
@@ -703,21 +723,27 @@ function App() {
   const handleRegisterLocalCapture = async () => {
     const clean = localPathInput.trim();
     if ((!clean && !localFileGrantToken) || isSubmitting) return;
-    if (aiEnabled && !aiConsent) {
-      pushToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์", "warn");
+    if (connectionStatus !== "connected") {
+      openConnectionModal("connection");
+      pushToast("เชื่อมต่อ Backend API ก่อนลงทะเบียน Local Capture", "warn");
       return;
     }
     if (aiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
+      setConsentPromptNonce((n) => n + 1);
       pushToast(
         "Layer-2 AI ยังไม่พร้อมใช้งาน",
         "warn",
-        "Backend ยังไม่เปิดใช้ AI provider หรือยังไม่ระบุ model — เปิด Workspace เพื่อตั้งค่า",
+        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'ปิด LLM (ใช้ Offline ทันที)' เพื่อวิเคราะห์ทันที",
       );
       return;
     }
-    if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
-      pushToast("เชื่อมต่อ Backend API ก่อนลงทะเบียน Local Capture", "warn");
+    if (aiEnabled && !aiConsent) {
+      setConsentPromptNonce((n) => n + 1);
+      pushToast(
+        "กรุณาติ๊กยืนยัน Consent สำหรับ AI Narrative",
+        "warn",
+        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'ไม่ใช้ LLM รอบนี้' เพื่อวิเคราะห์ Offline ทันที",
+      );
       return;
     }
     setIsSubmitting(true);
@@ -872,7 +898,7 @@ function App() {
   const handlePickNativePath = async (purpose: NativePickPurpose) => {
     if (isPickingPath) return;
     if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
+      openConnectionModal("connection");
       pushToast("กรุณาเชื่อมต่อ Backend API ก่อนเปิด OS File Manager", "warn");
       return;
     }
@@ -920,7 +946,7 @@ function App() {
     const clean = nextDir.trim();
     if (!clean) return;
     if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
+      openConnectionModal("connection");
       return;
     }
     try {
@@ -937,7 +963,7 @@ function App() {
     const clean = nextPath.trim();
     if (!clean) return;
     if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
+      openConnectionModal("connection");
       return;
     }
     try {
@@ -1175,9 +1201,9 @@ function App() {
             <button
               className="icon-button tiny"
               aria-label="เปิด Workspace & Settings"
-              onClick={() => setConnectionModalOpen(true)}
+              onClick={() => openConnectionModal()}
             >
-              <Icon name="bell" size={16} />
+              <Icon name="sliders" size={16} />
             </button>
           </div>
         </div>
@@ -1198,19 +1224,20 @@ function App() {
             </div>
           </div>
           <div className="topbar-right">
-            <button type="button" className={pillClass} onClick={() => setConnectionModalOpen(true)}>
+            <button
+              type="button"
+              className={pillClass}
+              title="เปิด Workspace Settings (AI Models, Storage & Connection)"
+              onClick={() => openConnectionModal()}
+            >
               <span className="pulse-dot" />
-              {pillLabel}
+              <span>{pillLabel}</span>
+              <span className="pill-divider" aria-hidden="true" />
+              <Icon name="sliders" size={12} />
+              <span className="pill-action">Settings</span>
             </button>
             <button className="icon-button top-search" aria-label="ค้นหา packet" onClick={() => navigate("traffic")}>
               <Icon name="search" />
-            </button>
-            <button
-              type="button"
-              className="secondary-button top-connect"
-              onClick={() => setConnectionModalOpen(true)}
-            >
-              Workspace &amp; Settings
             </button>
             <button className="primary-button top-new" onClick={() => navigate("analyze")}>
               <Icon name="upload" size={16} /> วิเคราะห์ใหม่
@@ -1220,32 +1247,97 @@ function App() {
 
         <main className="main-content">
           {activeReport.origin === "empty" ? (
-            <div className="status-banner status-empty" role="status">
-              <Icon name="info" size={16} />
-              <span><b>ยังไม่ได้เลือกผลวิเคราะห์</b> — เริ่มจากอัปโหลด PCAP/PCAPNG หรือเลือกงานที่เสร็จแล้วจากคิวงาน</span>
-              <button onClick={() => navigate("analyze")} aria-label="ไปยังหน้าวิเคราะห์ไฟล์">
-                <Icon name="arrow" size={15} />
+            <div className="capture-context-bar">
+              <button
+                type="button"
+                className="capture-context-trigger"
+                onClick={() => navigate("analyze")}
+              >
+                <span className="capture-context-badge">
+                  <Icon name="info" size={12} /> NO ACTIVE CASE
+                </span>
+                <div className="capture-context-main">
+                  <strong>ยังไม่ได้เลือกผลวิเคราะห์</strong>
+                  <small>อัปโหลด PCAP/CSV หรือเลือกงานที่เสร็จแล้วจากคิวเพื่อเปิด Workbench</small>
+                </div>
+                <span className="capture-context-cta">
+                  เลือกไฟล์วิเคราะห์ <Icon name="arrow" size={13} />
+                </span>
               </button>
+              {jobs.length > 0 && (
+                <div className="capture-context-quick">
+                  <button type="button" className="context-chip-btn" onClick={() => navigate("jobs")}>
+                    คิวงาน ({jobs.length})
+                  </button>
+                </div>
+              )}
             </div>
           ) : activeReport.origin === "local-csv" ? (
-            <div className="status-banner banner-local">
-              <Icon name="check" size={16} />
-              <span>
-                <b>Browser CSV Streaming Result</b> — วิเคราะห์ <code>{activeReport.fileName}</code> ({formatCompactCount(activeReport.packetsAnalyzed)} packets) ในเบราว์เซอร์แบบไม่ส่งออกข้อมูล
-              </span>
-              <button onClick={() => navigate("findings")} aria-label="ดู findings">
-                <Icon name="arrow" size={15} />
+            <div className="capture-context-bar capture-context-local">
+              <button
+                type="button"
+                className="capture-context-trigger"
+                onClick={() => navigate("findings")}
+              >
+                <span className="capture-context-badge">
+                  <Icon name="shield" size={12} /> LOCAL CSV
+                </span>
+                <div className="capture-context-main">
+                  <strong>{activeReport.fileName}</strong>
+                  <div className="capture-context-chips mono">
+                    <span>{activeReport.sizeLabel}</span>
+                    <span>{formatCompactCount(activeReport.packetsAnalyzed)} pkts</span>
+                    <span>{activeReport.findings.length} findings</span>
+                    <span>Browser Offline</span>
+                  </div>
+                </div>
+                <span className="capture-context-cta">
+                  ดู Findings <Icon name="arrow" size={13} />
+                </span>
               </button>
+              <div className="capture-context-quick">
+                <button type="button" className="context-chip-btn" onClick={() => navigate("traffic")}>
+                  Packets
+                </button>
+                <button type="button" className="context-chip-btn" onClick={() => navigate("reports")}>
+                  รายงาน
+                </button>
+              </div>
             </div>
           ) : (
-            <div className="status-banner banner-live">
-              <Icon name="check" size={16} />
-              <span>
-                <b>Live Capture Analysis</b> — <code>{activeReport.fileName}</code> ({activeReport.sizeLabel} · {formatCompactCount(activeReport.packetsAnalyzed)} packets · {activeReport.parsedPct} coverage)
-              </span>
-              <button onClick={() => navigate("reports")} aria-label="ดูรายงาน">
-                <Icon name="arrow" size={15} />
+            <div className="capture-context-bar capture-context-live">
+              <button
+                type="button"
+                className="capture-context-trigger"
+                onClick={() => navigate("reports")}
+              >
+                <span className="capture-context-badge">
+                  <Icon name="check" size={12} /> LIVE CASE
+                </span>
+                <div className="capture-context-main">
+                  <strong>{activeReport.fileName}</strong>
+                  <div className="capture-context-chips mono">
+                    <span>{activeReport.sizeLabel}</span>
+                    <span>{formatCompactCount(activeReport.packetsAnalyzed)} pkts</span>
+                    <span>{activeReport.parsedPct} coverage</span>
+                    <span>{activeReport.findings.length} findings</span>
+                  </div>
+                </div>
+                <span className="capture-context-cta">
+                  เปิดรายงาน <Icon name="arrow" size={13} />
+                </span>
               </button>
+              <div className="capture-context-quick">
+                <button type="button" className="context-chip-btn" onClick={() => navigate("findings")}>
+                  Findings ({activeReport.findings.length})
+                </button>
+                <button type="button" className="context-chip-btn" onClick={() => navigate("traffic")}>
+                  Packets
+                </button>
+                <button type="button" className="context-chip-btn" onClick={() => navigate("analyze")}>
+                  เปลี่ยนไฟล์
+                </button>
+              </div>
             </div>
           )}
 
@@ -1312,6 +1404,7 @@ function App() {
               }}
               aiConsent={aiConsent}
               setAiConsent={setAiConsent}
+              consentPromptNonce={consentPromptNonce}
               uploadProgress={uploadProgress}
               uploadPaused={uploadPaused}
               isSubmitting={isSubmitting}
@@ -1327,7 +1420,7 @@ function App() {
               onRemoveLocalRoot={(root) => void handleRemoveLocalRoot(root)}
               onSaveAiConfig={handleSaveAiConfig}
               onProbeAiModels={handleProbeAiModels}
-              onOpenConnectionModal={() => setConnectionModalOpen(true)}
+              onOpenConnectionModal={openConnectionModal}
               batchMaxFiles={batchMaxFiles}
               batchMaxTotalBytes={batchMaxTotalBytes}
               batchMaxFileBytes={batchMaxFileBytes}
@@ -1397,7 +1490,7 @@ function App() {
               }}
               onNavigate={navigate}
               onOpenEvidence={openEvidence}
-              onOpenConnectionModal={() => setConnectionModalOpen(true)}
+              onOpenConnectionModal={openConnectionModal}
             />
           )}
 
@@ -1421,6 +1514,7 @@ function App() {
 
       {connectionModalOpen && (
         <ConnectionModal
+          initialTab={connectionModalTab}
           initialUrl={backendUrl}
           initialToken={bearerToken}
           status={connectionStatus}
@@ -1576,6 +1670,7 @@ function pillClassFromTone(tone: PillTone): string {
 }
 
 function ConnectionModal({
+  initialTab,
   initialUrl,
   initialToken,
   status,
@@ -1597,6 +1692,7 @@ function ConnectionModal({
   onDisconnect,
   onRetest,
 }: {
+  initialTab?: SettingsTab;
   initialUrl: string;
   initialToken: string;
   status: ConnectionStatus;
@@ -1618,6 +1714,9 @@ function ConnectionModal({
   onDisconnect: () => void;
   onRetest: () => void;
 }) {
+  const [activeTab, setActiveTab] = useState<SettingsTab>(
+    initialTab ?? (status === "connected" ? "ai" : "connection"),
+  );
   const [urlInput, setUrlInput] = useState(initialUrl);
   const [tokenInput, setTokenInput] = useState(initialToken);
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
@@ -1639,6 +1738,10 @@ function ConnectionModal({
   const [probingAiModels, setProbingAiModels] = useState(false);
   const [savingAiConfig, setSavingAiConfig] = useState(false);
   const [aiFeedback, setAiFeedback] = useState<{ tone: "ok" | "info" | "warn" | "crit"; message: string } | null>(null);
+
+  useEffect(() => {
+    if (initialTab) setActiveTab(initialTab);
+  }, [initialTab]);
 
   useEffect(() => {
     setDataDirDraft(workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "");
@@ -1669,10 +1772,10 @@ function ConnectionModal({
       enabled: aiDraftEnabled,
       provider: aiDraftProvider,
       data_boundary: aiDraftBoundary,
-      base_url: aiDraftBaseUrl,
-      allowed_origins: aiDraftAllowedOrigins,
+      base_url: aiDraftProvider === "manus" ? "" : aiDraftBaseUrl,
+      allowed_origins: aiDraftProvider === "manus" ? "" : aiDraftAllowedOrigins,
       model: aiDraftModel,
-      api_key_env: aiDraftApiKeyEnv,
+      api_key_env: aiDraftProvider === "manus" ? "" : aiDraftApiKeyEnv,
     },
   });
   const dataDirDirty = Boolean(dataDirDraft.trim()) && dataDirDraft.trim() !== resolvedDataDir;
@@ -1692,6 +1795,14 @@ function ConnectionModal({
   };
 
   const validateEndpointInputs = (requireModelWhenEnabled: boolean): { cleanApiKeyEnv: string | null; cleanBaseUrl: string | null; origins: string[] } | null => {
+    if (aiDraftProvider === "manus") {
+      if (aiDraftEnabled && requireModelWhenEnabled && !aiDraftModel.trim()) {
+        setAiFeedback({ tone: "warn", message: "กรุณากด Probe / Discover Models หรือระบุชื่อ Model ก่อนเปิดใช้งาน Layer-2 AI" });
+        return null;
+      }
+      return { cleanApiKeyEnv: null, cleanBaseUrl: null, origins: [] };
+    }
+
     const cleanEnv = aiDraftApiKeyEnv.trim();
     if (cleanEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cleanEnv)) {
       setAiFeedback({
@@ -1731,7 +1842,7 @@ function ConnectionModal({
 
     const origins = buildAllowedOriginsList(aiDraftAllowedOrigins, cleanUrl, aiDraftProvider, aiDraftBoundary);
     if (aiDraftEnabled && requireModelWhenEnabled) {
-      if (!cleanUrl && aiDraftProvider !== "openai_compatible" && aiDraftProvider !== "manus") {
+      if (!cleanUrl && aiDraftProvider !== "openai_compatible") {
         setAiFeedback({ tone: "warn", message: `กรุณาระบุ Base URL สำหรับ provider "${aiDraftProvider}"` });
         return null;
       }
@@ -1760,9 +1871,11 @@ function ConnectionModal({
         base_url: validated.cleanBaseUrl,
         allowed_origins: validated.origins,
         api_key_env: validated.cleanApiKeyEnv,
-        data_boundary: aiDraftBoundary,
+        data_boundary: aiDraftProvider === "manus" ? "remote" : aiDraftBoundary,
       });
-      setAiDraftAllowedOrigins(validated.origins.join(", "));
+      if (aiDraftProvider !== "manus") {
+        setAiDraftAllowedOrigins(validated.origins.join(", "));
+      }
       if (res.items.length > 0) {
         if (!aiDraftModel.trim()) setAiDraftModel(res.items[0].id);
         setAiFeedback({
@@ -1796,7 +1909,7 @@ function ConnectionModal({
         allowed_origins: validated.origins,
         model: aiDraftModel.trim() || null,
         api_key_env: validated.cleanApiKeyEnv,
-        data_boundary: aiDraftBoundary,
+        data_boundary: aiDraftProvider === "manus" ? "remote" : aiDraftBoundary,
       });
       setAiDraftAllowedOrigins((updated.configuration.allowed_origins ?? []).join(", "));
       setAiFeedback({
@@ -1814,14 +1927,16 @@ function ConnectionModal({
 
   const cleanEnvTrimmed = aiDraftApiKeyEnv.trim();
   const savedEnvMatches = cleanEnvTrimmed !== "" && cleanEnvTrimmed === (aiConfig?.configuration.api_key_env ?? "");
+  const aiTabWarn = status !== "connected" || (aiDraftEnabled && !aiDraftModel.trim()) || layer2Status.hasUnsavedChanges;
+  const storageTabWarn = status !== "connected" || layer1Status.binMissing || dataDirDirty || modelPathDirty;
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="conn-modal-title">
       <div className="panel connection-modal">
         <div className="modal-head">
           <div>
-            <div className="section-kicker">WORKSPACE, LAYER-1/LAYER-2 &amp; BACKEND</div>
-            <h2 id="conn-modal-title">จัดการพื้นที่จัดเก็บ, Layer-1/ET-BERT, Layer-2 LLM &amp; การเชื่อมต่อ</h2>
+            <div className="section-kicker">WORKSPACE SETTINGS</div>
+            <h2 id="conn-modal-title">ตั้งค่า AI Models, พื้นที่จัดเก็บ และ การเชื่อมต่อ</h2>
           </div>
           <button type="button" className="icon-button" aria-label="ปิดหน้าต่าง" onClick={onClose}>
             <Icon name="close" size={18} />
@@ -1852,391 +1967,499 @@ function ConnectionModal({
             </div>
           </div>
 
-          {status === "connected" && (
-            <div className="workspace-picker-card">
-              <div className="workspace-picker-head">
-                <div>
-                  <strong>
-                    Data Directory <code className="env-chip">PCAP_DATA_DIR</code>
-                  </strong>
-                  <small>โฟลเดอร์เก็บ SQLite metadata และไฟล์ที่อัปโหลด — สลับได้โดยไม่ต้องรีสตาร์ท</small>
-                </div>
-                <div className="layer-head-actions">
-                  <span className={dataDirDirty ? "ai-env-pill env-missing" : "ai-env-pill env-ok"}>
-                    {dataDirDirty ? "ยังไม่บันทึก — กด Apply Path" : "Active"}
-                  </span>
-                  <button
-                    type="button"
-                    className="primary-button tiny-btn"
-                    disabled={isPickingPath || !pickerAvailable}
-                    onClick={() => onPickNativePath("data_dir")}
-                  >
-                    <Icon name="file" size={13} />{" "}
-                    {isPickingPath ? "รอเลือก..." : "เลือกผ่าน Popup..."}
-                  </button>
-                </div>
-              </div>
-              <div className="local-path-row">
-                <input
-                  type="text"
-                  value={dataDirDraft}
-                  onChange={(e) => setDataDirDraft(e.target.value)}
-                  placeholder="เช่น ~/.pcapscanner/data หรือ /Volumes/SSD/pcap-data"
-                />
-                <button
-                  type="button"
-                  className={dataDirDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
-                  disabled={!dataDirDirty}
-                  onClick={() => onUpdateDataDir(dataDirDraft)}
-                >
-                  Apply Path
-                </button>
-              </div>
+          <div className="modal-tabs" role="tablist" aria-label="Workspace settings tabs">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "ai"}
+              className={`modal-tab-btn ${activeTab === "ai" ? "modal-tab-active" : ""}`}
+              onClick={() => setActiveTab("ai")}
+            >
+              <Icon name="spark" size={13} /> AI &amp; Models
+              {(aiTabWarn || layer2Status.savedActive) && (
+                <i className={`modal-tab-dot ${aiTabWarn ? "dot-warn" : ""}`} />
+              )}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "storage"}
+              className={`modal-tab-btn ${activeTab === "storage" ? "modal-tab-active" : ""}`}
+              onClick={() => setActiveTab("storage")}
+            >
+              <Icon name="file" size={13} /> Storage &amp; ET-BERT
+              <i className={`modal-tab-dot ${storageTabWarn ? "dot-warn" : ""}`} />
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "connection"}
+              className={`modal-tab-btn ${activeTab === "connection" ? "modal-tab-active" : ""}`}
+              onClick={() => setActiveTab("connection")}
+            >
+              <Icon name="shield" size={13} /> Connection
+              <i className={`modal-tab-dot ${status !== "connected" ? "dot-warn" : ""}`} />
+            </button>
+          </div>
 
-              <div className="workspace-picker-head workspace-roots-head">
-                <div>
-                  <strong>
-                    Authorized Local Capture Folders <code className="env-chip">PCAP_LOCAL_INGEST_ROOTS</code>
-                  </strong>
-                  <small>
-                    ทางเลือกเสริมสำหรับสแกนไฟล์ขนาดใหญ่บนเครื่องตรง ๆ — ถ้าอัปโหลด PCAP ผ่านหน้าเว็บตามปกติปล่อยว่างได้
-                  </small>
+          {activeTab === "ai" && (
+            status !== "connected" ? (
+              <div className="alert-box alert-warn">
+                <Icon name="alert" size={16} />
+                <div style={{ display: "grid", gap: "8px" }}>
+                  <strong>ต้องเชื่อมต่อ Backend API ก่อนตั้งค่า Layer-2 AI Providers</strong>
+                  <span>ไปที่แท็บ Connection เพื่อใส่ URL / Bearer Token แล้วทดสอบการเชื่อมต่อ</span>
+                  <div>
+                    <button
+                      type="button"
+                      className="primary-button tiny-btn"
+                      onClick={() => setActiveTab("connection")}
+                    >
+                      เปิดแท็บ Connection <Icon name="arrow" size={12} />
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  className="secondary-button tiny-btn"
-                  disabled={isPickingPath || !pickerAvailable}
-                  onClick={() => onPickNativePath("capture_root")}
-                >
-                  <Icon name="upload" size={13} />{" "}
-                  {isPickingPath ? "รอเลือก..." : "+ เพิ่มโฟลเดอร์ (Popup)"}
-                </button>
               </div>
-              {roots.length === 0 ? (
-                <small className="muted">ยังไม่มีโฟลเดอร์ PCAP ที่อนุญาต (ปล่อยว่างได้หากใช้อัปโหลดผ่านหน้าเว็บ)</small>
-              ) : (
-                <div className="local-roots-bar mono">
-                  {roots.map((r) => (
-                    <b key={r} className="root-chip">
-                      <span>{r}</span>
+            ) : (
+              <>
+                <div className="ai-runtime-card">
+                  <div className="workspace-picker-head">
+                    <div>
+                      <strong>Layer-2 · Optional LLM Narrator (Runtime Configuration)</strong>
+                      <small>
+                        ตั้งค่า LLM สำหรับสรุปรายงานและ Grounded Chat — รับเฉพาะ minimized &amp; redacted evidence (ไม่ปิดกั้น Layer-1)
+                      </small>
+                    </div>
+                    <span className={pillClassFromTone(layer2Status.pillTone)}>{layer2Status.badgeLabel}</span>
+                  </div>
+
+                  {(!layer2Status.savedActive || layer2Status.hasUnsavedChanges) && (
+                    <div className={`ai-status-note note-${layer2Status.pillTone}`}>{layer2Status.helperText}</div>
+                  )}
+
+                  <div className="ai-preset-row">
+                    <label className="ai-toggle-line">
+                      <label className="switch">
+                        <input
+                          type="checkbox"
+                          checked={aiDraftEnabled}
+                          onChange={(e) => setAiDraftEnabled(e.target.checked)}
+                        />
+                        <span />
+                      </label>
+                      <span>เปิดใช้งาน Layer-2 LLM Narrator บน Backend</span>
+                    </label>
+                    <button
+                      type="button"
+                      className="secondary-button tiny-btn"
+                      onClick={applyLocalOllamaPreset}
+                    >
+                      <Icon name="spark" size={13} /> 1-Click Local Ollama Preset
+                    </button>
+                  </div>
+
+                  <div className="ai-field-grid">
+                    <label className="modal-field" style={aiDraftProvider === "manus" ? { gridColumn: "1 / -1" } : undefined}>
+                      <span>Provider</span>
+                      <select
+                        value={aiDraftProvider}
+                        onChange={(e) => {
+                          const next = asAIProviderName(e.target.value);
+                          setAiDraftProvider(next);
+                          if (next === "manus") {
+                            setAiDraftBoundary("remote");
+                            setAiDraftBaseUrl("");
+                            setAiDraftAllowedOrigins("");
+                            setAiDraftApiKeyEnv("");
+                          } else if (next === "anthropic" && aiDraftBoundary === "local") {
+                            setAiDraftBoundary("remote");
+                            if (!aiDraftBaseUrl.trim() || aiDraftBaseUrl === "http://127.0.0.1:11434") {
+                              setAiDraftBaseUrl("https://api.anthropic.com");
+                              setAiDraftAllowedOrigins("https://api.anthropic.com");
+                            }
+                            if (!aiDraftApiKeyEnv.trim()) setAiDraftApiKeyEnv("ANTHROPIC_API_KEY");
+                          }
+                        }}
+                      >
+                        <option value="openai_compatible">openai_compatible (Ollama / OpenAI / vLLM)</option>
+                        <option value="anthropic">anthropic (Claude Messages API)</option>
+                        <option value="manus">manus (MANUS_API_URL / MANUS_API_KEY)</option>
+                      </select>
+                    </label>
+
+                    {aiDraftProvider !== "manus" && (
+                      <>
+                        <label className="modal-field">
+                          <span>Data Boundary</span>
+                          <select
+                            value={aiDraftBoundary}
+                            onChange={(e) => setAiDraftBoundary(e.target.value === "local" ? "local" : "remote")}
+                          >
+                            <option value="local">local (Loopback 127.0.0.1 / localhost เท่านั้น)</option>
+                            <option value="remote">remote (HTTPS External API)</option>
+                          </select>
+                        </label>
+
+                        <label className="modal-field">
+                          <span>Base URL ({aiDraftBoundary === "local" ? "loopback" : "https://..."})</span>
+                          <input
+                            type="url"
+                            value={aiDraftBaseUrl}
+                            onChange={(e) => setAiDraftBaseUrl(e.target.value)}
+                            placeholder={aiDraftBoundary === "local" ? "เช่น http://127.0.0.1:11434 (ว่าง = ค่า Ollama เริ่มต้น)" : "เช่น https://api.openai.com"}
+                          />
+                        </label>
+
+                        <label className="modal-field">
+                          <span>Allowed Origins (คั่นด้วย comma, ไม่มี / ปิดท้าย)</span>
+                          <input
+                            type="text"
+                            value={aiDraftAllowedOrigins}
+                            onChange={(e) => setAiDraftAllowedOrigins(e.target.value)}
+                            placeholder="เช่น http://127.0.0.1:11434"
+                          />
+                        </label>
+                      </>
+                    )}
+                  </div>
+
+                  {aiDraftProvider !== "manus" && (
+                    <label className="modal-field">
+                      <span>API Key ENV Var Name (ใส่ชื่อตัวแปร ENV เช่น OPENAI_API_KEY — ระบบไม่รับและไม่บันทึก Secret จริง)</span>
+                      <input
+                        type="text"
+                        value={aiDraftApiKeyEnv}
+                        onChange={(e) => setAiDraftApiKeyEnv(e.target.value)}
+                        placeholder={aiDraftProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "เว้นว่างสำหรับ Ollama หรือใส่ OPENAI_API_KEY"}
+                      />
+                    </label>
+                  )}
+
+                  {aiDraftProvider === "manus" ? (
+                    <span className={`ai-env-pill ${aiConfig?.manus_env_set ? "env-ok" : "env-missing"}`}>
+                      {aiConfig?.manus_env_set
+                        ? "ENV READY: MANUS_API_URL + MANUS_API_KEY พร้อมใช้ (อ่านจาก Backend ENV อัตโนมัติ)"
+                        : "ENV MISSING: ตั้ง MANUS_API_URL และ MANUS_API_KEY ใน shell ก่อนเริ่ม backend"}
+                    </span>
+                  ) : cleanEnvTrimmed ? (
+                    <span className={`ai-env-pill ${savedEnvMatches && aiConfig?.api_key_env_set ? "env-ok" : "env-missing"}`}>
+                      {savedEnvMatches
+                        ? aiConfig?.api_key_env_set
+                          ? `ENV READY: พบค่า $${cleanEnvTrimmed} ใน Backend`
+                          : `ENV MISSING: ยังไม่พบ $${cleanEnvTrimmed} ใน shell ของ Backend`
+                        : `กด Save AI Config เพื่อตรวจ ENV $${cleanEnvTrimmed}`}
+                    </span>
+                  ) : (
+                    <span className="ai-env-pill env-neutral">ไม่ระบุ API Key ENV (เหมาะสำหรับ Local Ollama ที่ไม่ต้องใช้ token)</span>
+                  )}
+
+                  <div className="model-probe-row">
+                    <label className="modal-field">
+                      <span>Model Name (เลือกจากผล Probe หรือพิมพ์ชื่อโมเดลจริง)</span>
+                      <input
+                        type="text"
+                        value={aiDraftModel}
+                        onChange={(e) => setAiDraftModel(e.target.value)}
+                        placeholder="ยังไม่ได้ตั้ง — พิมพ์ เช่น qwen2.5:7b หรือกด Probe →"
+                      />
+                    </label>
+                    {discoveredModels.length > 0 && (
+                      <label className="modal-field">
+                        <span>Discovered Catalog ({discoveredModels.length})</span>
+                        <select
+                          value={discoveredModels.some((m) => m.id === aiDraftModel) ? aiDraftModel : ""}
+                          onChange={(e) => {
+                            if (e.target.value) setAiDraftModel(e.target.value);
+                          }}
+                        >
+                          <option value="">-- เลือกโมเดลที่พบ --</option>
+                          {discoveredModels.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.display_name ?? item.id}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    <button
+                      type="button"
+                      className="secondary-button tiny-btn"
+                      disabled={probingAiModels}
+                      onClick={() => void handleProbeClick()}
+                    >
+                      <Icon name="search" size={13} />{" "}
+                      {probingAiModels ? "Probing..." : "Probe / Discover Models"}
+                    </button>
+                  </div>
+
+                  {aiFeedback && (
+                    <div className={`alert-box alert-${aiFeedback.tone}`}>
+                      <Icon name={aiFeedback.tone === "ok" ? "check" : aiFeedback.tone === "info" ? "info" : "alert"} size={15} />
+                      <span>{aiFeedback.message}</span>
+                    </div>
+                  )}
+
+                  <div className={`ai-runtime-actions ${layer2Status.hasUnsavedChanges ? "actions-dirty" : ""}`}>
+                    <small className="muted">
+                      {layer2Status.hasUnsavedChanges
+                        ? "มีการตั้งค่าที่ยังไม่บันทึก — กด Save AI Config เพื่อให้ Backend เริ่มใช้งาน"
+                        : "การตั้งค่าบันทึกเฉพาะ metadata ที่ไม่เป็นความลับลง Workspace Config"}
+                    </small>
+                    <button
+                      type="button"
+                      className="primary-button tiny-btn"
+                      disabled={savingAiConfig}
+                      onClick={() => void handleSaveAiClick()}
+                    >
+                      <Icon name="check" size={13} />{" "}
+                      {savingAiConfig ? "Saving..." : "Save AI Config"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="workspace-picker-card">
+                  <div className="workspace-picker-head">
+                    <div>
+                      <strong>Layer-1 Offline Tier-1 &amp; ET-BERT Model (.bin)</strong>
+                      <small>{layer1Status.analyzeCardDetail}</small>
+                    </div>
+                    <div className="layer-head-actions">
+                      <span className={pillClassFromTone(layer1Status.pillTone)}>{layer1Status.badgeLabel}</span>
                       <button
                         type="button"
-                        className="root-remove-btn"
-                        aria-label={`ลบโฟลเดอร์ ${r}`}
-                        onClick={() => onRemoveRoot(r)}
+                        className="secondary-button tiny-btn"
+                        onClick={() => setActiveTab("storage")}
                       >
-                        ×
+                        จัดการ .bin &amp; Paths <Icon name="arrow" size={12} />
                       </button>
-                    </b>
-                  ))}
+                    </div>
+                  </div>
                 </div>
-              )}
-              {!pickerAvailable && (
-                <small className="muted">
-                  * ระบบกำลังรันบน headless environment ไม่มีหน้าต่าง File Manager — พิมพ์ path แล้วกด Apply ได้เลย
-                </small>
-              )}
-            </div>
+              </>
+            )
           )}
 
-          {status === "connected" && (
-            <div className="layer1-runtime-card">
-              <div className="workspace-picker-head">
-                <div>
-                  <strong>Layer-1 · Tier-1 Triage &amp; ET-BERT (Offline / Local)</strong>
-                  <small>ทำงานตรวจจับและคัดกรองแพ็กเก็ตในเครื่องโดยอัตโนมัติ แม้ปิด Layer-2 LLM</small>
-                </div>
-                <span className={pillClassFromTone(layer1Status.pillTone)}>{layer1Status.badgeLabel}</span>
-              </div>
-
-              <div className="layer1-subblock">
-                <div className="layer1-subhead">
-                  <strong>1) Neural Sidecar (tier1-inference · models/etbert-l7)</strong>
-                  <span className={layer1Status.sidecarConfigured ? "ai-env-pill env-ok" : "ai-env-pill env-neutral"}>
-                    {layer1Status.sidecarBadgeLabel}
-                  </span>
-                </div>
-                <small>{layer1Status.sidecarHint}</small>
-              </div>
-
-              <div className="layer1-subblock">
-                <div className="layer1-subhead">
-                  <strong>
-                    2) Local .bin Checkpoint Fallback <code className="env-chip">PCAP_ETBERT_MODEL_BIN</code>
-                  </strong>
-                  <div className="layer-head-actions">
-                    <span
-                      className={pillClassFromTone(
-                        layer1Status.binMissing
-                          ? "warn"
-                          : layer1Status.binReady
-                            ? layer1Status.binHasClassifierHead
-                              ? "ok"
-                              : "info"
-                            : "neutral",
-                      )}
+          {activeTab === "storage" && (
+            status !== "connected" ? (
+              <div className="alert-box alert-warn">
+                <Icon name="alert" size={16} />
+                <div style={{ display: "grid", gap: "8px" }}>
+                  <strong>ต้องเชื่อมต่อ Backend API ก่อนจัดการ Data Directory และไฟล์โมเดล ET-BERT (.bin)</strong>
+                  <span>ไปที่แท็บ Connection เพื่อเชื่อมต่อ FastAPI Backend</span>
+                  <div>
+                    <button
+                      type="button"
+                      className="primary-button tiny-btn"
+                      onClick={() => setActiveTab("connection")}
                     >
-                      {layer1Status.binBadgeLabel}
-                    </span>
+                      เปิดแท็บ Connection <Icon name="arrow" size={12} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="workspace-picker-card">
+                  <div className="workspace-picker-head">
+                    <div>
+                      <strong>
+                        Data Directory <code className="env-chip">PCAP_DATA_DIR</code>
+                      </strong>
+                      <small>โฟลเดอร์เก็บ SQLite metadata และไฟล์ที่อัปโหลด — สลับได้โดยไม่ต้องรีสตาร์ท</small>
+                    </div>
+                    <div className="layer-head-actions">
+                      <span className={dataDirDirty ? "ai-env-pill env-missing" : "ai-env-pill env-ok"}>
+                        {dataDirDirty ? "ยังไม่บันทึก — กด Apply Path" : "Active"}
+                      </span>
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={isPickingPath || !pickerAvailable}
+                        onClick={() => onPickNativePath("data_dir")}
+                      >
+                        <Icon name="file" size={13} />{" "}
+                        {isPickingPath ? "รอเลือก..." : "เลือกผ่าน Popup..."}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="local-path-row">
+                    <input
+                      type="text"
+                      value={dataDirDraft}
+                      onChange={(e) => setDataDirDraft(e.target.value)}
+                      placeholder="เช่น ~/.pcapscanner/data หรือ /Volumes/SSD/pcap-data"
+                    />
+                    <button
+                      type="button"
+                      className={dataDirDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
+                      disabled={!dataDirDirty}
+                      onClick={() => onUpdateDataDir(dataDirDraft)}
+                    >
+                      Apply Path
+                    </button>
+                  </div>
+
+                  <div className="workspace-picker-head workspace-roots-head">
+                    <div>
+                      <strong>
+                        Authorized Local Capture Folders <code className="env-chip">PCAP_LOCAL_INGEST_ROOTS</code>
+                      </strong>
+                      <small>
+                        ทางเลือกเสริมสำหรับสแกนไฟล์ขนาดใหญ่บนเครื่องตรง ๆ — ถ้าอัปโหลด PCAP ผ่านหน้าเว็บตามปกติปล่อยว่างได้
+                      </small>
+                    </div>
                     <button
                       type="button"
                       className="secondary-button tiny-btn"
                       disabled={isPickingPath || !pickerAvailable}
-                      onClick={() => onPickNativePath("model_file")}
+                      onClick={() => onPickNativePath("capture_root")}
                     >
-                      <Icon name="spark" size={13} />{" "}
-                      {isPickingPath ? "รอเลือก..." : "เลือกไฟล์ .bin (Popup)"}
+                      <Icon name="upload" size={13} />{" "}
+                      {isPickingPath ? "รอเลือก..." : "+ เพิ่มโฟลเดอร์ (Popup)"}
                     </button>
                   </div>
-                </div>
-                <small>{layer1Status.binHint}</small>
-                <div className="local-path-row">
-                  <input
-                    type="text"
-                    value={modelPathDraft}
-                    onChange={(e) => setModelPathDraft(e.target.value)}
-                    placeholder="ปล่อยว่าง (Optional) หรือใส่ path ไปยังไฟล์ .bin / .pt"
-                  />
-                  <button
-                    type="button"
-                    className={modelPathDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
-                    disabled={!modelPathDirty}
-                    onClick={() => onUpdateModelPath(modelPathDraft)}
-                  >
-                    Bind .bin Model
-                  </button>
-                  {layer1Status.binBound && (
-                    <button
-                      type="button"
-                      className="secondary-button tiny-btn"
-                      onClick={onClearModelPath}
-                    >
-                      Unbind
-                    </button>
+                  {roots.length === 0 ? (
+                    <small className="muted">ยังไม่มีโฟลเดอร์ PCAP ที่อนุญาต (ปล่อยว่างได้หากใช้อัปโหลดผ่านหน้าเว็บ)</small>
+                  ) : (
+                    <div className="local-roots-bar mono">
+                      {roots.map((r) => (
+                        <b key={r} className="root-chip">
+                          <span>{r}</span>
+                          <button
+                            type="button"
+                            className="root-remove-btn"
+                            aria-label={`ลบโฟลเดอร์ ${r}`}
+                            onClick={() => onRemoveRoot(r)}
+                          >
+                            ×
+                          </button>
+                        </b>
+                      ))}
+                    </div>
+                  )}
+                  {!pickerAvailable && (
+                    <small className="muted">
+                      * ระบบกำลังรันบน headless environment ไม่มีหน้าต่าง File Manager — พิมพ์ path แล้วกด Apply ได้เลย
+                    </small>
                   )}
                 </div>
-              </div>
-            </div>
+
+                <div className="layer1-runtime-card">
+                  <div className="workspace-picker-head">
+                    <div>
+                      <strong>Layer-1 · Tier-1 Triage &amp; ET-BERT (Offline / Local)</strong>
+                      <small>ทำงานตรวจจับและคัดกรองแพ็กเก็ตในเครื่องโดยอัตโนมัติ แม้ปิด Layer-2 LLM</small>
+                    </div>
+                    <span className={pillClassFromTone(layer1Status.pillTone)}>{layer1Status.badgeLabel}</span>
+                  </div>
+
+                  <div className="layer1-subblock">
+                    <div className="layer1-subhead">
+                      <strong>1) Neural Sidecar (tier1-inference · models/etbert-l7)</strong>
+                      <span className={layer1Status.sidecarConfigured ? "ai-env-pill env-ok" : "ai-env-pill env-neutral"}>
+                        {layer1Status.sidecarBadgeLabel}
+                      </span>
+                    </div>
+                    <small>{layer1Status.sidecarHint}</small>
+                  </div>
+
+                  <div className="layer1-subblock">
+                    <div className="layer1-subhead">
+                      <strong>
+                        2) Local .bin Checkpoint Fallback <code className="env-chip">PCAP_ETBERT_MODEL_BIN</code>
+                      </strong>
+                      <div className="layer-head-actions">
+                        <span
+                          className={pillClassFromTone(
+                            layer1Status.binMissing
+                              ? "warn"
+                              : layer1Status.binReady
+                                ? layer1Status.binHasClassifierHead
+                                  ? "ok"
+                                  : "info"
+                                : "neutral",
+                          )}
+                        >
+                          {layer1Status.binBadgeLabel}
+                        </span>
+                        <button
+                          type="button"
+                          className="secondary-button tiny-btn"
+                          disabled={isPickingPath || !pickerAvailable}
+                          onClick={() => onPickNativePath("model_file")}
+                        >
+                          <Icon name="spark" size={13} />{" "}
+                          {isPickingPath ? "รอเลือก..." : "เลือกไฟล์ .bin (Popup)"}
+                        </button>
+                      </div>
+                    </div>
+                    <small>{layer1Status.binHint}</small>
+                    <div className="local-path-row">
+                      <input
+                        type="text"
+                        value={modelPathDraft}
+                        onChange={(e) => setModelPathDraft(e.target.value)}
+                        placeholder="ปล่อยว่าง (Optional) หรือใส่ path ไปยังไฟล์ .bin / .pt"
+                      />
+                      <button
+                        type="button"
+                        className={modelPathDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
+                        disabled={!modelPathDirty}
+                        onClick={() => onUpdateModelPath(modelPathDraft)}
+                      >
+                        Bind .bin Model
+                      </button>
+                      {layer1Status.binBound && (
+                        <button
+                          type="button"
+                          className="secondary-button tiny-btn"
+                          onClick={onClearModelPath}
+                        >
+                          Unbind
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )
           )}
 
-          {status === "connected" && (
-            <div className="ai-runtime-card">
-              <div className="workspace-picker-head">
-                <div>
-                  <strong>Layer-2 · Optional LLM Narrator (Runtime Configuration)</strong>
-                  <small>
-                    ตั้งค่า LLM สำหรับสรุปรายงานแบบ opt-in เท่านั้น — รับเฉพาะ minimized &amp; redacted evidence (ไม่ปิดกั้น Layer-1)
-                  </small>
-                </div>
-                <span className={pillClassFromTone(layer2Status.pillTone)}>{layer2Status.badgeLabel}</span>
-              </div>
-
-              {(!layer2Status.savedActive || layer2Status.hasUnsavedChanges) && (
-                <div className={`ai-status-note note-${layer2Status.pillTone}`}>{layer2Status.helperText}</div>
-              )}
-
-              <div className="ai-preset-row">
-                <label className="ai-toggle-line">
-                  <label className="switch">
-                    <input
-                      type="checkbox"
-                      checked={aiDraftEnabled}
-                      onChange={(e) => setAiDraftEnabled(e.target.checked)}
-                    />
-                    <span />
-                  </label>
-                  <span>เปิดใช้งาน Layer-2 LLM Narrator บน Backend</span>
-                </label>
-                <button
-                  type="button"
-                  className="secondary-button tiny-btn"
-                  onClick={applyLocalOllamaPreset}
-                >
-                  <Icon name="spark" size={13} /> 1-Click Local Ollama Preset
-                </button>
-              </div>
-
-              <div className="ai-field-grid">
-                <label className="modal-field">
-                  <span>Provider</span>
-                  <select
-                    value={aiDraftProvider}
-                    onChange={(e) => {
-                      const next = asAIProviderName(e.target.value);
-                      setAiDraftProvider(next);
-                      if (next === "anthropic" && aiDraftBoundary === "local") {
-                        setAiDraftBoundary("remote");
-                        if (!aiDraftBaseUrl.trim() || aiDraftBaseUrl === "http://127.0.0.1:11434") {
-                          setAiDraftBaseUrl("https://api.anthropic.com");
-                          setAiDraftAllowedOrigins("https://api.anthropic.com");
-                        }
-                        if (!aiDraftApiKeyEnv.trim()) setAiDraftApiKeyEnv("ANTHROPIC_API_KEY");
-                      }
-                    }}
-                  >
-                    <option value="openai_compatible">openai_compatible (Ollama / OpenAI / vLLM)</option>
-                    <option value="anthropic">anthropic (Claude Messages API)</option>
-                    <option value="manus">manus (MANUS_API_URL / MANUS_API_KEY)</option>
-                  </select>
-                </label>
-
-                <label className="modal-field">
-                  <span>Data Boundary</span>
-                  <select
-                    value={aiDraftBoundary}
-                    onChange={(e) => setAiDraftBoundary(e.target.value === "local" ? "local" : "remote")}
-                  >
-                    <option value="local">local (Loopback 127.0.0.1 / localhost เท่านั้น)</option>
-                    <option value="remote">remote (HTTPS External API)</option>
-                  </select>
-                </label>
-
-                <label className="modal-field">
-                  <span>Base URL ({aiDraftBoundary === "local" ? "loopback" : "https://..."})</span>
-                  <input
-                    type="url"
-                    value={aiDraftBaseUrl}
-                    onChange={(e) => setAiDraftBaseUrl(e.target.value)}
-                    placeholder={aiDraftBoundary === "local" ? "เช่น http://127.0.0.1:11434 (ว่าง = ค่า Ollama เริ่มต้น)" : "เช่น https://api.openai.com"}
-                  />
-                </label>
-
-                <label className="modal-field">
-                  <span>Allowed Origins (คั่นด้วย comma, ไม่มี / ปิดท้าย)</span>
-                  <input
-                    type="text"
-                    value={aiDraftAllowedOrigins}
-                    onChange={(e) => setAiDraftAllowedOrigins(e.target.value)}
-                    placeholder="เช่น http://127.0.0.1:11434"
-                  />
-                </label>
-              </div>
-
+          {activeTab === "connection" && (
+            <>
               <label className="modal-field">
-                <span>API Key ENV Var Name (ใส่ชื่อตัวแปร ENV เช่น OPENAI_API_KEY — ระบบไม่รับและไม่บันทึก Secret จริง)</span>
+                <span>Backend URL (เว้นว่างเมื่อเปิดจาก Start PCAPSCANNER.command / Vite proxy)</span>
                 <input
-                  type="text"
-                  value={aiDraftApiKeyEnv}
-                  onChange={(e) => setAiDraftApiKeyEnv(e.target.value)}
-                  placeholder={aiDraftProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "เว้นว่างสำหรับ Ollama หรือใส่ OPENAI_API_KEY"}
-                  disabled={aiDraftProvider === "manus"}
+                  type="url"
+                  value={urlInput}
+                  onChange={(e) => setUrlInput(e.target.value)}
+                  placeholder="http://127.0.0.1:8000"
                 />
               </label>
 
-              {aiDraftProvider === "manus" ? (
-                <span className={`ai-env-pill ${aiConfig?.manus_env_set ? "env-ok" : "env-missing"}`}>
-                  {aiConfig?.manus_env_set
-                    ? "ENV READY: MANUS_API_URL + MANUS_API_KEY พร้อมใช้"
-                    : "ENV MISSING: ตั้ง MANUS_API_URL และ MANUS_API_KEY ใน shell ก่อนเริ่ม backend"}
+              <label className="modal-field">
+                <span>
+                  Operator Bearer Token <code className="env-chip">PCAP_API_TOKEN</code> (auto-filled เมื่อเปิดผ่าน 1-click launcher)
                 </span>
-              ) : cleanEnvTrimmed ? (
-                <span className={`ai-env-pill ${savedEnvMatches && aiConfig?.api_key_env_set ? "env-ok" : "env-missing"}`}>
-                  {savedEnvMatches
-                    ? aiConfig?.api_key_env_set
-                      ? `ENV READY: พบค่า $${cleanEnvTrimmed} ใน Backend`
-                      : `ENV MISSING: ยังไม่พบ $${cleanEnvTrimmed} ใน shell ของ Backend`
-                    : `กด Save AI Config เพื่อตรวจ ENV $${cleanEnvTrimmed}`}
-                </span>
-              ) : (
-                <span className="ai-env-pill env-neutral">ไม่ระบุ API Key ENV (เหมาะสำหรับ Local Ollama ที่ไม่ต้องใช้ token)</span>
-              )}
+                <input
+                  type="password"
+                  value={tokenInput}
+                  onChange={(e) => setTokenInput(e.target.value)}
+                  placeholder="ใส่ PCAP_API_TOKEN ที่ตั้งใน backend"
+                />
+              </label>
 
-              <div className="model-probe-row">
-                <label className="modal-field">
-                  <span>Model Name (เลือกจากผล Probe หรือพิมพ์ชื่อโมเดลจริง)</span>
-                  <input
-                    type="text"
-                    value={aiDraftModel}
-                    onChange={(e) => setAiDraftModel(e.target.value)}
-                    placeholder="ยังไม่ได้ตั้ง — พิมพ์ เช่น qwen2.5:7b หรือกด Probe →"
-                  />
-                </label>
-                {discoveredModels.length > 0 && (
-                  <label className="modal-field">
-                    <span>Discovered Catalog ({discoveredModels.length})</span>
-                    <select
-                      value={discoveredModels.some((m) => m.id === aiDraftModel) ? aiDraftModel : ""}
-                      onChange={(e) => {
-                        if (e.target.value) setAiDraftModel(e.target.value);
-                      }}
-                    >
-                      <option value="">-- เลือกโมเดลที่พบ --</option>
-                      {discoveredModels.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.display_name ?? item.id}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
-                <button
-                  type="button"
-                  className="secondary-button tiny-btn"
-                  disabled={probingAiModels}
-                  onClick={() => void handleProbeClick()}
-                >
-                  <Icon name="search" size={13} />{" "}
-                  {probingAiModels ? "Probing..." : "Probe / Discover Models"}
-                </button>
+              <div className="modal-help">
+                <strong>วิธีเปิดใช้งานแบบคลิกเดียว (ไม่ต้องพิมพ์หลายคำสั่ง):</strong>
+                <span>• macOS Finder: ดับเบิลคลิกไฟล์ <code>Start PCAPSCANNER.command</code> ในโฟลเดอร์โปรเจกต์</span>
+                <span>• Terminal (คำสั่งเดียว): <code>python -m backend.app.launcher</code> (ระบบสร้าง token, สตาร์ท worker และเปิดหน้าเว็บให้อัตโนมัติ)</span>
               </div>
-
-              {aiFeedback && (
-                <div className={`alert-box alert-${aiFeedback.tone}`}>
-                  <Icon name={aiFeedback.tone === "ok" ? "check" : aiFeedback.tone === "info" ? "info" : "alert"} size={15} />
-                  <span>{aiFeedback.message}</span>
-                </div>
-              )}
-
-              <div className={`ai-runtime-actions ${layer2Status.hasUnsavedChanges ? "actions-dirty" : ""}`}>
-                <small className="muted">
-                  {layer2Status.hasUnsavedChanges
-                    ? "มีการตั้งค่าที่ยังไม่บันทึก — กด Save AI Config เพื่อให้ Backend เริ่มใช้งาน"
-                    : "การตั้งค่าบันทึกเฉพาะ metadata ที่ไม่เป็นความลับลง Workspace Config"}
-                </small>
-                <button
-                  type="button"
-                  className="primary-button tiny-btn"
-                  disabled={savingAiConfig}
-                  onClick={() => void handleSaveAiClick()}
-                >
-                  <Icon name="check" size={13} />{" "}
-                  {savingAiConfig ? "Saving..." : "Save AI Config"}
-                </button>
-              </div>
-            </div>
+            </>
           )}
-
-          <label className="modal-field">
-            <span>Backend URL (เว้นว่างเมื่อเปิดจาก Start PCAPSCANNER.command / Vite proxy)</span>
-            <input
-              type="url"
-              value={urlInput}
-              onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="http://127.0.0.1:8000"
-            />
-          </label>
-
-          <label className="modal-field">
-            <span>
-              Operator Bearer Token <code className="env-chip">PCAP_API_TOKEN</code> (auto-filled เมื่อเปิดผ่าน 1-click launcher)
-            </span>
-            <input
-              type="password"
-              value={tokenInput}
-              onChange={(e) => setTokenInput(e.target.value)}
-              placeholder="ใส่ PCAP_API_TOKEN ที่ตั้งใน backend"
-            />
-          </label>
-
-          <div className="modal-help">
-            <strong>วิธีเปิดใช้งานแบบคลิกเดียว (ไม่ต้องพิมพ์หลายคำสั่ง):</strong>
-            <span>• macOS Finder: ดับเบิลคลิกไฟล์ <code>Start PCAPSCANNER.command</code> ในโฟลเดอร์โปรเจกต์</span>
-            <span>• Terminal (คำสั่งเดียว): <code>python -m backend.app.launcher</code> (ระบบสร้าง token, สตาร์ท worker และเปิดหน้าเว็บให้อัตโนมัติ)</span>
-          </div>
         </div>
 
         <div className="modal-actions">
-          {initialToken && (
+          {activeTab === "connection" && initialToken && (
             <button type="button" className="secondary-button" onClick={onDisconnect}>
               Disconnect Token
             </button>
@@ -2244,13 +2467,19 @@ function ConnectionModal({
           <button type="button" className="secondary-button" onClick={onRetest}>
             Test Health
           </button>
-          <button
-            type="button"
-            className="primary-button"
-            onClick={() => onSave(urlInput, tokenInput)}
-          >
-            <Icon name="check" size={15} /> Save &amp; Connect
-          </button>
+          {activeTab === "connection" ? (
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => onSave(urlInput, tokenInput)}
+            >
+              <Icon name="check" size={15} /> Save &amp; Connect
+            </button>
+          ) : (
+            <button type="button" className="secondary-button" onClick={onClose}>
+              ปิดหน้าต่าง
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -2679,6 +2908,7 @@ function AnalyzePage({
   setAiEnabled,
   aiConsent,
   setAiConsent,
+  consentPromptNonce,
   uploadProgress,
   uploadPaused,
   isSubmitting,
@@ -2726,6 +2956,7 @@ function AnalyzePage({
   setAiEnabled: (val: boolean) => void;
   aiConsent: boolean;
   setAiConsent: (val: boolean) => void;
+  consentPromptNonce: number;
   uploadProgress: UploadProgress | null;
   uploadPaused: boolean;
   isSubmitting: boolean;
@@ -2741,15 +2972,25 @@ function AnalyzePage({
   onRemoveLocalRoot: (root: string) => void;
   onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
   onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
-  onOpenConnectionModal: () => void;
+  onOpenConnectionModal: (tab?: SettingsTab) => void;
   batchMaxFiles: number | null;
   batchMaxTotalBytes: number | null;
   batchMaxFileBytes: number | null;
   onOpenBatchJob: (analysisId: string) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const consentSummaryRef = useRef<HTMLDivElement | null>(null);
   const [dragging, setDragging] = useState(false);
   const [quickAiBusy, setQuickAiBusy] = useState(false);
+  const [consentHighlighted, setConsentHighlighted] = useState(false);
+
+  useEffect(() => {
+    if (consentPromptNonce === 0) return;
+    setConsentHighlighted(true);
+    consentSummaryRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const timer = window.setTimeout(() => setConsentHighlighted(false), 1800);
+    return () => window.clearTimeout(timer);
+  }, [consentPromptNonce]);
 
   const handleQuickEnableAi = async () => {
     if (quickAiBusy) return;
@@ -2813,6 +3054,19 @@ function AnalyzePage({
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
   const nativePickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? false;
 
+  const consentState = resolveRunConsentState({
+    connected: connectionStatus === "connected",
+    isCsvSelected: Boolean(sourceTab === "upload" && selectedFile && isCsvSelected),
+    triageEnabled,
+    triageEndpointConfigured,
+    triageEndpointConsent,
+    layer1Kind: layer1Status.kind,
+    aiEnabled,
+    aiConsent,
+    canStartBackendAi,
+    aiBackendEnabled: aiConfig?.configuration.enabled,
+  });
+
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     setDragging(false);
@@ -2825,15 +3079,148 @@ function AnalyzePage({
     if (file) void onFileSelect(file);
   };
 
+  const renderInlineConsentCard = (placement: "source" | "summary") => {
+    if (sourceTab === "batch") return null;
+    if (sourceTab === "upload" && selectedFile && isCsvSelected) {
+      if (placement === "summary") {
+        return (
+          <div className="inline-consent-card">
+            <div className="inline-consent-head">
+              <strong>
+                <Icon name="shield" size={13} /> Browser CSV (100% Offline)
+              </strong>
+              <small>No Consent Needed</small>
+            </div>
+            <span className="muted">
+              สแกน Wireshark CSV ในเบราว์เซอร์โดยตรง ไม่ส่งข้อมูลออกจากเครื่อง
+            </span>
+          </div>
+        );
+      }
+      return null;
+    }
+
+    const showTier1Checkbox = triageEnabled && triageEndpointConfigured;
+    const showAiBlock = aiEnabled;
+    if (!showTier1Checkbox && !showAiBlock) return null;
+    if (placement === "source" && !consentState.hasAnyConsentPrompt) return null;
+
+    return (
+      <div
+        className={`inline-consent-card ${placement === "source" ? "consent-source" : ""} ${consentState.hasAnyConsentPrompt ? "consent-pending" : ""} ${consentHighlighted ? "consent-highlight-pulse" : ""}`}
+      >
+        <div className="inline-consent-head">
+          <strong>
+            <Icon name={consentState.hasAnyConsentPrompt ? "alert" : "check"} size={13} />{" "}
+            {consentState.needsAiSetup
+              ? "ตั้งค่า Layer-2 AI หรือสลับ Offline"
+              : consentState.hasAnyConsentPrompt
+                ? "กรุณายืนยัน Consent ก่อนส่งงาน"
+                : "ยืนยัน Consent พร้อมส่งงาน"}
+          </strong>
+          <small className="mono">{consentState.hasAnyConsentPrompt ? "ACTION NEEDED" : "READY"}</small>
+        </div>
+
+        {consentState.needsAiSetup && (
+          <>
+            <span style={{ color: "#e8cb83" }}>
+              {aiConfig && !aiConfig.configuration.enabled
+                ? "เปิดใช้ Layer-2 AI อยู่ แต่ Backend ปิดไว้ (ai.enabled = false) — เปิดใช้งานหรือปิด LLM ชั่วคราวเพื่อวิเคราะห์ทันที"
+                : "เปิดใช้ Layer-2 AI อยู่ แต่ยังไม่ได้เลือก Model บน Backend"}
+            </span>
+            <div className="inline-consent-actions">
+              <button
+                type="button"
+                className="primary-button tiny-btn"
+                onClick={() => onOpenConnectionModal("ai")}
+              >
+                <Icon name="spark" size={12} /> ตั้งค่า / เลือก Model
+              </button>
+              <button
+                type="button"
+                className="secondary-button tiny-btn"
+                onClick={() => setAiEnabled(false)}
+              >
+                ปิด LLM (ใช้ Offline ทันที)
+              </button>
+            </div>
+          </>
+        )}
+
+        {showAiBlock && !consentState.needsAiSetup && (
+          <>
+            <label className="inline-consent-row">
+              <input
+                type="checkbox"
+                checked={aiConsent}
+                onChange={(e) => setAiConsent(e.target.checked)}
+              />
+              <span>
+                <b>Layer-2 AI:</b> ยินยอมส่ง Redacted Summary ไปยัง{" "}
+                {aiConfig?.configuration.provider ?? "LLM"} ({aiConfig?.configuration.model ?? "model"})
+                <small>ไม่ส่ง raw packet/payload · {aiConsent ? "ยืนยันแล้ว" : "ติ๊กเพื่อเปิดสรุป AI"}</small>
+              </span>
+            </label>
+            {!aiConsent && (
+              <div className="inline-consent-actions">
+                <button
+                  type="button"
+                  className="secondary-button tiny-btn"
+                  onClick={() => setAiEnabled(false)}
+                >
+                  ไม่ใช้ LLM รอบนี้ (รัน Offline ทันที)
+                </button>
+              </div>
+            )}
+          </>
+        )}
+
+        {showTier1Checkbox && (
+          <label className="inline-consent-row">
+            <input
+              type="checkbox"
+              checked={triageEndpointConsent}
+              onChange={(e) => setTriageEndpointConsent(e.target.checked)}
+            />
+            <span>
+              <b>Tier-1 Sidecar (ทางเลือก):</b> ยินยอมเรียก {triageEndpointTargets.join(" / ") || "Sidecar Endpoint"}
+              <small>
+                ไม่ส่ง payload · หากไม่ติ๊ก ใช้ {layer1Status.binReady ? "ET-BERT .bin ในเครื่อง" : "Heuristic Tier-1"} อัตโนมัติ
+              </small>
+            </span>
+          </label>
+        )}
+      </div>
+    );
+  };
+
+  const binarySubmitLabel = uploadPaused
+    ? "Resume Upload & Analyze"
+    : isSubmitting
+      ? "กำลังอัปโหลด..."
+      : consentState.submitBlockedReason === "ai_setup"
+        ? "ตั้งค่า LLM หรือปิดเพื่อส่งงาน"
+        : consentState.submitBlockedReason === "ai_consent"
+          ? "ติ๊ก Consent ด้านบนเพื่อส่งงาน"
+          : "Upload & Queue Job";
+
+  const localSubmitLabel = isSubmitting
+    ? "กำลังลงทะเบียน..."
+    : consentState.submitBlockedReason === "ai_setup"
+      ? "ตั้งค่า LLM หรือปิดเพื่อส่งงาน"
+      : consentState.submitBlockedReason === "ai_consent"
+        ? "ติ๊ก Consent ด้านบนเพื่อส่งงาน"
+        : "Analyze Local Capture";
+
   return (
     <>
       <PageHeading
         eyebrow="ANALYSIS / NEW RUN"
         title="วิเคราะห์ network capture"
-        detail="รองรับ bounded resumable upload, private local-capture snapshots และการวิเคราะห์ Wireshark CSV/TSV ในเบราว์เซอร์"
+        detail="รองรับ bounded resumable upload, private local-capture snapshots, batch intake และ Wireshark CSV/TSV ในเบราว์เซอร์"
         actions={
-          <button type="button" className="secondary-button" onClick={onOpenConnectionModal}>
-            <Icon name="activity" size={15} /> {connectionStatus === "connected" ? "Workspace & Settings" : "Connect Backend"}
+          <button type="button" className="secondary-button" onClick={() => onOpenConnectionModal("ai")}>
+            <Icon name="sliders" size={15} /> {connectionStatus === "connected" ? "Settings & Models" : "Connect Backend"}
           </button>
         }
       />
@@ -2849,7 +3236,7 @@ function AnalyzePage({
           <small>
             {capabilities?.host.cgroup_memory_limit_mb
               ? `cgroup capped (${capabilities.host.cgroup_memory_limit_mb} MB)`
-              : "ยังไม่มีข้อมูล resource จาก Backend"}
+              : "Adaptive streaming bounds"}
           </small>
         </div>
         <div className="hw-item">
@@ -2857,7 +3244,7 @@ function AnalyzePage({
           <strong>
             {capabilities
               ? capabilities.limits.unlimited_upload_enabled
-                ? `ไม่กำหนดเพดานตายตัว · พื้นที่พร้อมใช้งาน ${formatBytes(capabilities.limits.effective_storage_max_bytes)}`
+                ? `พร้อมใช้งาน ${formatBytes(capabilities.limits.effective_storage_max_bytes)}`
                 : formatBytes(capabilities.limits.effective_upload_max_bytes)
               : "เชื่อมต่อ API เพื่ออ่าน upload limits"}
           </strong>
@@ -2865,7 +3252,7 @@ function AnalyzePage({
             <span className="mono" title={resolvedDataDir || undefined}>
               {resolvedDataDir
                 ? `Data: ${resolvedDataDir} · Chunk ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`
-                : `Chunk size: ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"} · Disk reserve status from Backend`}
+                : `Chunk: ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`}
             </span>
             {connectionStatus === "connected" && nativePickerAvailable && (
               <button
@@ -2874,7 +3261,7 @@ function AnalyzePage({
                 disabled={isPickingPath}
                 onClick={() => onPickNativePath("data_dir")}
               >
-                {isPickingPath ? "รอเลือก..." : "เปลี่ยน Data Dir (Popup)"}
+                {isPickingPath ? "รอเลือก..." : "เปลี่ยน Data Dir"}
               </button>
             )}
           </small>
@@ -2891,9 +3278,7 @@ function AnalyzePage({
               {layer1Status.hardwareBadgeLabel}
             </span>
             <span className={canStartBackendAi ? "hw-badge-ok" : "muted"}>
-              {canStartBackendAi
-                ? `LLM Ready (${aiConfig?.configuration.model})`
-                : "LLM Standby"}
+              {canStartBackendAi ? `LLM Ready (${aiConfig?.configuration.model})` : "LLM Standby"}
             </span>
           </small>
         </div>
@@ -2916,7 +3301,7 @@ function AnalyzePage({
                   className={sourceTab === "upload" ? "segment-active" : ""}
                   onClick={() => setSourceTab("upload")}
                 >
-                  File Upload / CSV
+                  Upload / CSV
                 </button>
                 <button
                   type="button"
@@ -2925,7 +3310,16 @@ function AnalyzePage({
                   className={sourceTab === "local" ? "segment-active" : ""}
                   onClick={() => setSourceTab("local")}
                 >
-                  Local Capture (Verified Snapshot)
+                  Local Capture
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sourceTab === "batch"}
+                  className={sourceTab === "batch" ? "segment-active" : ""}
+                  onClick={() => setSourceTab("batch")}
+                >
+                  Batch Intake
                 </button>
               </div>
             </div>
@@ -2986,7 +3380,13 @@ function AnalyzePage({
                     {selectedFile && (
                       <button
                         type="button"
-                        className={isCsvSelected ? "secondary-button" : "primary-button"}
+                        className={
+                          isCsvSelected
+                            ? "secondary-button"
+                            : consentState.submitBlockedReason !== "none"
+                              ? "primary-button btn-needs-consent"
+                              : "primary-button"
+                        }
                         disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
                         onClick={onUploadAndAnalyze}
                       >
@@ -3006,6 +3406,8 @@ function AnalyzePage({
                     <div className="dropzone-empty-hint">ยังไม่มีไฟล์ — เลือก PCAP/PCAPNG หรือ Wireshark CSV/TSV เพื่อเริ่ม</div>
                   )}
                 </div>
+
+                {selectedFile && !isCsvSelected && renderInlineConsentCard("source")}
 
                 {(uploadProgress || uploadPaused) && (
                   <div className="upload-progress-card">
@@ -3052,12 +3454,12 @@ function AnalyzePage({
                   </div>
                 )}
               </>
-            ) : (
+            ) : sourceTab === "local" ? (
               <div className="local-ingest-box">
                 {connectionStatus !== "connected" ? (
                   <div className="consent-required">
                     ต้องเชื่อมต่อ Backend API ก่อนจึงจะเลือกไฟล์ local และสร้าง private snapshot เพื่อวิเคราะห์ได้{" "}
-                    <button type="button" className="text-button" onClick={onOpenConnectionModal}>
+                    <button type="button" className="text-button" onClick={() => onOpenConnectionModal("connection")}>
                       ตั้งค่าการเชื่อมต่อ <Icon name="arrow" size={13} />
                     </button>
                   </div>
@@ -3079,28 +3481,20 @@ function AnalyzePage({
                         disabled={isPickingPath || !nativePickerAvailable}
                         onClick={() => onPickNativePath("capture_root")}
                       >
-                        <Icon name="upload" size={14} /> + เพิ่มโฟลเดอร์ PCAP (Popup)
+                        <Icon name="upload" size={14} /> + เพิ่มโฟลเดอร์ PCAP
                       </button>
-                      <button
-                        type="button"
-                        className="secondary-button tiny-btn"
-                        disabled={isPickingPath || !nativePickerAvailable}
-                        onClick={() => onPickNativePath("data_dir")}
-                      >
-                        เปลี่ยน Data Dir (Popup)
-                      </button>
-                      <button type="button" className="text-button tiny-btn" onClick={onOpenConnectionModal}>
-                        ตั้งค่า Workspace / Path
+                      <button type="button" className="text-button tiny-btn" onClick={() => onOpenConnectionModal("storage")}>
+                        จัดการ Storage &amp; Paths
                       </button>
                     </div>
 
                     {!localBrowse?.enabled ? (
                       <div className="consent-required">
-                        <strong>ยังไม่มี local capture folder — กด &quot;เลือกไฟล์ Capture (Popup)&quot; หรือ &quot;+ เพิ่มโฟลเดอร์ PCAP (Popup)&quot; ด้านบนได้เลย</strong>
+                        <strong>ยังไม่มี local capture folder — กด &quot;เลือกไฟล์ Capture (Popup)&quot; หรือ &quot;+ เพิ่มโฟลเดอร์ PCAP&quot; ด้านบนได้เลย</strong>
                         <span>
                           {nativePickerAvailable
                             ? "การเลือกไฟล์ให้สิทธิ์อ่านเฉพาะไฟล์นั้นครั้งเดียว นาน 5 นาที; จะไม่เพิ่มโฟลเดอร์แม่ใน allowlist"
-                            : "Environment ปัจจุบันไม่มีหน้าต่าง GUI Picker — กรอก path ใน Workspace & Settings หรือตั้ง env ก่อนสตาร์ทเซิร์ฟเวอร์"}
+                            : "Environment ปัจจุบันไม่มีหน้าต่าง GUI Picker — กรอก path ใน Settings หรือเพิ่ม allowlisted root"}
                         </span>
                         <div className="local-path-row">
                           <input
@@ -3111,7 +3505,7 @@ function AnalyzePage({
                           />
                           <button
                             type="button"
-                            className="primary-button"
+                            className={consentState.submitBlockedReason !== "none" ? "primary-button btn-needs-consent" : "primary-button"}
                             disabled={(!hasLocalFileGrant && !localPathInput.trim()) || isSubmitting}
                             onClick={onRegisterLocalCapture}
                           >
@@ -3149,8 +3543,8 @@ function AnalyzePage({
                           />
                           <button
                             type="button"
-                            className="primary-button"
-                            disabled={!localPathInput.trim() || isSubmitting}
+                            className={consentState.submitBlockedReason !== "none" ? "primary-button btn-needs-consent" : "primary-button"}
+                            disabled={(!hasLocalFileGrant && !localPathInput.trim()) || isSubmitting}
                             onClick={onRegisterLocalCapture}
                           >
                             <Icon name="play" size={15} /> Register &amp; Analyze
@@ -3159,7 +3553,7 @@ function AnalyzePage({
                         <div className="local-file-list">
                           {localBrowse.files.length === 0 ? (
                             <div className="empty-state">
-                              ไม่พบไฟล์ .pcap/.pcapng/.cap/.csv/.tsv ในโฟลเดอร์ที่เลือก — กด &quot;+ เพิ่มโฟลเดอร์ PCAP (Popup)&quot; ด้านบน
+                              ไม่พบไฟล์ .pcap/.pcapng/.cap/.csv/.tsv ในโฟลเดอร์ที่เลือก — กด &quot;+ เพิ่มโฟลเดอร์ PCAP&quot; ด้านบน
                             </div>
                           ) : (
                             localBrowse.files.map((item) => (
@@ -3181,311 +3575,322 @@ function AnalyzePage({
                         </div>
                       </>
                     )}
+                    {(hasLocalFileGrant || Boolean(localPathInput.trim())) && renderInlineConsentCard("source")}
                   </>
                 )}
               </div>
+            ) : (
+              <BatchIntakePanel
+                api={apiClient}
+                connected={connectionStatus === "connected"}
+                maxFiles={batchMaxFiles}
+                maxTotalBytes={batchMaxTotalBytes}
+                maxFileBytes={batchMaxFileBytes}
+                onOpenJob={onOpenBatchJob}
+              />
             )}
 
-          <div className="upload-foot">
-              <span>
-                <Icon name="shield" size={15} /> พาสเวิร์ด, cookies และ raw payloads จะไม่ถูกส่งออกจาก parser หรือส่งเข้า AI LLM
-              </span>
-              <span className="muted">
-                {connectionStatus !== "connected" && connectionError ? connectionError : "SHA-256 provenance tracked per capture"}
-              </span>
-          </div>
-        </section>
-
-        <BatchIntakePanel
-          api={apiClient}
-          connected={connectionStatus === "connected"}
-          maxFiles={batchMaxFiles}
-          maxTotalBytes={batchMaxTotalBytes}
-          maxFileBytes={batchMaxFileBytes}
-          onOpenJob={onOpenBatchJob}
-        />
-
-          <section className="panel options-panel">
-            <div className="upload-head">
-              <div>
-                <div className="section-kicker">02 / RESOURCE LIMITS &amp; OPTIONAL AI</div>
-                <h2>ควบคุม resource และข้อมูลก่อนส่ง provider</h2>
-                <p>Tier-1 ใช้ local classifier เป็นค่าเริ่มต้น; HTTP endpoint ต้องผ่าน allowlist และ consent ต่อ analysis; AI narrator แยก consent อีกชั้นและรับเฉพาะ minimized structured evidence</p>
+            {sourceTab !== "batch" && (
+              <div className="upload-foot">
+                <span>
+                  <Icon name="shield" size={15} /> พาสเวิร์ด, cookies และ raw payloads จะไม่ถูกส่งออกจาก parser หรือส่งเข้า AI LLM
+                </span>
+                <span className="muted">
+                  {connectionStatus !== "connected" && connectionError ? connectionError : "SHA-256 provenance tracked per capture"}
+                </span>
               </div>
-              <span className="step-tag">PIPELINE</span>
-            </div>
+            )}
+          </section>
 
-            <div className="profile-grid" role="radiogroup" aria-label="Resource execution profile">
-              {(["auto", "fast", "deep", "unlimited"] as ResourceMode[]).map((mode) => {
-                const prof = profiles?.[mode] ?? null;
-                const titleMap: Record<ResourceMode, string> = {
-                  auto: "Auto (Device-Adaptive)",
-                  fast: "Fast Triage",
-                  deep: "Deep Capture",
-                  unlimited: "Max Server-Bounded",
-                };
-                return (
-                  <button
-                    type="button"
-                    key={mode}
-                    role="radio"
-                    aria-checked={Boolean(prof) && resourceMode === mode}
-                    className={`profile-option ${resourceMode === mode ? "profile-option-active" : ""}`}
-                    disabled={!prof}
-                    onClick={() => setResourceMode(mode)}
-                  >
-                    <div className="profile-option-head">
-                      <strong>{titleMap[mode]}</strong>
-                      <span className="mono">{mode.toUpperCase()}</span>
-                    </div>
-                    <small className="mono">
-                      {prof
-                        ? `${prof.packet_limit === 0 ? "All packets (∞ stream)" : `${formatCompactCount(prof.packet_limit)} pkts`} · ${formatCompactCount(prof.flow_limit)} flows`
-                        : "Limits unavailable until Backend capabilities load"}
-                    </small>
-                    <small>
-                      {prof ? `RAM ${prof.parser_memory_mb} MB · Timeout ${formatDuration(prof.timeout_seconds)}` : "No estimate is shown without server data"}
-                    </small>
-                  </button>
-                );
-              })}
-            </div>
-
-            <div className="ai-layer-status-grid">
-              <div className="ai-layer-card">
-                <div className="ai-layer-card-head">
-                  <strong>Layer 1 · Offline Tier-1 + ET-BERT</strong>
-                  <span className={pillClassFromTone(layer1Status.pillTone)}>
-                    {layer1Status.badgeLabel}
-                  </span>
+          {sourceTab !== "batch" && (
+            <section className="panel options-panel">
+              <div className="upload-head">
+                <div>
+                  <div className="section-kicker">02 / RESOURCE LIMITS &amp; OPTIONAL AI</div>
+                  <h2>ควบคุม resource และโมเดลวิเคราะห์</h2>
+                  <p>เลือก Profile และเปิด/ปิด Tier-1 Sidecar หรือ Layer-2 LLM — ช่องยินยอม Consent อยู่เหนือปุ่มส่งงานด้านขวาเสมอ</p>
                 </div>
-                <small>{layer1Status.analyzeCardDetail}</small>
+                <span className="step-tag">PIPELINE</span>
               </div>
-              <div className="ai-layer-card">
-                <div className="ai-layer-card-head">
-                  <strong>Layer 2 · Optional LLM Narrator</strong>
-                  <button
-                    type="button"
-                    className="hw-action-btn"
-                    onClick={onOpenConnectionModal}
-                  >
-                    {canStartBackendAi ? "แก้ไข LLM" : "ตั้งค่า LLM"}
-                  </button>
+
+              <div className="profile-grid" role="radiogroup" aria-label="Resource execution profile">
+                {(["auto", "fast", "deep", "unlimited"] as ResourceMode[]).map((mode) => {
+                  const prof = profiles?.[mode] ?? null;
+                  const titleMap: Record<ResourceMode, string> = {
+                    auto: "Auto (Device-Adaptive)",
+                    fast: "Fast Triage",
+                    deep: "Deep Capture",
+                    unlimited: "Max Server-Bounded",
+                  };
+                  return (
+                    <button
+                      type="button"
+                      key={mode}
+                      role="radio"
+                      aria-checked={Boolean(prof) && resourceMode === mode}
+                      className={`profile-option ${resourceMode === mode ? "profile-option-active" : ""}`}
+                      disabled={!prof}
+                      onClick={() => setResourceMode(mode)}
+                    >
+                      <div className="profile-option-head">
+                        <strong>{titleMap[mode]}</strong>
+                        <span className="mono">{mode.toUpperCase()}</span>
+                      </div>
+                      <small className="mono">
+                        {prof
+                          ? `${prof.packet_limit === 0 ? "All packets (∞ stream)" : `${formatCompactCount(prof.packet_limit)} pkts`} · ${formatCompactCount(prof.flow_limit)} flows`
+                          : "Limits unavailable until Backend capabilities load"}
+                      </small>
+                      <small>
+                        {prof ? `RAM ${prof.parser_memory_mb} MB · Timeout ${formatDuration(prof.timeout_seconds)}` : "No estimate is shown without server data"}
+                      </small>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="ai-layer-status-grid">
+                <div className="ai-layer-card">
+                  <div className="ai-layer-card-head">
+                    <strong>Layer 1 · Offline Tier-1 + ET-BERT</strong>
+                    <span className={pillClassFromTone(layer1Status.pillTone)}>
+                      {layer1Status.badgeLabel}
+                    </span>
+                  </div>
+                  <small>{layer1Status.analyzeCardDetail}</small>
                 </div>
-                <small>
-                  {canStartBackendAi
-                    ? `พร้อมใช้งาน: ${aiConfig?.configuration.provider} (${aiConfig?.configuration.model})`
-                    : connectionStatus === "connected" && aiConfig && !aiConfig.configuration.enabled
-                      ? "Layer-2 AI ถูกปิดโดยผู้ดูแล (ai.enabled = false) — คลิกเปิดใช้งานด้านล่างหรือใน Workspace & Settings"
-                      : connectionStatus === "connected" && aiConfig?.configuration.enabled
-                        ? `เปิดใช้งานโดยค่าเริ่มต้น (${aiConfig.configuration.provider}) — เลือก Model หรือกด Detect Models เพื่อเริ่มใช้งาน`
-                        : "Standby — เชื่อมต่อ Backend แล้วเลือกโมเดล Local Ollama หรือ API Endpoint เมื่อต้องการสรุปรายงาน"}
-                </small>
-                {connectionStatus === "connected" && !canStartBackendAi && (
-                  <div className="ai-quick-models">
-                    {aiConfig && !aiConfig.configuration.enabled ? (
-                      <button
-                        type="button"
-                        className="ai-model-chip"
-                        disabled={quickAiBusy}
-                        onClick={() => void handleQuickEnableAi()}
-                      >
-                        <Icon name="spark" size={11} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
-                      </button>
-                    ) : (
-                      <>
-                        {(aiModels?.items ?? []).slice(0, 4).map((item) => (
-                          <button
-                            key={item.id}
-                            type="button"
-                            className="ai-model-chip"
-                            disabled={quickAiBusy}
-                            onClick={() => void handleQuickSelectModel(item.id)}
-                          >
-                            <Icon name="spark" size={11} /> ใช้ {item.id}
-                          </button>
-                        ))}
+                <div className="ai-layer-card">
+                  <div className="ai-layer-card-head">
+                    <strong>Layer 2 · Optional LLM Narrator</strong>
+                    <button
+                      type="button"
+                      className="hw-action-btn"
+                      onClick={() => onOpenConnectionModal("ai")}
+                    >
+                      {canStartBackendAi ? "แก้ไข LLM" : "ตั้งค่า LLM"}
+                    </button>
+                  </div>
+                  <small>
+                    {canStartBackendAi
+                      ? `พร้อมใช้งาน: ${aiConfig?.configuration.provider} (${aiConfig?.configuration.model})`
+                      : connectionStatus === "connected" && aiConfig && !aiConfig.configuration.enabled
+                        ? "Layer-2 AI ถูกปิดอยู่ (ai.enabled = false) — กดเปิดหรือวิเคราะห์แบบ Offline ได้เลย"
+                        : connectionStatus === "connected" && aiConfig?.configuration.enabled
+                          ? `เปิดใช้งานแล้ว (${aiConfig.configuration.provider}) — เลือก Model หรือกด Detect Models`
+                          : "Standby — เชื่อมต่อ Backend แล้วเลือกโมเดล Local Ollama หรือ API Endpoint"}
+                  </small>
+                  {connectionStatus === "connected" && !canStartBackendAi && (
+                    <div className="ai-quick-models">
+                      {aiConfig && !aiConfig.configuration.enabled ? (
                         <button
                           type="button"
                           className="ai-model-chip"
                           disabled={quickAiBusy}
-                          onClick={() => void handleQuickDetectModels()}
+                          onClick={() => void handleQuickEnableAi()}
                         >
-                          <Icon name="search" size={11} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
+                          <Icon name="spark" size={11} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
                         </button>
-                      </>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="option-row">
-              <div className="option-symbol intel-symbol">
-                <Icon name="nodes" size={18} />
-              </div>
-              <div className="option-copy">
-                <strong id="triage-label">Tier-1 local classifier + Pre-AI Compactor</strong>
-                <span id="triage-help">
-                  ใช้ local heuristic เมื่อเปิดใช้; network endpoint แยก consent ต่อ analysis และไม่เปิดโดยปริยาย
-                </span>
-              </div>
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  aria-labelledby="triage-label"
-                  aria-describedby="triage-help"
-                  checked={triageEnabled}
-                  onChange={(e) => setTriageEnabled(e.target.checked)}
-                />
-                <span />
-              </label>
-            </div>
-
-            {triageEnabled && triageEndpointConfigured && (
-              <div className="ai-config-callout">
-                <div className="consent-required">
-                  <strong>Tier-1 endpoint configured</strong>
-                  <span>ค่าเริ่มต้นจะไม่ส่ง network request. เมื่อยินยอม จะส่งเฉพาะ pseudonymized, allowlisted flow features ไปยัง endpoint ที่ผู้ดูแลกำหนด — ไม่ส่งไฟล์ PCAP หรือ packet payload.</span>
-                  <span className="mono">ปลายทาง: {triageEndpointTargets.join(" · ") || "configured endpoint"}</span>
-                </div>
-                <label className="consent-choice">
-                  <input
-                    type="checkbox"
-                    checked={triageEndpointConsent}
-                    onChange={(e) => setTriageEndpointConsent(e.target.checked)}
-                  />
-                  <span>ยินยอมให้ analysis นี้เรียก Tier-1 endpoint ที่กำหนดไว้</span>
-                </label>
-              </div>
-            )}
-
-            <div className="option-row option-row-last">
-              <div className="option-symbol ai-symbol">
-                <Icon name="spark" size={18} />
-              </div>
-              <div className="option-copy">
-                <strong id="ai-narrative-label">สร้าง AI-Assisted Narrative (Opt-in)</strong>
-                <span id="ai-narrative-help">
-                  {aiConfig?.configuration.enabled
-                    ? `เชื่อมต่อกับ ${aiConfig.configuration.provider} (${aiConfig.configuration.model ?? "unselected"} · boundary: ${aiConfig.configuration.data_boundary})`
-                    : "ส่งเฉพาะ Redacted Escalated Evidence Summary — ไม่ส่ง raw payload หรือ IPs จริง"}
-                </span>
-              </div>
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  aria-labelledby="ai-narrative-label"
-                  aria-describedby="ai-narrative-help"
-                  checked={aiEnabled}
-                  onChange={(e) => setAiEnabled(e.target.checked)}
-                />
-                <span />
-              </label>
-            </div>
-
-            {aiEnabled && (
-              <div className="ai-config-callout">
-                {connectionStatus === "connected" && !canStartBackendAi ? (
-                  <div className="consent-required">
-                    {aiConfig && !aiConfig.configuration.enabled ? (
-                      <>
-                        <strong>Layer-2 AI ถูกปิดอยู่บน Backend (ai.enabled = false)</strong>
-                        <span>
-                          ผู้ดูแลตั้งค่า <code>ai.enabled = false</code> — กดเปิดใช้งานทันทีหรือตั้งค่า Provider ใน Workspace &amp; Settings (Layer-1 deterministic detectors และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ)
-                        </span>
-                        <div className="consent-cta">
+                      ) : (
+                        <>
+                          {(aiModels?.items ?? []).slice(0, 4).map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              className="ai-model-chip"
+                              disabled={quickAiBusy}
+                              onClick={() => void handleQuickSelectModel(item.id)}
+                            >
+                              <Icon name="spark" size={11} /> ใช้ {item.id}
+                            </button>
+                          ))}
                           <button
                             type="button"
-                            className="primary-button tiny-btn"
-                            disabled={quickAiBusy}
-                            onClick={() => void handleQuickEnableAi()}
-                          >
-                            <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary-button tiny-btn"
-                            onClick={onOpenConnectionModal}
-                          >
-                            ตั้งค่า AI Provider
-                          </button>
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <strong>Layer-2 AI เปิดใช้งานโดยค่าเริ่มต้นแล้ว — กรุณาเลือก Model</strong>
-                        <span>
-                          Backend เปิด <code>ai.enabled = true</code> โดยปริยายแล้ว แต่ยังไม่ได้เลือก <code>ai.model</code> — คลิกเลือกโมเดลที่พบหรือกด Detect Models ด้านล่าง (Layer-1 และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ)
-                        </span>
-                        {aiModels && aiModels.items.length > 0 && (
-                          <div className="ai-quick-models">
-                            {aiModels.items.slice(0, 6).map((item) => (
-                              <button
-                                key={item.id}
-                                type="button"
-                                className="ai-model-chip"
-                                disabled={quickAiBusy}
-                                onClick={() => void handleQuickSelectModel(item.id)}
-                              >
-                                <Icon name="spark" size={11} /> {item.id}
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                        <div className="consent-cta">
-                          <button
-                            type="button"
-                            className="primary-button tiny-btn"
+                            className="ai-model-chip"
                             disabled={quickAiBusy}
                             onClick={() => void handleQuickDetectModels()}
                           >
-                            <Icon name="search" size={13} /> {quickAiBusy ? "กำลังตรวจจับ…" : "Detect Models"}
+                            <Icon name="search" size={11} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
                           </button>
-                          <button
-                            type="button"
-                            className="secondary-button tiny-btn"
-                            onClick={onOpenConnectionModal}
-                          >
-                            ตั้งค่า AI Provider
-                          </button>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                ) : (
-                  <>
-                    <div className="ai-meta-grid mono">
-                      <span>Provider: {aiConfig?.configuration.provider ?? "server-configured"}</span>
-                      <span>Model: {aiConfig?.configuration.model ?? "server PCAP_AI_MODEL"}</span>
-                      <span>
-                        Context Budget: {aiConfig?.configuration.context_window_tokens ?? "unreported"} tok /{" "}
-                        {aiConfig?.configuration.input_max_bytes ? formatBytes(aiConfig.configuration.input_max_bytes) : "unreported"}
-                      </span>
-                      {aiModels && <span>Discovered models: {aiModels.items.length}</span>}
+                        </>
+                      )}
                     </div>
-                    <label className="consent-choice">
-                      <input
-                        type="checkbox"
-                        checked={aiConsent}
-                        onChange={(e) => setAiConsent(e.target.checked)}
-                      />
-                      <span>
-                        ยืนยันส่งเฉพาะ Redacted &amp; Tier-1 Compacted Evidence Summary ไปยัง endpoint (
-                        {aiConfig?.configuration.data_boundary ?? "configured boundary"})
-                      </span>
-                    </label>
-                  </>
-                )}
+                  )}
+                </div>
               </div>
-            )}
-          </section>
+
+              <div className="option-row">
+                <div className="option-symbol intel-symbol">
+                  <Icon name="nodes" size={18} />
+                </div>
+                <div className="option-copy">
+                  <strong id="triage-label">Tier-1 Classifier + Pre-AI Compactor</strong>
+                  <span id="triage-help">
+                    ใช้ local heuristic / .bin อัตโนมัติ; ถ้าเปิด Tier-1 sidecar ต้องติ๊กยินยอมก่อนเรียก endpoint
+                  </span>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    aria-labelledby="triage-label"
+                    aria-describedby="triage-help"
+                    checked={triageEnabled}
+                    onChange={(e) => setTriageEnabled(e.target.checked)}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              {triageEnabled && triageEndpointConfigured && (
+                <div className="ai-config-callout">
+                  <div className="consent-required">
+                    <strong>Tier-1 Sidecar endpoint configured</strong>
+                    <span>ส่งเฉพาะ pseudonymized flow features เมื่อยินยอม — ไม่ส่ง PCAP หรือ payload ({triageEndpointTargets.join(" · ") || "configured endpoint"})</span>
+                  </div>
+                  <label className="consent-choice">
+                    <input
+                      type="checkbox"
+                      checked={triageEndpointConsent}
+                      onChange={(e) => setTriageEndpointConsent(e.target.checked)}
+                    />
+                    <span>ยินยอมให้ analysis นี้เรียก Tier-1 Sidecar endpoint</span>
+                  </label>
+                </div>
+              )}
+
+              <div className="option-row option-row-last">
+                <div className="option-symbol ai-symbol">
+                  <Icon name="spark" size={18} />
+                </div>
+                <div className="option-copy">
+                  <strong id="ai-narrative-label">สร้าง AI-Assisted Narrative (Opt-in)</strong>
+                  <span id="ai-narrative-help">
+                    {aiConfig?.configuration.enabled
+                      ? `เชื่อมต่อกับ ${aiConfig.configuration.provider} (${aiConfig.configuration.model ?? "unselected"} · boundary: ${aiConfig.configuration.data_boundary})`
+                      : "ส่งเฉพาะ Redacted Escalated Evidence Summary — ไม่ส่ง raw payload หรือ IPs จริง"}
+                  </span>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    aria-labelledby="ai-narrative-label"
+                    aria-describedby="ai-narrative-help"
+                    checked={aiEnabled}
+                    onChange={(e) => setAiEnabled(e.target.checked)}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              {aiEnabled && (
+                <div className="ai-config-callout">
+                  {connectionStatus === "connected" && !canStartBackendAi ? (
+                    <div className="consent-required">
+                      {aiConfig && !aiConfig.configuration.enabled ? (
+                        <>
+                          <strong>Layer-2 AI ถูกปิดอยู่บน Backend (ai.enabled = false)</strong>
+                          <span>
+                            กดเปิดใช้งานทันทีหรือตั้งค่า Model ใน Settings — หรือปิดสวิตช์ LLM เพื่อใช้เฉพาะ Offline Tier-1
+                          </span>
+                          <div className="consent-cta">
+                            <button
+                              type="button"
+                              className="primary-button tiny-btn"
+                              disabled={quickAiBusy}
+                              onClick={() => void handleQuickEnableAi()}
+                            >
+                              <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button tiny-btn"
+                              onClick={() => onOpenConnectionModal("ai")}
+                            >
+                              ตั้งค่า AI Provider
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <strong>กรุณาเลือก Layer-2 Model</strong>
+                          <span>คลิกเลือกโมเดลที่พบหรือกด Detect Models ด้านล่าง</span>
+                          {aiModels && aiModels.items.length > 0 && (
+                            <div className="ai-quick-models">
+                              {aiModels.items.slice(0, 6).map((item) => (
+                                <button
+                                  key={item.id}
+                                  type="button"
+                                  className="ai-model-chip"
+                                  disabled={quickAiBusy}
+                                  onClick={() => void handleQuickSelectModel(item.id)}
+                                >
+                                  <Icon name="spark" size={11} /> {item.id}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          <div className="consent-cta">
+                            <button
+                              type="button"
+                              className="primary-button tiny-btn"
+                              disabled={quickAiBusy}
+                              onClick={() => void handleQuickDetectModels()}
+                            >
+                              <Icon name="search" size={13} /> {quickAiBusy ? "กำลังตรวจจับ…" : "Detect Models"}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button tiny-btn"
+                              onClick={() => onOpenConnectionModal("ai")}
+                            >
+                              ตั้งค่า AI Provider
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="ai-meta-grid mono">
+                        <span>Provider: {aiConfig?.configuration.provider ?? "server-configured"}</span>
+                        <span>Model: {aiConfig?.configuration.model ?? "server PCAP_AI_MODEL"}</span>
+                        <span>
+                          Budget: {aiConfig?.configuration.context_window_tokens ?? "unreported"} tok /{" "}
+                          {aiConfig?.configuration.input_max_bytes ? formatBytes(aiConfig.configuration.input_max_bytes) : "unreported"}
+                        </span>
+                      </div>
+                      <label className="consent-choice">
+                        <input
+                          type="checkbox"
+                          checked={aiConsent}
+                          onChange={(e) => setAiConsent(e.target.checked)}
+                        />
+                        <span>
+                          ยืนยันส่งเฉพาะ Redacted &amp; Tier-1 Compacted Evidence Summary ไปยัง endpoint (
+                          {aiConfig?.configuration.data_boundary ?? "configured boundary"})
+                        </span>
+                      </label>
+                    </>
+                  )}
+                </div>
+              )}
+            </section>
+          )}
         </div>
 
         <aside className="panel run-summary">
           <div className="summary-kicker">ACTIVE EXECUTION PLAN</div>
-          <h2>{activeProfile ? `${resourceMode.toUpperCase()} Profile` : "Resource limits unavailable"}</h2>
-          <p className="summary-description">Pipeline แบบ Asynchronous + Streaming Priority Eviction</p>
+          <h2>
+            {sourceTab === "batch"
+              ? "Batch Safe Intake"
+              : activeProfile
+                ? `${resourceMode.toUpperCase()} Profile`
+                : "Resource limits unavailable"}
+          </h2>
+          <p className="summary-description">
+            {sourceTab === "batch"
+              ? "แต่ละไฟล์สร้าง analysis job แยกกันอัตโนมัติ (Offline Tier-1 + Auto profile)"
+              : "Pipeline แบบ Asynchronous + Streaming Priority Eviction"}
+          </p>
           <div className="profile-stage-list">
             <div>
               <span className="profile-index">01</span>
@@ -3497,7 +3902,7 @@ function AnalyzePage({
               <span>
                 {activeProfile
                   ? activeProfile.packet_limit === 0 ? "∞ Streaming TShark/CSV" : `≤ ${formatCompactCount(activeProfile.packet_limit)} pkts`
-                  : "Packet limit unavailable until Backend capabilities load"}
+                  : "Packet limit pending Backend"}
               </span>
               <span className="profile-required">STREAM</span>
             </div>
@@ -3506,17 +3911,15 @@ function AnalyzePage({
               <span>L2–L7 Detectors (ARP/DNS/TLS/TCP)</span>
               <span className="profile-required">REQUIRED</span>
             </div>
-            <div>
+            <div title={consentState.stage04Note}>
               <span className="profile-index">04</span>
-              <span>Tier-1 local heuristics / optional endpoint</span>
-              <span className={triageEnabled ? "profile-required" : "profile-optional"}>
-                {triageEnabled ? "ON" : "OFF"}
-              </span>
+              <span>Tier-1 ({consentState.stage04Note})</span>
+              <span className={`profile-${consentState.stage04Tone}`}>{consentState.stage04Label}</span>
             </div>
-            <div>
+            <div title={consentState.stage05Note}>
               <span className="profile-index">05</span>
-              <span>AI Summary (Pack ≤ Budget)</span>
-              <span className="profile-optional">{aiEnabled && aiConsent ? "OPT-IN" : "OFF"}</span>
+              <span>AI Summary ({consentState.stage05Note})</span>
+              <span className={`profile-${consentState.stage05Tone}`}>{consentState.stage05Label}</span>
             </div>
           </div>
 
@@ -3532,7 +3935,15 @@ function AnalyzePage({
             </div>
           </div>
 
-          {sourceTab === "upload" && selectedFile ? (
+          {sourceTab !== "batch" && (
+            <div ref={consentSummaryRef}>
+              {renderInlineConsentCard("summary")}
+            </div>
+          )}
+
+          {sourceTab === "batch" ? (
+            <div className="empty-state">ส่งไฟล์ได้โดยตรงในแท็บ Batch Intake ด้านซ้าย</div>
+          ) : sourceTab === "upload" && selectedFile ? (
             isCsvSelected ? (
               <button
                 type="button"
@@ -3545,21 +3956,29 @@ function AnalyzePage({
             ) : (
               <button
                 type="button"
-                className="primary-button full-button"
-                disabled={isSubmitting}
+                className={
+                  consentState.submitBlockedReason !== "none"
+                    ? "primary-button full-button btn-needs-consent"
+                    : "primary-button full-button"
+                }
+                disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
                 onClick={onUploadAndAnalyze}
               >
-                <Icon name="upload" size={15} /> Upload &amp; Queue Job
+                <Icon name="upload" size={15} /> {binarySubmitLabel}
               </button>
             )
-          ) : sourceTab === "local" && localPathInput.trim() ? (
+          ) : sourceTab === "local" && (localPathInput.trim() || hasLocalFileGrant) ? (
             <button
               type="button"
-              className="primary-button full-button"
+              className={
+                consentState.submitBlockedReason !== "none"
+                  ? "primary-button full-button btn-needs-consent"
+                  : "primary-button full-button"
+              }
               disabled={isSubmitting}
               onClick={onRegisterLocalCapture}
             >
-              <Icon name="play" size={15} /> Analyze Local Capture
+              <Icon name="play" size={15} /> {localSubmitLabel}
             </button>
           ) : (
             <div className="empty-state">เลือก capture จริงก่อนเริ่มวิเคราะห์</div>
@@ -4505,7 +4924,7 @@ function ReportsPage({
   onChat: (question: string, consent: boolean) => Promise<GroundedChatResponse>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
-  onOpenConnectionModal: () => void;
+  onOpenConnectionModal: (tab?: SettingsTab) => void;
 }) {
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   const aiActive = report.ai?.state === "completed" && Boolean(report.ai.report);
@@ -4514,6 +4933,8 @@ function ReportsPage({
   const aiBackendReady = Boolean(aiBackendEnabled && aiBackendModel);
   const [privacyMode, setPrivacyMode] = useState(false);
   const redactor = useMemo(() => new PrivacyRedactor(privacyMode), [privacyMode]);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const [chatQuestion, setChatQuestion] = useState("");
   const [chatConsent, setChatConsent] = useState(false);
   const [chatPending, setChatPending] = useState(false);
@@ -4522,6 +4943,24 @@ function ReportsPage({
   const [quickModelInput, setQuickModelInput] = useState("");
   const [quickAiBusy, setQuickAiBusy] = useState(false);
   const chatTargetId = useRef(report.analysisId);
+
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const onPointerDown = (ev: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(ev.target as Node)) {
+        setExportMenuOpen(false);
+      }
+    };
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setExportMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [exportMenuOpen]);
 
   const handleQuickEnableAi = async () => {
     if (quickAiBusy) return;
@@ -4597,8 +5036,24 @@ function ReportsPage({
     }
   };
 
+  const triggerExport = (
+    kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
+  ) => {
+    setExportMenuOpen(false);
+    onExport(kind);
+  };
+
   const mitreTechniques = report.rawBundle?.mitre_attack?.techniques ?? [];
   const carvedArtifacts = report.rawBundle?.artifacts ?? [];
+  const chatDisabledReason = !connected
+    ? "ต้องเชื่อมต่อ Backend ก่อนใช้งาน Grounded Chat"
+    : aiConfig && !aiBackendReady
+      ? "กรุณาเปิดใช้งานและเลือก Layer-2 Model ด้านบนก่อนถาม"
+      : !chatQuestion.trim()
+        ? "พิมพ์คำถามที่ต้องการถามจาก evidence ของรายงานนี้"
+        : !chatConsent
+          ? "ติ๊กช่องยืนยัน consent ด้านบนเพื่อส่งคำถามรอบนี้"
+          : "";
 
   return (
     <>
@@ -4616,34 +5071,57 @@ function ReportsPage({
             >
               <Icon name="shield" size={15} /> {privacyMode ? "Privacy Redaction: ON" : "Privacy Redaction: OFF"}
             </button>
-            <button type="button" className="secondary-button" onClick={() => onExport("triage-jsonl")}>
-              <Icon name="download" size={15} /> Export JSONL
-            </button>
-            <button type="button" className="secondary-button" onClick={() => onExport("markdown")}>
-              <Icon name="download" size={15} /> Export MD
-            </button>
             {report.origin === "live" && (
-              <>
-                <button type="button" className="secondary-button" onClick={() => onExport("pdf")}>
-                  <Icon name="download" size={15} /> Export PDF
-                </button>
-                <button type="button" className="secondary-button" onClick={() => onExport("csv")}>
-                  <Icon name="download" size={15} /> Export CSV
-                </button>
-                <button type="button" className="secondary-button" onClick={() => onExport("cef")}>
-                  <Icon name="download" size={15} /> Export CEF
-                </button>
-                <button type="button" className="secondary-button" onClick={() => onExport("navigator")}>
-                  <Icon name="download" size={15} /> ATT&amp;CK Navigator
-                </button>
-                <button type="button" className="secondary-button" onClick={() => onExport("stix")}>
-                  <Icon name="download" size={15} /> Export STIX 2.1
-                </button>
-              </>
+              <button type="button" className="secondary-button" onClick={() => triggerExport("pdf")}>
+                <Icon name="download" size={15} /> Export PDF
+              </button>
             )}
-            <button type="button" className="primary-button" onClick={() => onExport("json")}>
+            <button type="button" className="primary-button" onClick={() => triggerExport("json")}>
               <Icon name="download" size={15} /> Export JSON
             </button>
+            <div className="export-menu-wrap" ref={exportMenuRef}>
+              <button
+                type="button"
+                className="secondary-button"
+                aria-expanded={exportMenuOpen}
+                aria-haspopup="menu"
+                onClick={() => setExportMenuOpen((v) => !v)}
+              >
+                More Formats <Icon name="chevron" size={13} />
+              </button>
+              {exportMenuOpen && (
+                <div className="export-dropdown" role="menu" aria-label="Additional export formats">
+                  <button type="button" role="menuitem" onClick={() => triggerExport("markdown")}>
+                    <span>Markdown Report</span>
+                    <small>.md</small>
+                  </button>
+                  <button type="button" role="menuitem" onClick={() => triggerExport("triage-jsonl")}>
+                    <span>Tier-1 Evidence</span>
+                    <small>.jsonl</small>
+                  </button>
+                  {report.origin === "live" && (
+                    <>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("csv")}>
+                        <span>Findings &amp; Flows</span>
+                        <small>.csv</small>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("cef")}>
+                        <span>SIEM Syslog</span>
+                        <small>.cef</small>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("navigator")}>
+                        <span>ATT&amp;CK Navigator</span>
+                        <small>.json</small>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("stix")}>
+                        <span>STIX 2.1 Bundle</span>
+                        <small>.stix</small>
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         }
       />
@@ -4873,52 +5351,19 @@ function ReportsPage({
                   {report.ai?.error_code
                     ? `Layer-2 AI narrative ถูกข้ามด้วย fallback (${report.ai.error_code}) — deterministic findings และ Layer-1 Tier-1 triage ยังอยู่ครบ`
                     : connected && aiConfig && !aiBackendEnabled
-                      ? "Layer-2 AI ถูกปิดอยู่ (ai.enabled = false) — คลิกเปิดใช้งานด้านขวา หรือดู deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"
+                      ? "Layer-2 AI ถูกปิดอยู่ (ai.enabled = false) — deterministic findings และ export ใช้งานได้ตามปกติ"
                       : connected && aiBackendEnabled && !aiBackendModel
-                        ? `Layer-2 AI เปิดใช้งานโดยค่าเริ่มต้นแล้ว (${aiConfig?.configuration.provider}) — เลือกโมเดลเพื่อเปิดใช้สรุปรายงานถัดไปและ Grounded Chat`
+                        ? `Layer-2 AI เปิดใช้งานแล้ว (${aiConfig?.configuration.provider}) — เลือกโมเดลใน Grounded Chat ด้านล่างหรือ Settings`
                         : connected && aiBackendReady
-                          ? `รอบนี้ไม่ได้ขอ AI narrative ตอนส่งงาน (${aiConfig?.configuration.provider}: ${aiBackendModel} พร้อมใช้งาน) — ถาม AI จาก evidence ด้านล่างได้ทันที`
+                          ? `รอบนี้ไม่ได้เปิด AI narrative ตอนส่งงาน (${aiConfig?.configuration.provider}: ${aiBackendModel} พร้อมใช้งาน) — ถาม AI จาก evidence ด้านล่างได้ทันที`
                           : "Layer-2 AI narrative ยังไม่ถูกสร้างในรอบนี้ — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
                 </span>
                 <div className="ai-disabled-actions">
-                  {connected && aiConfig && !aiBackendEnabled && (
-                    <button
-                      type="button"
-                      className="primary-button tiny-btn"
-                      disabled={quickAiBusy}
-                      onClick={() => void handleQuickEnableAi()}
-                    >
-                      <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
-                    </button>
-                  )}
-                  {connected && aiBackendEnabled && !aiBackendModel && (
-                    <>
-                      {(aiModels?.items ?? []).slice(0, 3).map((item) => (
-                        <button
-                          key={item.id}
-                          type="button"
-                          className="ai-model-chip"
-                          disabled={quickAiBusy}
-                          onClick={() => void handleQuickSelectModel(item.id)}
-                        >
-                          <Icon name="spark" size={11} /> ใช้ {item.id}
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        className="secondary-button tiny-btn"
-                        disabled={quickAiBusy}
-                        onClick={() => void handleQuickDetectModels()}
-                      >
-                        <Icon name="search" size={12} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
-                      </button>
-                    </>
-                  )}
-                  <button type="button" className="secondary-button tiny-btn" onClick={onOpenConnectionModal}>
-                    <Icon name="spark" size={13} /> ตั้งค่า AI Provider
+                  <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
+                    <Icon name="spark" size={13} /> ตั้งค่า AI &amp; Models
                   </button>
                   <button type="button" className="text-button" onClick={() => onNavigate("analyze")}>
-                    ดูตัวเลือก <Icon name="arrow" size={14} />
+                    ไปหน้าวิเคราะห์ <Icon name="arrow" size={14} />
                   </button>
                 </div>
               </div>
@@ -4950,7 +5395,7 @@ function ReportsPage({
                       <div>
                         <strong>Layer-2 AI ถูกปิดอยู่ (ai.enabled = false)</strong>
                         <p style={{ margin: "3px 0 0" }}>
-                          ผู้ดูแลปิด Layer-2 AI ไว้ — กดเปิดใช้งานทันทีด้านล่างหรือปรับแต่งใน Workspace &amp; Settings
+                          เปิดใช้งาน Layer-2 AI เพื่อถามคำถามแบบ grounded กับ evidence ของรายงานนี้
                         </p>
                       </div>
                     </div>
@@ -4963,8 +5408,8 @@ function ReportsPage({
                       >
                         <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
                       </button>
-                      <button type="button" className="secondary-button tiny-btn" onClick={onOpenConnectionModal}>
-                        ตั้งค่า AI Provider
+                      <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
+                        ตั้งค่า AI &amp; Models
                       </button>
                     </div>
                   </div>
@@ -4972,8 +5417,8 @@ function ReportsPage({
                 {connected && aiConfig && aiBackendEnabled && !aiBackendModel && (
                   <div className="ai-chat-status-strip">
                     <div>
-                      <strong>Layer-2 AI เปิดใช้งานโดยค่าเริ่มต้นแล้ว ({aiConfig.configuration.provider})</strong>
-                      {" — กรุณาเลือกหรือระบุ Model ด้านล่างก่อนส่งคำถาม"}
+                      <strong>Layer-2 AI เปิดใช้งานแล้ว ({aiConfig.configuration.provider})</strong>
+                      {" — เลือกหรือระบุ Model ด้านล่างเพื่อเปิดใช้ Grounded Chat"}
                     </div>
                     {aiModels && aiModels.items.length > 0 && (
                       <div className="ai-quick-models">
@@ -5015,7 +5460,7 @@ function ReportsPage({
                       >
                         <Icon name="search" size={12} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
                       </button>
-                      <button type="button" className="text-button" onClick={onOpenConnectionModal}>
+                      <button type="button" className="text-button" onClick={() => onOpenConnectionModal("ai")}>
                         ตั้งค่า AI Provider
                       </button>
                     </div>
@@ -5054,13 +5499,16 @@ function ReportsPage({
                     I consent to send this question and the privacy-filtered evidence to the configured AI provider for this turn.
                   </label>
                   {chatError && <p role="alert" className="grounded-chat-error">{chatError}</p>}
-                  <button
-                    type="submit"
-                    className="primary-button"
-                    disabled={chatPending || !chatQuestion.trim() || !chatConsent || (connected && Boolean(aiConfig) && !aiBackendReady)}
-                  >
-                    {chatPending ? "Analyzing evidence…" : "Ask grounded AI"}
-                  </button>
+                  <div className="chat-submit-row">
+                    <button
+                      type="submit"
+                      className="primary-button"
+                      disabled={chatPending || !chatQuestion.trim() || !chatConsent || (connected && Boolean(aiConfig) && !aiBackendReady)}
+                    >
+                      {chatPending ? "Analyzing evidence…" : "Ask grounded AI"}
+                    </button>
+                    {chatDisabledReason && <small className="chat-helper-hint">{chatDisabledReason}</small>}
+                  </div>
                 </form>
               </>
             )}

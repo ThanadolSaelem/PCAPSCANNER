@@ -48,16 +48,20 @@
   .topbar-left, .topbar-right { gap: 7px; }
   .crumb { gap: 5px; font-size: 8px; }
   .crumb span { display: none; }
-  .connection-pill { padding: 4px 6px; font-size: 7px; }
+  .connection-pill { padding: 4px 8px; font-size: 7.5px; gap: 5px; }
+  .pill-divider, .pill-action { display: none; }
   .top-search, .top-avatar { display: none; }
   .top-new { min-height: 30px; gap: 5px; padding: 0 8px; font-size: 9px; }
   .main-content { padding: 12px 12px 25px; }
-  .status-banner { align-items: flex-start; margin-bottom: 16px; font-size: 8px; }
-  .status-banner > svg { margin-top: 1px; }
+  .capture-context-bar { flex-direction: column; margin-bottom: 16px; }
+  .capture-context-trigger { flex-wrap: wrap; gap: 7px 9px; padding: 9px 10px; }
+  .capture-context-cta { margin-left: auto; }
+  .capture-context-quick { flex-wrap: wrap; }
+  .context-chip-btn { min-height: 30px; }
   .page-heading { align-items: flex-start; flex-direction: column; gap: 10px; margin-bottom: 14px; }
   .page-heading h1 { font-size: 21px; }
   .page-heading p { font-size: 9px; }
-  .heading-actions { width: 100%; }
+  .heading-actions { width: 100%; flex-wrap: wrap; }
   .case-hero { min-height: 190px; align-items: flex-start; padding: 16px; }
   .hero-left { padding-right: 0; }
   .hero-topline { flex-wrap: wrap; gap: 6px; }
@@ -137,7 +141,6 @@
   .local-path-row, .model-probe-row { flex-direction: column; align-items: stretch; }
   .workspace-picker-head { flex-direction: column; }
   .triage-class-row { grid-template-columns: 110px minmax(0, 1fr) 72px; }
-  .top-connect { display: none; }
   .batch-panel { padding: 12px; }
   .batch-panel-title { flex-direction: column; }
   .batch-controls, .batch-submit-row { align-items: flex-start; }
