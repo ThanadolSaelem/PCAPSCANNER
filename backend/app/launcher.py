@@ -20,11 +20,12 @@ import webbrowser
 from pathlib import Path
 from typing import Sequence
 from urllib.error import URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from .picker import (
     default_pcapscanner_home,
+    is_loopback_client,
     load_workspace_config,
     save_workspace_config,
     truthy_env,
@@ -95,6 +96,76 @@ def probe_pcapscanner_health(port: int, *, host: str = "127.0.0.1", timeout: flo
             return isinstance(data, dict) and data.get("status") == "ok" and "api_version" in data
     except (OSError, URLError, ValueError):
         return False
+
+
+def discover_local_ollama_model(
+    base_url: str = "http://127.0.0.1:11434",
+    *,
+    timeout: float = 0.4,
+) -> str | None:
+    """Inspect a loopback Ollama server (/api/tags or /v1/models) and pick a chat model if available."""
+    parts = urlsplit(base_url.strip())
+    if parts.scheme.lower() not in {"http", "https"} or not is_loopback_client(parts.hostname):
+        return None
+    clean_base = base_url.strip().rstrip("/")
+    candidates: list[str] = []
+    for path in ("/api/tags", "/v1/models"):
+        try:
+            with urlopen(Request(f"{clean_base}{path}", headers={"Accept": "application/json"}), timeout=timeout) as resp:
+                if resp.status != 200:
+                    continue
+                payload = json.loads(resp.read(262_144).decode("utf-8"))
+        except (OSError, URLError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("models", "data"):
+            rows = payload.get(key)
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                model_id = item.get("name") or item.get("model") or item.get("id")
+                if isinstance(model_id, str) and model_id.strip():
+                    candidates.append(model_id.strip())
+        if candidates:
+            break
+    if not candidates:
+        return None
+    for model_id in candidates:
+        if "embed" not in model_id.lower():
+            return model_id
+    return candidates[0]
+
+
+def maybe_autoconfigure_local_ai(
+    child_env: dict[str, str],
+    ws_path: Path,
+    *,
+    timeout: float = 0.4,
+) -> str | None:
+    """Populate PCAP_AI_MODEL from local Ollama unless operator config/env disables or overrides AI."""
+    ai_env_raw = child_env.get("PCAP_AI_ENABLED")
+    if ai_env_raw is not None and not truthy_env(ai_env_raw):
+        return None
+    if child_env.get("PCAP_AI_CONFIG", "").strip():
+        return None
+    if child_env.get("PCAP_AI_MODEL", "").strip() or child_env.get("PCAP_AI_BASE_URL", "").strip():
+        return None
+    ws_cfg = load_workspace_config(ws_path)
+    ws_ai = ws_cfg.get("ai") if isinstance(ws_cfg.get("ai"), dict) else {}
+    if ws_ai.get("enabled") is False or ws_ai.get("model") or ws_ai.get("base_url"):
+        return None
+    provider = str(child_env.get("PCAP_AI_PROVIDER") or ws_ai.get("provider") or "openai_compatible")
+    if provider != "openai_compatible":
+        return None
+    detected = discover_local_ollama_model(timeout=timeout)
+    if not detected:
+        return None
+    child_env["PCAP_AI_MODEL"] = detected
+    child_env.setdefault("PCAP_AI_ENABLED", "1")
+    return detected
 
 
 def is_port_free(port: int, *, host: str = "127.0.0.1") -> bool:
@@ -322,7 +393,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     print("[PCAPSCANNER] Tier-1 service did not become ready in time; using built-in calibrated Tier-1 scorer.")
 
-        # 2. Backend FastAPI server
+        # 2. Layer-2 Local Ollama auto-detection (opt-out with PCAP_AI_ENABLED=0)
+        detected_ollama = maybe_autoconfigure_local_ai(child_env, ws_path)
+        if detected_ollama:
+            print(f"[PCAPSCANNER] Layer-2 Ollama model auto-selected: {detected_ollama}")
+
+        # 3. Backend FastAPI server
         print(f"[PCAPSCANNER] Starting Backend API on http://127.0.0.1:{api_port} ...")
         api_proc = subprocess.Popen(
             [

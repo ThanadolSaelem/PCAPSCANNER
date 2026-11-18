@@ -167,6 +167,79 @@ class LauncherUnitTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_discover_local_ollama_model_and_autoconfigure_respect_opt_out(self) -> None:
+        class _OllamaHandler(BaseHTTPRequestHandler):
+            mode = "tags"
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.mode == "tags" and self.path == "/api/tags":
+                    body = json.dumps(
+                        {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:7b"}]}
+                    ).encode("utf-8")
+                    self.send_response(200)
+                elif self.mode == "v1" and self.path == "/v1/models":
+                    body = json.dumps({"data": [{"id": "llama3.2:latest"}]}).encode("utf-8")
+                    self.send_response(200)
+                else:
+                    body = b"{}"
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        # Reject non-loopback endpoint without attempting remote network call
+        self.assertIsNone(launcher.discover_local_ollama_model("http://8.8.8.8:11434", timeout=0.2))
+
+        server = HTTPServer(("127.0.0.1", 0), _OllamaHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            self.assertEqual(launcher.discover_local_ollama_model(base, timeout=1.0), "qwen2.5:7b")
+
+            _OllamaHandler.mode = "v1"
+            self.assertEqual(launcher.discover_local_ollama_model(base, timeout=1.0), "llama3.2:latest")
+
+            with tempfile.TemporaryDirectory() as tmp:
+                ws_path = Path(tmp) / "workspace.json"
+                with mock.patch.object(
+                    launcher,
+                    "discover_local_ollama_model",
+                    return_value="qwen2.5:7b",
+                ):
+                    env: dict[str, str] = {}
+                    picked = launcher.maybe_autoconfigure_local_ai(env, ws_path)
+                    self.assertEqual(picked, "qwen2.5:7b")
+                    self.assertEqual(env["PCAP_AI_MODEL"], "qwen2.5:7b")
+                    self.assertEqual(env["PCAP_AI_ENABLED"], "1")
+
+                    # Respect operator opt-out via PCAP_AI_ENABLED=0
+                    env_off = {"PCAP_AI_ENABLED": "0"}
+                    self.assertIsNone(launcher.maybe_autoconfigure_local_ai(env_off, ws_path))
+                    self.assertNotIn("PCAP_AI_MODEL", env_off)
+
+                    # Respect explicit PCAP_AI_MODEL
+                    env_set = {"PCAP_AI_MODEL": "custom-model"}
+                    self.assertIsNone(launcher.maybe_autoconfigure_local_ai(env_set, ws_path))
+                    self.assertEqual(env_set["PCAP_AI_MODEL"], "custom-model")
+
+                    # Respect workspace.json ai.enabled=false
+                    ws_path.write_text(json.dumps({"ai": {"enabled": False}}), encoding="utf-8")
+                    env_ws_off: dict[str, str] = {}
+                    self.assertIsNone(launcher.maybe_autoconfigure_local_ai(env_ws_off, ws_path))
+                    self.assertNotIn("PCAP_AI_MODEL", env_ws_off)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Closed loopback port returns None cleanly
+        self.assertIsNone(launcher.discover_local_ollama_model(f"http://127.0.0.1:{port}", timeout=0.2))
+
 
 @unittest.skipUnless(HAS_PYDANTIC_V2, "requires pydantic>=2 + fastapi TestClient")
 class WorkspaceApiAndSpaTests(unittest.TestCase):

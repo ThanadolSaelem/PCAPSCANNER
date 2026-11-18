@@ -116,11 +116,44 @@ async def test_disabled_never_calls_transport():
         called = True
         return httpx.Response(500)
 
-    disabled = AppSettings()
+    disabled = AppSettings(ai=AIConfig(enabled=False))
     result = await generate_summary(bundle(), disabled, transport=httpx.MockTransport(handler))
     assert result.state == "disabled"
     assert result.report is None
     assert called is False
+
+
+def test_ai_enabled_by_default_with_local_ollama_defaults_and_opt_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = AIConfig()
+    assert cfg.enabled is True
+    assert cfg.provider == "openai_compatible"
+    assert cfg.data_boundary == "local"
+    assert cfg.allowed_origins == [ORIGIN]
+    assert cfg.model is None
+
+    with_model = AIConfig(model="qwen2.5:7b")
+    assert with_model.enabled is True
+    assert with_model.data_boundary == "local"
+    assert with_model.allowed_origins == [ORIGIN]
+
+    monkeypatch.delenv("PCAP_AI_CONFIG", raising=False)
+    monkeypatch.delenv("PCAP_AI_ENABLED", raising=False)
+    monkeypatch.delenv("PCAP_WORKSPACE_CONFIG", raising=False)
+    monkeypatch.delenv("PCAP_ENABLE_NATIVE_PICKER", raising=False)
+    monkeypatch.delenv("PCAP_USE_WORKSPACE_CONFIG", raising=False)
+    monkeypatch.setenv("PCAP_DATA_DIR", str(tmp_path / "data"))
+    loaded_default = load_settings()
+    assert loaded_default.ai.enabled is True
+    assert loaded_default.ai.data_boundary == "local"
+    assert loaded_default.ai.allowed_origins == [ORIGIN]
+
+    monkeypatch.setenv("PCAP_AI_ENABLED", "0")
+    loaded_opt_out = load_settings()
+    assert loaded_opt_out.ai.enabled is False
+
+    # Custom endpoint still fails closed without explicit allowed_origins.
+    with pytest.raises(ValidationError):
+        AIConfig(base_url="https://api.example/v1")
 
 
 @pytest.mark.asyncio

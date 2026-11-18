@@ -124,7 +124,7 @@ Adapters ที่ implement:
 - `openai_compatible`: ใช้ `/v1/chat/completions` และ `/v1/models`; เหมาะกับ OpenAI-compatible gateway, Ollama และ LM Studio ที่รองรับ request shape ที่เลือก
 - `anthropic`: native `/v1/messages`, `x-api-key`, version header และ native structured-output format. ไม่แปลงเป็น OpenAI shim และไม่ hardcode model list
 
-ตัวอย่าง local อยู่ใน `backend/examples/ai-config.example.yaml`; remote อยู่ใน `backend/examples/ai-config.remote.example.yaml`. ปิดไว้โดยปริยายและ `model: null` เพราะ model IDs เปลี่ยนได้ ต้องเลือกจาก catalog/เอกสาร provider ของ environment จริง
+ตัวอย่าง local อยู่ใน `backend/examples/ai-config.example.yaml`; remote อยู่ใน `backend/examples/ai-config.remote.example.yaml`. AI เปิดไว้โดยปริยาย (`enabled: true` พร้อม local Ollama boundary และเลือก model อัตโนมัติเมื่อ launcher พบ Ollama บนเครื่อง) และตั้ง `model: null` เมื่อยังไม่ระบุ model เพราะ model IDs เปลี่ยนได้ — ปิดได้ด้วย `PCAP_AI_ENABLED=0` หรือ `enabled: false`
 
 ตัวอย่าง non-secret profile:
 
@@ -154,14 +154,14 @@ max_output_tokens: 2048
 ```bash
 export PCAP_AI_API_KEY='SET_SECURELY_IN_YOUR_OWN_TERMINAL_OR_SECRET_MANAGER'
 # ตัวอย่าง overrides โดยไม่แก้ไฟล์ profile
-export PCAP_AI_ENABLED=1
+export PCAP_AI_ENABLED=1   # ใช้ 0 เมื่อต้องการปิด AI
 export PCAP_AI_MODEL='MODEL_ID_FROM_YOUR_PROVIDER'
 export PCAP_AI_TOKEN_PARAMETER=max_completion_tokens
 ```
 
-ลำดับ precedence คือ defaults → `PCAP_AI_CONFIG` JSON/YAML → ENV. รายการ ENV ที่รองรับอยู่ใน `backend/app/config.py`; ครอบคลุม provider/base URL/allowed origins/model/timeout/retries/context/output/token field/response mode/temperature/API-key ENV reference และ nested aliases `PCAP_AI__...`. การเปลี่ยนไฟล์/ENV ต้อง restart API และ narrator ให้ใช้ fingerprint เดียวกัน; ไม่ hot-reload secret หรือรับ endpoint URL จาก request/capture
+ลำดับ precedence คือ defaults → `PCAP_AI_CONFIG` JSON/YAML → ENV. รายการ ENV ที่รองรับอยู่ใน `backend/app/config.py`; ครอบคลุม provider/base URL/allowed origins/model/timeout/retries/context/output/token field/response mode/temperature/API-key ENV reference และ nested aliases `PCAP_AI__...`. การปรับค่า non-secret ทำผ่าน `PUT /api/v1/ai/config` จาก loopback ได้ทันทีและบันทึกใน `workspace.json` เมื่อเปิดใช้งาน; ไม่ hot-reload secret หรือรับ endpoint URL จาก request/capture
 
-อ่าน non-secret config ด้วย `GET /api/v1/ai/config`, schema ด้วย `/ai/config/schema`, catalog ด้วย `/ai/models`. ต้องเปิด AI config เพื่อ discovery แต่ยังไม่จำเป็นต้องกำหนด model. ผล catalog ว่างมี state `disabled` หรือ `unavailable_or_empty` ไม่ได้แปลว่า provider ไม่มี model
+อ่าน non-secret config ด้วย `GET /api/v1/ai/config`, schema ด้วย `/ai/config/schema`, catalog ด้วย `/ai/models`. AI เปิดใช้งานโดยปริยาย (ยังต้องกำหนด model หรือปล่อยให้ launcher เลือกจาก local Ollama และต้องยินยอมต่อ analysis/turn จึงส่งข้อมูลออก). ผล catalog ว่างมี state `disabled` หรือ `unavailable_or_empty` ไม่ได้แปลว่า provider ไม่มี model
 
 ### Model compatibility และ context
 

@@ -259,6 +259,28 @@
 }
 .ai-layer-card-head strong { color: #d5e2eb; font-size: 9px; }
 .ai-layer-card small { display: block; color: var(--muted); font-size: 8px; line-height: 1.45; }
+.ai-quick-models { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.ai-model-chip {
+  min-height: 25px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border: 1px solid rgba(50, 189, 209, .34);
+  border-radius: 999px;
+  color: var(--cyan-2);
+  background: rgba(50, 189, 209, .1);
+  font: 600 9px var(--mono);
+  cursor: pointer;
+  transition: background .16s var(--ease), border-color .16s var(--ease), transform .18s var(--spring);
+}
+.ai-model-chip:hover:not(:disabled) {
+  border-color: var(--cyan);
+  background: rgba(50, 189, 209, .2);
+  transform: translateY(-1px);
+}
+.ai-model-chip:disabled { opacity: .55; cursor: not-allowed; }
+.ai-model-chip:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
 
 .run-summary { position: sticky; top: 72px; }
 .summary-kicker { color: #7c91a0; font: 8px var(--mono); letter-spacing: .12em; }

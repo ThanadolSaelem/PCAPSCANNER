@@ -136,7 +136,7 @@ class AIConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", use_enum_values=True, validate_assignment=True)
 
     schema_version: Literal["1.0"] = "1.0"
-    enabled: bool = False
+    enabled: bool = True
     provider: ProviderName = ProviderName.OPENAI_COMPATIBLE
     # None means the safe local Ollama-compatible default for the compatible
     # provider, or the runtime MANUS_API_URL for the Manus adapter.
@@ -155,6 +155,25 @@ class AIConfig(BaseModel):
     response_mode: ResponseMode = "json_schema"
     temperature: float | None = Field(default=None, ge=0, le=2)
     anthropic_version: str = Field(default="2023-06-01", min_length=1, max_length=64)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_local_ollama_defaults(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        provider = data.get("provider", ProviderName.OPENAI_COMPATIBLE)
+        provider_text = provider.value if isinstance(provider, ProviderName) else str(provider)
+        if (
+            provider_text == ProviderName.OPENAI_COMPATIBLE.value
+            and "base_url" not in data
+            and "data_boundary" not in data
+            and "allowed_origins" not in data
+        ):
+            updated = dict(data)
+            updated["data_boundary"] = "local"
+            updated["allowed_origins"] = ["http://127.0.0.1:11434"]
+            return updated
+        return data
 
     @field_validator("allowed_origins")
     @classmethod

@@ -125,11 +125,47 @@ def test_queue_idempotency_and_cancel(client):
     assert client.post("/api/v1/analyses", json=body).status_code == 202
 
 
-def test_ai_opt_in_operator_and_config(client):
+def test_ai_opt_in_operator_and_config(app, client):
     cid = upload(client)
+    cfg = client.get("/api/v1/ai/config")
+    assert cfg.status_code == 200
+    assert TOKEN not in cfg.text
+    assert cfg.json()["configuration"]["enabled"] is True
+    assert cfg.json()["configuration"]["data_boundary"] == "local"
+    assert cfg.json()["configuration"]["allowed_origins"] == ["http://127.0.0.1:11434"]
+
     assert client.post("/api/v1/analyses", json={"capture_id": cid, "ai_enabled": True}).status_code == 422
-    assert client.post("/api/v1/analyses", json={"capture_id": cid, "ai_enabled": True, "ai_consent": True}).status_code == 409
-    assert TOKEN not in client.get("/api/v1/ai/config").text
+    no_model = client.post("/api/v1/analyses", json={"capture_id": cid, "ai_enabled": True, "ai_consent": True})
+    assert no_model.status_code == 409
+    assert no_model.json()["code"] == "ai_model_not_configured"
+
+    # Explicit operator opt-out returns 409 ai_disabled_by_operator; re-enabling works cleanly even from legacy remote default.
+    off = client.put("/api/v1/ai/config", json={"enabled": False})
+    assert off.status_code == 200
+    assert off.json()["configuration"]["enabled"] is False
+    disabled_resp = client.post("/api/v1/analyses", json={"capture_id": cid, "ai_enabled": True, "ai_consent": True})
+    assert disabled_resp.status_code == 409
+    assert disabled_resp.json()["code"] == "ai_disabled_by_operator"
+
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "ai": AIConfig(
+                enabled=False,
+                provider="openai_compatible",
+                base_url=None,
+                allowed_origins=[],
+                data_boundary="remote",
+                model=None,
+            )
+        }
+    )
+    recovered = client.put("/api/v1/ai/config", json={"enabled": True, "model": "qwen2.5:7b"})
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["configuration"]["enabled"] is True
+    assert recovered.json()["configuration"]["data_boundary"] == "local"
+    assert recovered.json()["configuration"]["allowed_origins"] == ["http://127.0.0.1:11434"]
+    assert recovered.json()["configuration"]["model"] == "qwen2.5:7b"
+
     assert client.get("/api/v1/ai/config/schema").json()["$schema"].endswith("2020-12/schema")
 
 
@@ -271,6 +307,25 @@ def test_grounded_chat_requires_per_turn_consent_and_cites_privacy_safe_evidence
     )
     assert denied.status_code == 200
     assert denied.json()["state"] == "consent_required"
+    assert calls == []
+
+    # Default app has ai.enabled=True and model=None: consenting chat asks for model instead of ai_disabled_by_operator.
+    unselected = client.post(
+        f"/api/v1/analyses/{analysis_id}/chat",
+        json={"question": "What happened?", "consent": True},
+    )
+    assert unselected.status_code == 409
+    assert unselected.json()["code"] == "ai_model_not_configured"
+    assert calls == []
+
+    # Explicit operator opt-out still returns 409 ai_disabled_by_operator.
+    app.state.settings = app.state.settings.model_copy(update={"ai": AIConfig(enabled=False)})
+    disabled_chat = client.post(
+        f"/api/v1/analyses/{analysis_id}/chat",
+        json={"question": "What happened?", "consent": True},
+    )
+    assert disabled_chat.status_code == 409
+    assert disabled_chat.json()["code"] == "ai_disabled_by_operator"
     assert calls == []
 
     app.state.settings = app.state.settings.model_copy(

@@ -236,7 +236,15 @@ function safeEndpointOrigin(value?: string | null): string | null {
 }
 
 function safeFormatError(err: unknown): string {
-  if (err instanceof ApiProblemError) return err.message;
+  if (err instanceof ApiProblemError) {
+    if (err.code === "ai_disabled_by_operator") {
+      return "ai_disabled_by_operator: Layer-2 AI ถูกปิดอยู่ (กด 'เปิดใช้งาน Layer-2 AI' หรือเปิดใน Workspace Settings)";
+    }
+    if (err.code === "ai_model_not_configured") {
+      return "ai_model_not_configured: Layer-2 AI เปิดใช้งานอยู่แล้ว — กรุณาเลือก Model (หรือกด Detect Local Models)";
+    }
+    return err.message;
+  }
   if (err instanceof Error) return err.message;
   return "เกิดข้อผิดพลาดในการเชื่อมต่อ";
 }
@@ -311,6 +319,7 @@ function App() {
   const pauseRequestedRef = useRef(false);
   const autoLoadedJobRef = useRef<string | null>(null);
   const userSetResourceModeRef = useRef(false);
+  const userToggledAiRef = useRef(false);
   const workspaceRefreshGenerationRef = useRef(0);
   const toastSeqRef = useRef(0);
   const toastTimersRef = useRef<Map<number, number>>(new Map());
@@ -327,6 +336,13 @@ function App() {
     }
     consentPolicyRef.current = nextPolicy;
   }, [aiConfig?.policy_hash]);
+
+  useEffect(() => {
+    if (!aiConfig || userToggledAiRef.current) return;
+    const ready = Boolean(aiConfig.configuration.enabled && aiConfig.configuration.model);
+    setAiEnabled(ready);
+    if (!ready) setAiConsent(false);
+  }, [aiConfig]);
 
   const activeFindingList = activeReport.findings;
   const selectedFinding: WorkspaceFinding | null =
@@ -418,11 +434,10 @@ function App() {
           );
           return;
         }
-        const [capsRes, wsRes, cfgRes, modelsRes, browseRes, jobsRes] = await Promise.allSettled([
+        const [capsRes, wsRes, cfgRes, browseRes, jobsRes] = await Promise.allSettled([
           api.getCapabilities(),
           api.getWorkspaceConfig(),
           api.getAiConfig(),
-          api.getAiModels(),
           api.browseLocalCaptures(),
           api.listJobs(50),
         ]);
@@ -454,10 +469,20 @@ function App() {
         } else setCapabilities(null);
         if (wsRes.status === "fulfilled") setWorkspaceConfig(wsRes.value);
         if (cfgRes.status === "fulfilled") setAiConfig(cfgRes.value);
-        if (modelsRes.status === "fulfilled") setAiModels(modelsRes.value);
         if (browseRes.status === "fulfilled") setLocalBrowse(browseRes.value);
         setJobs(jobsRes.value);
         if (!quiet) pushToast("เชื่อมต่อ FastAPI backend สำเร็จ", "success");
+
+        void api
+          .getAiModels()
+          .then((modelsRes) => {
+            if (requestGeneration === workspaceRefreshGenerationRef.current) {
+              setAiModels(modelsRes);
+            }
+          })
+          .catch(() => {
+            // Non-blocking catalog discovery; explicit Probe reports errors cleanly.
+          });
       } catch (err) {
         if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
         setCapabilities(null);
@@ -1261,6 +1286,7 @@ function App() {
               setTriageEndpointConsent={setTriageEndpointConsent}
               aiEnabled={aiEnabled}
               setAiEnabled={(val) => {
+                userToggledAiRef.current = true;
                 setAiEnabled(val);
                 if (!val) setAiConsent(false);
               }}
@@ -1279,6 +1305,8 @@ function App() {
               onRegisterLocalCapture={handleRegisterLocalCapture}
               onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
               onRemoveLocalRoot={(root) => void handleRemoveLocalRoot(root)}
+              onSaveAiConfig={handleSaveAiConfig}
+              onProbeAiModels={handleProbeAiModels}
               onOpenConnectionModal={() => setConnectionModalOpen(true)}
               batchMaxFiles={batchMaxFiles}
               batchMaxTotalBytes={batchMaxTotalBytes}
@@ -1336,6 +1364,10 @@ function App() {
               report={activeReport}
               apiClient={api}
               connected={connectionStatus === "connected"}
+              aiConfig={aiConfig}
+              aiModels={aiModels}
+              onSaveAiConfig={handleSaveAiConfig}
+              onProbeAiModels={handleProbeAiModels}
               onExport={(kind) => void handleExport(kind)}
               onChat={(question, consent) => {
                 if (activeReport.origin !== "live" || connectionStatus !== "connected") {
@@ -1479,6 +1511,42 @@ function asAIProviderName(value?: string | null): AIProviderName {
   return "openai_compatible";
 }
 
+function buildQuickAiSavePayload(
+  aiConfig: AIConfigResponse | null,
+  patch: Partial<AIConfigUpdatePayload>,
+): AIConfigUpdatePayload {
+  const payload: AIConfigUpdatePayload = { enabled: true, ...patch };
+  const cfg = aiConfig?.configuration;
+  const isDefaultLocalCompatible =
+    !cfg ||
+    (cfg.provider === "openai_compatible" &&
+      !cfg.base_url &&
+      (cfg.data_boundary !== "local" || (cfg.allowed_origins?.length ?? 0) === 0));
+  if (payload.enabled && isDefaultLocalCompatible) {
+    if (payload.data_boundary === undefined) payload.data_boundary = "local";
+    if (payload.allowed_origins === undefined) payload.allowed_origins = ["http://127.0.0.1:11434"];
+  }
+  return payload;
+}
+
+function buildQuickAiProbePayload(aiConfig: AIConfigResponse | null): AIModelProbePayload {
+  const cfg = aiConfig?.configuration;
+  const provider = asAIProviderName(cfg?.provider);
+  const data_boundary = cfg?.data_boundary ?? "local";
+  const base_url = cfg?.base_url ?? null;
+  const allowed_origins =
+    cfg?.allowed_origins && cfg.allowed_origins.length > 0
+      ? cfg.allowed_origins
+      : buildAllowedOriginsList("", base_url ?? "", provider, data_boundary);
+  return {
+    provider,
+    base_url,
+    allowed_origins,
+    api_key_env: cfg?.api_key_env ?? null,
+    data_boundary,
+  };
+}
+
 function ConnectionModal({
   initialUrl,
   initialToken,
@@ -1530,7 +1598,7 @@ function ConnectionModal({
   const [dataDirDraft, setDataDirDraft] = useState(resolvedDataDir);
   const [modelPathDraft, setModelPathDraft] = useState(resolvedModelPath);
 
-  const [aiDraftEnabled, setAiDraftEnabled] = useState<boolean>(aiConfig?.configuration.enabled ?? false);
+  const [aiDraftEnabled, setAiDraftEnabled] = useState<boolean>(aiConfig?.configuration.enabled ?? true);
   const [aiDraftProvider, setAiDraftProvider] = useState<AIProviderName>(asAIProviderName(aiConfig?.configuration.provider));
   const [aiDraftBoundary, setAiDraftBoundary] = useState<"local" | "remote">(aiConfig?.configuration.data_boundary ?? "local");
   const [aiDraftBaseUrl, setAiDraftBaseUrl] = useState<string>(aiConfig?.configuration.base_url ?? "");
@@ -2525,6 +2593,8 @@ function AnalyzePage({
   onRegisterLocalCapture,
   onPickNativePath,
   onRemoveLocalRoot,
+  onSaveAiConfig,
+  onProbeAiModels,
   onOpenConnectionModal,
   batchMaxFiles,
   batchMaxTotalBytes,
@@ -2570,6 +2640,8 @@ function AnalyzePage({
   onRegisterLocalCapture: () => void;
   onPickNativePath: (purpose: NativePickPurpose) => void;
   onRemoveLocalRoot: (root: string) => void;
+  onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
+  onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
   onOpenConnectionModal: () => void;
   batchMaxFiles: number | null;
   batchMaxTotalBytes: number | null;
@@ -2578,6 +2650,50 @@ function AnalyzePage({
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [quickAiBusy, setQuickAiBusy] = useState(false);
+
+  const handleQuickEnableAi = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      const updated = await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true }));
+      if (updated.configuration.enabled && updated.configuration.model && !aiEnabled) {
+        setAiEnabled(true);
+      }
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickSelectModel = async (modelId: string) => {
+    const clean = modelId.trim();
+    if (!clean || quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      const updated = await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true, model: clean }));
+      if (updated.configuration.enabled && updated.configuration.model && !aiEnabled) {
+        setAiEnabled(true);
+      }
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickDetectModels = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onProbeAiModels(buildQuickAiProbePayload(aiConfig));
+    } catch {
+      // Error toast is already surfaced by handleProbeAiModels.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
 
   const profiles = capabilities?.profiles ?? null;
   const activeProfile = profiles?.[resourceMode] ?? null;
@@ -3062,8 +3178,48 @@ function AnalyzePage({
                 <small>
                   {canStartBackendAi
                     ? `พร้อมใช้งาน: ${aiConfig?.configuration.provider} (${aiConfig?.configuration.model})`
-                    : "Standby — ตั้งค่า Local Ollama หรือ API Endpoint + ชื่อ ENV var แล้วเปิด Opt-in เมื่อต้องการสรุปรายงาน"}
+                    : connectionStatus === "connected" && aiConfig && !aiConfig.configuration.enabled
+                      ? "Layer-2 AI ถูกปิดโดยผู้ดูแล (ai.enabled = false) — คลิกเปิดใช้งานด้านล่างหรือใน AI Settings"
+                      : connectionStatus === "connected" && aiConfig?.configuration.enabled
+                        ? `เปิดใช้งานโดยค่าเริ่มต้น (${aiConfig.configuration.provider}) — เลือก Model หรือกด Detect Models เพื่อเริ่มใช้งาน`
+                        : "Standby — เชื่อมต่อ Backend แล้วเลือกโมเดล Local Ollama หรือ API Endpoint เมื่อต้องการสรุปรายงาน"}
                 </small>
+                {connectionStatus === "connected" && !canStartBackendAi && (
+                  <div className="ai-quick-models">
+                    {aiConfig && !aiConfig.configuration.enabled ? (
+                      <button
+                        type="button"
+                        className="ai-model-chip"
+                        disabled={quickAiBusy}
+                        onClick={() => void handleQuickEnableAi()}
+                      >
+                        <Icon name="spark" size={11} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                      </button>
+                    ) : (
+                      <>
+                        {(aiModels?.items ?? []).slice(0, 4).map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            className="ai-model-chip"
+                            disabled={quickAiBusy}
+                            onClick={() => void handleQuickSelectModel(item.id)}
+                          >
+                            <Icon name="spark" size={11} /> ใช้ {item.id}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          className="ai-model-chip"
+                          disabled={quickAiBusy}
+                          onClick={() => void handleQuickDetectModels()}
+                        >
+                          <Icon name="search" size={11} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -3135,24 +3291,75 @@ function AnalyzePage({
               <div className="ai-config-callout">
                 {connectionStatus === "connected" && !canStartBackendAi ? (
                   <div className="consent-required">
-                    <strong>ยังไม่ได้ตั้งค่า Layer-2 LLM Provider บน Backend</strong>
-                    <span>
-                      Backend ตั้งค่า <code>ai.enabled = false</code> หรือยังไม่ได้กำหนด <code>ai.model</code> — Layer-1 deterministic detectors และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ
-                    </span>
-                    <div className="consent-cta">
-                      <button
-                        type="button"
-                        className="primary-button tiny-btn"
-                        onClick={onOpenConnectionModal}
-                      >
-                        <Icon name="spark" size={13} /> ตั้งค่า &amp; เปิดใช้ AI Provider
-                      </button>
-                    </div>
+                    {aiConfig && !aiConfig.configuration.enabled ? (
+                      <>
+                        <strong>Layer-2 AI ถูกปิดอยู่บน Backend (ai.enabled = false)</strong>
+                        <span>
+                          ผู้ดูแลตั้งค่า <code>ai.enabled = false</code> — กดเปิดใช้งานทันทีหรือตั้งค่า Provider ใน AI Settings (Layer-1 deterministic detectors และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ)
+                        </span>
+                        <div className="consent-cta">
+                          <button
+                            type="button"
+                            className="primary-button tiny-btn"
+                            disabled={quickAiBusy}
+                            onClick={() => void handleQuickEnableAi()}
+                          >
+                            <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button tiny-btn"
+                            onClick={onOpenConnectionModal}
+                          >
+                            ตั้งค่า AI Provider
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <strong>Layer-2 AI เปิดใช้งานโดยค่าเริ่มต้นแล้ว — กรุณาเลือก Model</strong>
+                        <span>
+                          Backend เปิด <code>ai.enabled = true</code> โดยปริยายแล้ว แต่ยังไม่ได้เลือก <code>ai.model</code> — คลิกเลือกโมเดลที่พบหรือกด Detect Models ด้านล่าง (Layer-1 และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ)
+                        </span>
+                        {aiModels && aiModels.items.length > 0 && (
+                          <div className="ai-quick-models">
+                            {aiModels.items.slice(0, 6).map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className="ai-model-chip"
+                                disabled={quickAiBusy}
+                                onClick={() => void handleQuickSelectModel(item.id)}
+                              >
+                                <Icon name="spark" size={11} /> {item.id}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <div className="consent-cta">
+                          <button
+                            type="button"
+                            className="primary-button tiny-btn"
+                            disabled={quickAiBusy}
+                            onClick={() => void handleQuickDetectModels()}
+                          >
+                            <Icon name="search" size={13} /> {quickAiBusy ? "กำลังตรวจจับ…" : "Detect Models"}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button tiny-btn"
+                            onClick={onOpenConnectionModal}
+                          >
+                            ตั้งค่า AI Provider
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <>
                     <div className="ai-meta-grid mono">
-                  <span>Provider: {aiConfig?.configuration.provider ?? "server-configured"}</span>
+                      <span>Provider: {aiConfig?.configuration.provider ?? "server-configured"}</span>
                       <span>Model: {aiConfig?.configuration.model ?? "server PCAP_AI_MODEL"}</span>
                       <span>
                         Context Budget: {aiConfig?.configuration.context_window_tokens ?? "unreported"} tok /{" "}
@@ -4178,6 +4385,10 @@ function ReportsPage({
   report,
   apiClient,
   connected,
+  aiConfig,
+  aiModels,
+  onSaveAiConfig,
+  onProbeAiModels,
   onExport,
   onChat,
   onNavigate,
@@ -4187,6 +4398,10 @@ function ReportsPage({
   report: WorkspaceReport;
   apiClient: PcapApiClient;
   connected: boolean;
+  aiConfig: AIConfigResponse | null;
+  aiModels: AIModelsResponse | null;
+  onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
+  onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
   onExport: (
     kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
   ) => void;
@@ -4197,6 +4412,9 @@ function ReportsPage({
 }) {
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   const aiActive = report.ai?.state === "completed" && Boolean(report.ai.report);
+  const aiBackendEnabled = Boolean(aiConfig?.configuration.enabled);
+  const aiBackendModel = aiConfig?.configuration.model ?? null;
+  const aiBackendReady = Boolean(aiBackendEnabled && aiBackendModel);
   const [privacyMode, setPrivacyMode] = useState(false);
   const redactor = useMemo(() => new PrivacyRedactor(privacyMode), [privacyMode]);
   const [chatQuestion, setChatQuestion] = useState("");
@@ -4204,7 +4422,49 @@ function ReportsPage({
   const [chatPending, setChatPending] = useState(false);
   const [chatError, setChatError] = useState("");
   const [chatTurns, setChatTurns] = useState<{ question: string; claims: GroundedChatResponse["claims"] }[]>([]);
+  const [quickModelInput, setQuickModelInput] = useState("");
+  const [quickAiBusy, setQuickAiBusy] = useState(false);
   const chatTargetId = useRef(report.analysisId);
+
+  const handleQuickEnableAi = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true }));
+      setChatError("");
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickSelectModel = async (modelId: string) => {
+    const clean = modelId.trim();
+    if (!clean || quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true, model: clean }));
+      setQuickModelInput("");
+      setChatError("");
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickDetectModels = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onProbeAiModels(buildQuickAiProbePayload(aiConfig));
+    } catch {
+      // Error toast is already surfaced by handleProbeAiModels.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
   useEffect(() => {
     chatTargetId.current = report.analysisId;
     setChatTurns([]);
@@ -4515,9 +4775,48 @@ function ReportsPage({
                 <span>
                   {report.ai?.error_code
                     ? `Layer-2 AI narrative ถูกข้ามด้วย fallback (${report.ai.error_code}) — deterministic findings และ Layer-1 Tier-1 triage ยังอยู่ครบ`
-                    : "Layer-2 AI narrative ปิดอยู่สำหรับรอบนี้ (Standby) — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
+                    : connected && aiConfig && !aiBackendEnabled
+                      ? "Layer-2 AI ถูกปิดอยู่ (ai.enabled = false) — คลิกเปิดใช้งานด้านขวา หรือดู deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"
+                      : connected && aiBackendEnabled && !aiBackendModel
+                        ? `Layer-2 AI เปิดใช้งานโดยค่าเริ่มต้นแล้ว (${aiConfig?.configuration.provider}) — เลือกโมเดลเพื่อเปิดใช้สรุปรายงานถัดไปและ Grounded Chat`
+                        : connected && aiBackendReady
+                          ? `รอบนี้ไม่ได้ขอ AI narrative ตอนส่งงาน (${aiConfig?.configuration.provider}: ${aiBackendModel} พร้อมใช้งาน) — ถาม AI จาก evidence ด้านล่างได้ทันที`
+                          : "Layer-2 AI narrative ยังไม่ถูกสร้างในรอบนี้ — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
                 </span>
                 <div className="ai-disabled-actions">
+                  {connected && aiConfig && !aiBackendEnabled && (
+                    <button
+                      type="button"
+                      className="primary-button tiny-btn"
+                      disabled={quickAiBusy}
+                      onClick={() => void handleQuickEnableAi()}
+                    >
+                      <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                    </button>
+                  )}
+                  {connected && aiBackendEnabled && !aiBackendModel && (
+                    <>
+                      {(aiModels?.items ?? []).slice(0, 3).map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          className="ai-model-chip"
+                          disabled={quickAiBusy}
+                          onClick={() => void handleQuickSelectModel(item.id)}
+                        >
+                          <Icon name="spark" size={11} /> ใช้ {item.id}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        className="secondary-button tiny-btn"
+                        disabled={quickAiBusy}
+                        onClick={() => void handleQuickDetectModels()}
+                      >
+                        <Icon name="search" size={12} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
+                      </button>
+                    </>
+                  )}
                   <button type="button" className="secondary-button tiny-btn" onClick={onOpenConnectionModal}>
                     <Icon name="spark" size={13} /> ตั้งค่า AI Provider
                   </button>
@@ -4539,6 +4838,92 @@ function ReportsPage({
                 <p className="grounded-chat-privacy">
                   แต่ละคำถามต้องยืนยันแยกกัน · ส่งเฉพาะ structured evidence ที่ pseudonymize แล้ว · URL, path, payload และ transcript จะไม่ถูกเก็บโดย backend
                 </p>
+                {connected && aiConfig && aiBackendReady && (
+                  <div className="ai-chat-active-pill">
+                    <Icon name="spark" size={12} />
+                    <span>
+                      AI Ready: {aiConfig.configuration.provider} · {aiBackendModel} ({aiConfig.configuration.data_boundary})
+                    </span>
+                  </div>
+                )}
+                {connected && aiConfig && !aiBackendEnabled && (
+                  <div className="ai-chat-status-strip">
+                    <div className="alert-box alert-warn">
+                      <Icon name="alert" size={15} />
+                      <div>
+                        <strong>Layer-2 AI ถูกปิดอยู่ (ai.enabled = false)</strong>
+                        <p style={{ margin: "3px 0 0" }}>
+                          ผู้ดูแลปิด Layer-2 AI ไว้ — กดเปิดใช้งานทันทีด้านล่างหรือปรับแต่งใน AI Settings
+                        </p>
+                      </div>
+                    </div>
+                    <div className="ai-inline-model-bar">
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={quickAiBusy}
+                        onClick={() => void handleQuickEnableAi()}
+                      >
+                        <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                      </button>
+                      <button type="button" className="secondary-button tiny-btn" onClick={onOpenConnectionModal}>
+                        ตั้งค่า AI Provider
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {connected && aiConfig && aiBackendEnabled && !aiBackendModel && (
+                  <div className="ai-chat-status-strip">
+                    <div>
+                      <strong>Layer-2 AI เปิดใช้งานโดยค่าเริ่มต้นแล้ว ({aiConfig.configuration.provider})</strong>
+                      {" — กรุณาเลือกหรือระบุ Model ด้านล่างก่อนส่งคำถาม"}
+                    </div>
+                    {aiModels && aiModels.items.length > 0 && (
+                      <div className="ai-quick-models">
+                        {aiModels.items.slice(0, 6).map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            className="ai-model-chip"
+                            disabled={quickAiBusy}
+                            onClick={() => void handleQuickSelectModel(item.id)}
+                          >
+                            <Icon name="spark" size={11} /> {item.id}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="ai-inline-model-bar">
+                      <input
+                        type="text"
+                        value={quickModelInput}
+                        onChange={(e) => setQuickModelInput(e.target.value)}
+                        placeholder="ระบุชื่อ model (เช่น qwen2.5:7b, llama3.2)"
+                        disabled={quickAiBusy}
+                        aria-label="Model name for grounded chat"
+                      />
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={quickAiBusy || !quickModelInput.trim()}
+                        onClick={() => void handleQuickSelectModel(quickModelInput)}
+                      >
+                        {quickAiBusy ? "กำลังบันทึก…" : "ใช้โมเดลนี้"}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button tiny-btn"
+                        disabled={quickAiBusy}
+                        onClick={() => void handleQuickDetectModels()}
+                      >
+                        <Icon name="search" size={12} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
+                      </button>
+                      <button type="button" className="text-button" onClick={onOpenConnectionModal}>
+                        ตั้งค่า AI Provider
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {chatTurns.map((turn, turnIndex) => (
                   <div className="grounded-chat-turn" key={`${report.analysisId}-${turnIndex}`}>
                     <strong>Q: {redactor.redactFreeText(turn.question)}</strong>
@@ -4572,7 +4957,11 @@ function ReportsPage({
                     I consent to send this question and the privacy-filtered evidence to the configured AI provider for this turn.
                   </label>
                   {chatError && <p role="alert" className="grounded-chat-error">{chatError}</p>}
-                  <button type="submit" className="primary-button" disabled={chatPending || !chatQuestion.trim() || !chatConsent}>
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={chatPending || !chatQuestion.trim() || !chatConsent || (connected && Boolean(aiConfig) && !aiBackendReady)}
+                  >
                     {chatPending ? "Analyzing evidence…" : "Ask grounded AI"}
                   </button>
                 </form>

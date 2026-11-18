@@ -1581,6 +1581,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if field_name in {"base_url", "model", "api_key_env"} and isinstance(val, str):
                 val = val.strip() or None
             next_ai_data[field_name] = val
+        if (
+            next_ai_data.get("enabled")
+            and str(next_ai_data.get("provider")) == "openai_compatible"
+            and next_ai_data.get("base_url") is None
+            and "base_url" not in body.model_fields_set
+            and "data_boundary" not in body.model_fields_set
+            and "allowed_origins" not in body.model_fields_set
+            and not next_ai_data.get("allowed_origins")
+        ):
+            next_ai_data["data_boundary"] = "local"
+            next_ai_data["allowed_origins"] = ["http://127.0.0.1:11434"]
         try:
             updated_ai = AIConfig.model_validate(next_ai_data)
         except ValidationError:
@@ -1609,7 +1620,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
         cfg_now = _cfg()
         try:
-            items = await list_models(cfg_now)
+            discovery_cfg = cfg_now.model_copy(
+                update={"ai": cfg_now.ai.model_copy(update={"timeout_seconds": min(cfg_now.ai.timeout_seconds, 5)})}
+            )
+            items = await list_models(discovery_cfg)
             return {
                 "state": "disabled" if not cfg_now.ai.enabled else ("completed" if items else "unavailable_or_empty"),
                 "items": items,
