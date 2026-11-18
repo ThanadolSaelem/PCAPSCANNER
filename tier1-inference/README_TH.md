@@ -73,6 +73,24 @@ export PCAP_TRIAGE_ETBERT_ENDPOINT_URL="http://127.0.0.1:9000/etbert/score"
 export PCAP_TRIAGE_ALLOWED_ORIGINS="http://127.0.0.1:9000"
 ```
 
+## แปลงไฟล์ UER `.bin` ที่เทรนแล้วเป็นโฟลเดอร์ HuggingFace (รันบน Mac `mps` ได้ทันที)
+
+หาก fine-tune ET-BERT จาก `ET-BERT-main/fine-tuning/run_classifier.py` ได้ไฟล์ `.bin` (เช่น `models/finetuned_model_resumed.bin`) ให้แปลงครั้งเดียวเป็นโฟลเดอร์ HuggingFace ก่อนนำไปรัน:
+
+```bash
+python -m tier1_inference.convert_uer \
+  --bin /Users/thanadol/Downloads/ET-BERT-main/models/finetuned_model_resumed.bin \
+  --vocab /Users/thanadol/Downloads/ET-BERT-main/models/encryptd_vocab.txt \
+  --uer-config /Users/thanadol/Downloads/ET-BERT-main/bert_base_config.json \
+  --output ./models/etbert-l7
+```
+
+จากนั้นเปิดรันด้วย:
+
+```bash
+./start-tier1.sh --etbert-checkpoint ./models/etbert-l7 --require-weights
+```
+
 ## หมายเหตุสำคัญเกี่ยวกับไฟล์ `pre-trained_model.bin`
 
 ไฟล์ `pre-trained_model.bin` ของ UER ET-BERT เป็น pre-trained MLM backbone (ยังไม่มี fine-tuned classification head และ HuggingFace `config.json`) หากระบุไฟล์นี้ใน `--etbert-checkpoint` ระบบจะตรวจสอบโครงสร้างอย่างปลอดภัยและรายงานใน `/health` ว่า `has_classification_head: false`, `etbert_loaded: false` พร้อมสลับใช้ calibrated L7 fallback อย่างตรงไปตรงมา (หากใส่ `--require-weights` จะหยุดแจ้งเตือนชัดเจน)

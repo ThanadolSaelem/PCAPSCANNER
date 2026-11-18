@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 pcapscanner-tier1 = "tier1_inference.cli:main"
+pcapscanner-tier1-convert = "tier1_inference.convert_uer:main"
 
 [tool.setuptools.packages.find]
 include = ["tier1_inference*"]

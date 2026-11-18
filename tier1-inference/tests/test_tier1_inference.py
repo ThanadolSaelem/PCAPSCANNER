@@ -429,5 +429,219 @@ class FastApiServerAndCliTests(unittest.TestCase):
         self.assertIn("require_weights=True", stderr.getvalue())
 
 
+class UerToHfConversionTests(unittest.TestCase):
+    def test_map_uer_state_dict_keys_and_segment_offset(self) -> None:
+        from tier1_inference import convert_uer, etbert_scorer
+
+        class _MockTensor:
+            def __init__(self, shape: tuple[int, ...], tag: str = "") -> None:
+                self.shape = shape
+                self.tag = tag
+
+            def clone(self) -> "_MockTensor":
+                return _MockTensor(self.shape, self.tag)
+
+            def __getitem__(self, item):
+                if isinstance(item, slice):
+                    start, stop, _ = item.indices(self.shape[0])
+                    return _MockTensor((max(0, stop - start), *self.shape[1:]), f"{self.tag}[{start}:{stop}]")
+                raise TypeError("unsupported slice")
+
+        uer_state = {
+            "module.embedding.word_embedding.weight": _MockTensor((16, 8), "word"),
+            "module.embedding.position_embedding.weight": _MockTensor((32, 8), "pos"),
+            "module.embedding.segment_embedding.weight": _MockTensor((3, 8), "seg"),
+            "module.embedding.layer_norm.gamma": _MockTensor((8,), "emb_g"),
+            "module.embedding.layer_norm.beta": _MockTensor((8,), "emb_b"),
+            "module.output_layer_1.weight": _MockTensor((8, 8), "out1_w"),
+            "module.output_layer_1.bias": _MockTensor((8,), "out1_b"),
+            "module.output_layer_2.weight": _MockTensor((120, 8), "out2_w"),
+            "module.output_layer_2.bias": _MockTensor((120,), "out2_b"),
+        }
+        for i in range(2):
+            for qkv in ("0", "1", "2"):
+                uer_state[f"module.encoder.transformer.{i}.self_attn.linear_layers.{qkv}.weight"] = _MockTensor((8, 8))
+                uer_state[f"module.encoder.transformer.{i}.self_attn.linear_layers.{qkv}.bias"] = _MockTensor((8,))
+            uer_state[f"module.encoder.transformer.{i}.self_attn.final_linear.weight"] = _MockTensor((8, 8))
+            uer_state[f"module.encoder.transformer.{i}.self_attn.final_linear.bias"] = _MockTensor((8,))
+            uer_state[f"module.encoder.transformer.{i}.layer_norm_1.gamma"] = _MockTensor((8,))
+            uer_state[f"module.encoder.transformer.{i}.layer_norm_1.beta"] = _MockTensor((8,))
+            uer_state[f"module.encoder.transformer.{i}.feed_forward.linear_1.weight"] = _MockTensor((32, 8))
+            uer_state[f"module.encoder.transformer.{i}.feed_forward.linear_1.bias"] = _MockTensor((32,))
+            uer_state[f"module.encoder.transformer.{i}.feed_forward.linear_2.weight"] = _MockTensor((8, 32))
+            uer_state[f"module.encoder.transformer.{i}.feed_forward.linear_2.bias"] = _MockTensor((8,))
+            uer_state[f"module.encoder.transformer.{i}.layer_norm_2.gamma"] = _MockTensor((8,))
+            uer_state[f"module.encoder.transformer.{i}.layer_norm_2.beta"] = _MockTensor((8,))
+
+        hf_state, meta = convert_uer.map_uer_state_dict_to_hf_bert(
+            uer_state,
+            uer_config={"layers_num": 2, "heads_num": 2, "feedforward_size": 32, "hidden_size": 8},
+        )
+        self.assertEqual(meta["vocab_size"], 16)
+        self.assertEqual(meta["hidden_size"], 8)
+        self.assertEqual(meta["num_hidden_layers"], 2)
+        self.assertEqual(meta["num_labels"], 120)
+        self.assertTrue(meta["has_classification_head"])
+        # Segment embedding [3, 8] -> HF token_type_embeddings [2, 8] sliced at [1:3]
+        self.assertEqual(hf_state["bert.embeddings.token_type_embeddings.weight"].shape, (2, 8))
+        self.assertEqual(hf_state["bert.embeddings.token_type_embeddings.weight"].tag, "seg[1:3]")
+        self.assertIn("bert.encoder.layer.1.attention.self.query.weight", hf_state)
+        self.assertIn("bert.encoder.layer.1.output.LayerNorm.bias", hf_state)
+        self.assertIn("bert.pooler.dense.weight", hf_state)
+        self.assertEqual(hf_state["classifier.weight"].shape, (120, 8))
+
+        # Pretrained encoder without head fails unless allow_untrained_head=True
+        no_head = {k: v for k, v in uer_state.items() if "output_layer" not in k}
+        with self.assertRaises(ValueError):
+            convert_uer.map_uer_state_dict_to_hf_bert(no_head)
+
+        # Bigram-only formatting drops ASCII "| BURST" prefix noise
+        self.assertEqual(
+            etbert_scorer.format_etbert_input_text(
+                {"state": "FLOW TLS ...", "bigram_tokens": ["1603", "0301"]},
+                bigram_only=True,
+            ),
+            "1603 0301",
+        )
+
+    def test_convert_uer_checkpoint_roundtrip_mocked(self) -> None:
+        from tier1_inference import convert_uer
+
+        class _MiniTensor:
+            def __init__(self, shape: tuple[int, ...]) -> None:
+                self.shape = shape
+
+            def clone(self):
+                return _MiniTensor(self.shape)
+
+            def __getitem__(self, item):
+                if isinstance(item, slice):
+                    start, stop, _ = item.indices(self.shape[0])
+                    return _MiniTensor((max(0, stop - start), *self.shape[1:]))
+                raise TypeError
+
+        raw_uer = {
+            "embedding.word_embedding.weight": _MiniTensor((8, 4)),
+            "embedding.position_embedding.weight": _MiniTensor((16, 4)),
+            "embedding.segment_embedding.weight": _MiniTensor((3, 4)),
+            "embedding.layer_norm.gamma": _MiniTensor((4,)),
+            "embedding.layer_norm.beta": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.linear_layers.0.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.linear_layers.0.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.linear_layers.1.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.linear_layers.1.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.linear_layers.2.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.linear_layers.2.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.final_linear.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.final_linear.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_1.gamma": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_1.beta": _MiniTensor((4,)),
+            "encoder.transformer.0.feed_forward.linear_1.weight": _MiniTensor((16, 4)),
+            "encoder.transformer.0.feed_forward.linear_1.bias": _MiniTensor((16,)),
+            "encoder.transformer.0.feed_forward.linear_2.weight": _MiniTensor((4, 16)),
+            "encoder.transformer.0.feed_forward.linear_2.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_2.gamma": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_2.beta": _MiniTensor((4,)),
+            "output_layer_1.weight": _MiniTensor((4, 4)),
+            "output_layer_1.bias": _MiniTensor((4,)),
+            "output_layer_2.weight": _MiniTensor((3, 4)),
+            "output_layer_2.bias": _MiniTensor((3,)),
+        }
+
+        class _NullCtx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *_a):
+                return False
+
+        class _Logits:
+            shape = (1, 3)
+
+        class _FakeBertConfig:
+            def __init__(self, d):
+                self._d = dict(d)
+
+            @classmethod
+            def from_dict(cls, d):
+                return cls(d)
+
+        class _FakeBertModel:
+            def __init__(self, cfg):
+                self.cfg = cfg
+                self.loaded = None
+
+            def load_state_dict(self, state, strict=True):
+                assert strict
+                self.loaded = state
+                return [], []
+
+            def eval(self):
+                return self
+
+            def save_pretrained(self, out_dir):
+                p = Path(out_dir)
+                (p / "config.json").write_text(json.dumps(self.cfg._d), encoding="utf-8")
+                (p / "model.safetensors").write_bytes(b"mock-safetensors")
+
+            @classmethod
+            def from_pretrained(cls, path):
+                cfg = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+                return cls(_FakeBertConfig(cfg))
+
+            def __call__(self, **_kw):
+                return types.SimpleNamespace(logits=_Logits())
+
+        fake_torch = types.ModuleType("torch")
+        fake_torch.load = lambda *_a, **_kw: raw_uer
+        fake_torch.inference_mode = lambda: _NullCtx()
+        fake_torch.isfinite = lambda _x: types.SimpleNamespace(all=lambda: True)
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.BertConfig = _FakeBertConfig
+        fake_transformers.BertForSequenceClassification = _FakeBertModel
+        fake_transformers.AutoModelForSequenceClassification = _FakeBertModel
+        fake_transformers.AutoTokenizer = types.SimpleNamespace(
+            from_pretrained=lambda *_a, **_kw: (lambda _txt, **_k: {"input_ids": [[1, 2, 3]]})
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            bin_file = tmp_dir / "finetuned.bin"
+            bin_file.write_bytes(b"bin")
+            vocab_file = tmp_dir / "encryptd_vocab.txt"
+            vocab_file.write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n1603\n", encoding="utf-8")
+            labels_file = tmp_dir / "labels.json"
+            labels_file.write_text(json.dumps(["Benign", "TLS_Anomaly", "C2_Beaconing"]), encoding="utf-8")
+            uer_cfg_file = tmp_dir / "bert_base_config.json"
+            uer_cfg_file.write_text(
+                json.dumps({"layers_num": 1, "heads_num": 1, "feedforward_size": 16, "hidden_size": 4}),
+                encoding="utf-8",
+            )
+            out_dir = tmp_dir / "hf-out"
+
+            with mock.patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
+                summary = convert_uer.convert_uer_checkpoint(
+                    bin_path=bin_file,
+                    vocab_path=vocab_file,
+                    output_dir=out_dir,
+                    uer_config_path=uer_cfg_file,
+                    labels_path=labels_file,
+                    verify=True,
+                )
+
+            self.assertEqual(summary["num_labels"], 3)
+            self.assertTrue(summary["verified"])
+            self.assertTrue((out_dir / "config.json").is_file())
+            self.assertTrue((out_dir / "model.safetensors").is_file())
+            self.assertTrue((out_dir / "tokenizer_config.json").is_file())
+            self.assertTrue((out_dir / "special_tokens_map.json").is_file())
+            vocab_lines = (out_dir / "vocab.txt").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(vocab_lines), 8)  # Padded from 6 -> expected vocab_size=8
+            saved_cfg = json.loads((out_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_cfg["id2label"]["2"], "C2_Beaconing")
+            self.assertEqual(saved_cfg["etbert_input_mode"], "bigram")
+
+
 if __name__ == "__main__":
     unittest.main()

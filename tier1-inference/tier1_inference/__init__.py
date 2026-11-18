@@ -21,6 +21,14 @@ from .server import create_app
 
 __version__ = "1.0.0"
 
+
+def convert_uer_checkpoint(*args, **kwargs):
+    """Lazily delegate to `tier1_inference.convert_uer.convert_uer_checkpoint`."""
+    from .convert_uer import convert_uer_checkpoint as _impl
+
+    return _impl(*args, **kwargs)
+
+
 __all__ = [
     "CHOICE_LETTERS",
     "CLASS_TO_INDEX",
@@ -32,6 +40,7 @@ __all__ = [
     "TRAFFIC_CLASSES",
     "__version__",
     "bytes_to_etbert_bigram_tokens",
+    "convert_uer_checkpoint",
     "create_app",
     "format_etbert_input_text",
     "inspect_etbert_checkpoint",

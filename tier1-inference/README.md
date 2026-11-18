@@ -74,6 +74,24 @@ export PCAP_TRIAGE_ETBERT_ENDPOINT_URL="http://127.0.0.1:9000/etbert/score"
 export PCAP_TRIAGE_ALLOWED_ORIGINS="http://127.0.0.1:9000"
 ```
 
+## Converting Fine-Tuned UER ET-BERT `.bin` Checkpoints
+
+If you fine-tuned ET-BERT with UER-py (`run_classifier.py`, producing e.g. `finetuned_model_resumed.bin`), convert it once into a standard HuggingFace `BertForSequenceClassification` directory so `tier1-inference` can run it directly on `mps` / `cuda` / `cpu`:
+
+```bash
+python -m tier1_inference.convert_uer \
+  --bin /path/to/ET-BERT-main/models/finetuned_model_resumed.bin \
+  --vocab /path/to/ET-BERT-main/models/encryptd_vocab.txt \
+  --uer-config /path/to/ET-BERT-main/bert_base_config.json \
+  --output ./models/etbert-l7
+```
+
+Then start the service:
+
+```bash
+./start-tier1.sh --etbert-checkpoint ./models/etbert-l7 --require-weights
+```
+
 ## Note on Raw `pre-trained_model.bin` (UER MLM)
 
-If you point `--etbert-checkpoint` to a raw UER masked-language-model archive (`pre-trained_model.bin`) rather than a fine-tuned HuggingFace sequence-classification checkpoint directory (`config.json` + `model.safetensors`), `/health` reports `has_classification_head: false` and `etbert_loaded: false`, and falls back safely to calibrated L7 telemetry scoring unless `--require-weights` is set.
+If you point `--etbert-checkpoint` directly to a raw UER masked-language-model archive (`pre-trained_model.bin`) rather than a converted/fine-tuned HuggingFace sequence-classification checkpoint directory (`config.json` + `model.safetensors`), `/health` reports `has_classification_head: false` and `etbert_loaded: false`, and falls back safely to calibrated L7 telemetry scoring unless `--require-weights` is set.

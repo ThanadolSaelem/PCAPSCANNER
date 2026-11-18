@@ -108,15 +108,18 @@ def bytes_to_etbert_bigram_tokens(datagram: bytes | Sequence[int], *, max_len: i
     return [f"{int(seq[i]) & 0xFF:02x}{int(seq[i + 1]) & 0xFF:02x}" for i in range(len(seq) - 1)][:max_len]
 
 
-def format_etbert_input_text(item: Mapping[str, Any]) -> str:
+def format_etbert_input_text(item: Mapping[str, Any], *, bigram_only: bool = False) -> str:
     """Format datagram/telemetry item into compact input text for ET-BERT Transformer."""
     if item.get("bigram_tokens"):
         toks = " ".join(str(t) for t in list(item["bigram_tokens"])[:256])
+        if bigram_only or not str(item.get("state") or "").strip():
+            return toks
         return f"{item.get('state', '')} | BURST {toks}".strip()
     feats = dict(item.get("features") or {})
     if feats:
         parts = [f"{k}={v}" for k, v in sorted(feats.items()) if k not in {"src_pseudo", "dst_pseudo"}]
-        return f"[CLS] {item.get('kind', 'flow')} " + " ".join(parts)
+        prefix = "" if bigram_only else "[CLS] "
+        return f"{prefix}{item.get('kind', 'flow')} " + " ".join(parts)
     return str(item.get("state") or "")
 
 
@@ -310,6 +313,7 @@ class ETBertDatagramScorer:
         self.id2label = dict(id2label) if id2label else {i: cls for i, cls in enumerate(TRAFFIC_CLASSES)}
         self._tokenizer: Any = None
         self._model: Any = None
+        self._bigram_only = False
         self.loaded_weights = False
         self.checkpoint_info: dict[str, Any] = inspect_etbert_checkpoint(self.checkpoint_path)
 
@@ -361,6 +365,7 @@ class ETBertDatagramScorer:
         cfg_map = getattr(self._model.config, "id2label", None)
         if isinstance(cfg_map, dict) and cfg_map:
             self.id2label = {int(k): str(v) for k, v in cfg_map.items()}
+        self._bigram_only = getattr(self._model.config, "etbert_input_mode", None) == "bigram"
         self.loaded_weights = True
 
     def _fallback_score_item(self, item: Mapping[str, Any]) -> dict[str, Any]:
@@ -436,7 +441,7 @@ class ETBertDatagramScorer:
         step = max(1, batch_size)
         for start in range(0, len(items), step):
             chunk = items[start : start + step]
-            texts = [format_etbert_input_text(item) for item in chunk]
+            texts = [format_etbert_input_text(item, bigram_only=self._bigram_only) for item in chunk]
             enc = self._tokenizer(
                 texts,
                 padding=True,
