@@ -31,6 +31,7 @@ ChatState = Literal[
     "budget_exceeded",
     "invalid_output",
     "unavailable",
+    "refused",
 ]
 
 # Conservative tokenizer-free approximation: four UTF-8 bytes per token, with
@@ -53,7 +54,7 @@ _URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>()]+")
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 _IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 _IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
-_DOMAIN_RE = re.compile(r"(?i)(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?![\w-])")
+_DOMAIN_RE = re.compile(r"(?i)(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]{2,63}(?![\w-])")
 _URI_PATH_RE = re.compile(r"(?<![A-Za-z0-9])/(?:[A-Za-z0-9._~!$&'()*+,;=:@%-]+/?)+(?:\?[^\s]*)?")
 _AUTHORIZATION_RE = re.compile(r"(?i)\bauthorization\s*[:=]\s*[^\s,;]+(?:\s+[^\s,;]+)?")
 _CREDENTIAL_ASSIGNMENT_RE = re.compile(
@@ -99,6 +100,7 @@ class ChatResult:
     claims: tuple[GroundedClaim, ...] = ()
     prompt_sha256: str | None = None
     error_code: str | None = None
+    usage: dict[str, int] | None = None
 
 
 ChatProvider = Callable[[str], Awaitable[str]]
@@ -146,6 +148,11 @@ def _claims_from_output(raw: str, evidence_ids: set[str], limits: ChatLimits) ->
         parsed = json.loads(raw)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("invalid_json") from exc
+    if isinstance(parsed, dict) and (
+        (isinstance(parsed.get("refusal"), str) and parsed["refusal"].strip())
+        or parsed.get("state") == "refused"
+    ):
+        raise ValueError("provider_refused")
     if not isinstance(parsed, dict) or set(parsed) != {"claims"}:
         raise ValueError("invalid_shape")
     rows = parsed.get("claims")
@@ -225,14 +232,23 @@ async def answer_question(
         return ChatResult(state="unavailable", prompt_sha256=prompt_hash, error_code="provider_error")
     if not isinstance(raw, str):
         return ChatResult(state="invalid_output", prompt_sha256=prompt_hash, error_code="invalid_output_type")
+    raw_bytes = raw.encode("utf-8")
+    usage = {
+        "input_bytes": len(prompt_raw),
+        "output_bytes": len(raw_bytes),
+        "estimated_input_tokens": math.ceil(len(prompt_raw) / _TOKEN_BYTES),
+        "estimated_output_tokens": math.ceil(len(raw_bytes) / _TOKEN_BYTES),
+    }
     try:
         claims = _claims_from_output(raw, known_ids, limits)
     except ValueError as exc:
         code = str(exc)
+        if code == "provider_refused":
+            return ChatResult(state="refused", prompt_sha256=prompt_hash, error_code=code, usage=usage)
         if code.endswith("budget_exceeded"):
-            return ChatResult(state="budget_exceeded", prompt_sha256=prompt_hash, error_code=code)
-        return ChatResult(state="invalid_output", prompt_sha256=prompt_hash, error_code=code)
-    return ChatResult(state="completed", claims=claims, prompt_sha256=prompt_hash)
+            return ChatResult(state="budget_exceeded", prompt_sha256=prompt_hash, error_code=code, usage=usage)
+        return ChatResult(state="invalid_output", prompt_sha256=prompt_hash, error_code=code, usage=usage)
+    return ChatResult(state="completed", claims=claims, prompt_sha256=prompt_hash, usage=usage)
 
 
 __all__ = ["ChatLimits", "ChatProvider", "ChatResult", "answer_question"]

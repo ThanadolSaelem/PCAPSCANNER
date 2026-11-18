@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import errno
+import ipaddress
 import os
 import re
 import shutil
@@ -11,6 +12,7 @@ import sqlite3
 import stat
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,6 +155,78 @@ class Store:
               created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS case_notes_case ON case_notes(case_id, created_at, id);
+            CREATE TABLE IF NOT EXISTS analysis_snapshots (
+              snapshot_id TEXT PRIMARY KEY,
+              analysis_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              created_at TEXT NOT NULL,
+              capture_sha256 TEXT NOT NULL,
+              parser_version TEXT NOT NULL,
+              rule_set_version TEXT NOT NULL,
+              policy_hash TEXT NOT NULL,
+              manifest_json TEXT NOT NULL,
+              bundle_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS analysis_snapshots_job ON analysis_snapshots(analysis_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS analysis_artifacts (
+              artifact_id TEXT NOT NULL,
+              analysis_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              filename TEXT NOT NULL,
+              content_type TEXT NOT NULL,
+              size_bytes INTEGER NOT NULL,
+              sha256 TEXT NOT NULL,
+              md5 TEXT,
+              sha1 TEXT,
+              source_protocol TEXT NOT NULL DEFAULT 'http',
+              packet_refs TEXT NOT NULL DEFAULT '[]',
+              matched_rules TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(analysis_id, artifact_id)
+            );
+            CREATE TABLE IF NOT EXISTS api_keys (
+              key_id TEXT PRIMARY KEY,
+              label TEXT NOT NULL,
+              token_prefix TEXT NOT NULL,
+              token_sha256 TEXT NOT NULL UNIQUE,
+              scopes TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              expires_at TEXT,
+              revoked_at TEXT,
+              last_used_at TEXT,
+              rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
+              quota_limit INTEGER NOT NULL DEFAULT 1000,
+              window_epoch_minute INTEGER NOT NULL DEFAULT 0,
+              window_request_count INTEGER NOT NULL DEFAULT 0,
+              total_requests INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS api_key_audit (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              key_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              endpoint TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS osint_cache (
+              cache_id TEXT PRIMARY KEY,
+              provider TEXT NOT NULL,
+              indicator_type TEXT NOT NULL,
+              indicator_hash TEXT NOT NULL,
+              state TEXT NOT NULL,
+              summary_json TEXT NOT NULL,
+              cached_at TEXT NOT NULL,
+              expires_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS osint_cache_exp ON osint_cache(expires_at);
+            CREATE TABLE IF NOT EXISTS case_iocs (
+              ioc_id TEXT PRIMARY KEY,
+              case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              indicator_type TEXT NOT NULL,
+              indicator TEXT NOT NULL,
+              severity TEXT NOT NULL DEFAULT 'medium',
+              tags TEXT NOT NULL DEFAULT '[]',
+              notes TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS case_iocs_case ON case_iocs(case_id);
             """)
             self._migrate_columns(db)
         os.chmod(self.path, 0o600)
@@ -184,6 +258,10 @@ class Store:
         for col, ddl in job_migrations.items():
             if col not in job_cols:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+
+        key_cols = {r[1] for r in db.execute("PRAGMA table_info(api_keys)").fetchall()}
+        if "quota_limit" not in key_cols:
+            db.execute("ALTER TABLE api_keys ADD COLUMN quota_limit INTEGER NOT NULL DEFAULT 1000")
 
         audit_cols = {r[1] for r in db.execute("PRAGMA table_info(osint_audit)").fetchall()}
         if "operation_id" not in audit_cols:
@@ -1070,7 +1148,7 @@ class Store:
     ) -> None:
         """Record only operation metadata; never persist the queried IoC values or keys."""
         self._validate_id(jid)
-        if not 0 <= indicator_count <= 12 or len(providers) > 5:
+        if not 0 <= indicator_count <= 12 or len(providers) > 7:
             raise StoreError("osint_audit_invalid", 400)
         if operation_id is not None and not re.fullmatch(r"[a-f0-9]{32}", operation_id):
             raise StoreError("osint_audit_invalid", 400)
@@ -1436,3 +1514,638 @@ class Store:
             cursor = db.execute("DELETE FROM case_notes WHERE case_id=? AND id=?", (case_id, note_id))
             if cursor.rowcount != 1:
                 raise StoreError("case_note_not_found", 404)
+
+    # --- Immutable Export Snapshots (M6) ---
+
+    def create_snapshot(
+        self,
+        analysis_id: str,
+        *,
+        parser_version: str = "pcapscanner-3.1.0",
+        rule_set_version: str = "default_threats-2026.11",
+    ) -> dict:
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (analysis_id,)).fetchone()
+            if row is None:
+                raise StoreError("job_not_found", 404)
+            if not row["evidence"]:
+                raise StoreError("evidence_not_ready", 409)
+            bundle_obj = json.loads(row["evidence"])
+            capture_sha256 = str(bundle_obj.get("capture_sha256") or "")
+            policy_hash = str(row["policy_hash"] or "")
+            created_at = utcnow()
+            snapshot_seed = json.dumps(
+                {
+                    "analysis_id": analysis_id,
+                    "capture_sha256": capture_sha256,
+                    "policy_hash": policy_hash,
+                    "parser_version": parser_version,
+                    "rule_set_version": rule_set_version,
+                    "evidence_sha256": hashlib.sha256(str(row["evidence"]).encode("utf-8")).hexdigest(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            snapshot_id = "SNAP-" + hashlib.sha256(snapshot_seed.encode("utf-8")).hexdigest()[:24]
+            existing = db.execute(
+                "SELECT * FROM analysis_snapshots WHERE snapshot_id=?",
+                (snapshot_id,),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["manifest_json"])
+            evidence_ids = [
+                str(ev.get("evidence_id"))
+                for ev in (bundle_obj.get("evidence") or [])
+                if isinstance(ev, dict) and ev.get("evidence_id")
+            ]
+            finding_ids = [
+                str(f.get("finding_id"))
+                for f in (bundle_obj.get("findings") or [])
+                if isinstance(f, dict) and f.get("finding_id")
+            ]
+            manifest = {
+                "snapshot_id": snapshot_id,
+                "analysis_id": analysis_id,
+                "created_at": created_at,
+                "immutable": True,
+                "capture_sha256": capture_sha256,
+                "parser_version": parser_version,
+                "rule_set_version": rule_set_version,
+                "policy_hash": policy_hash,
+                "coverage": bundle_obj.get("coverage") or {},
+                "evidence_count": len(evidence_ids),
+                "finding_count": len(finding_ids),
+                "evidence_ids": evidence_ids[:500],
+                "finding_ids": finding_ids[:200],
+            }
+            db.execute(
+                """INSERT INTO analysis_snapshots(
+                     snapshot_id, analysis_id, created_at, capture_sha256,
+                     parser_version, rule_set_version, policy_hash, manifest_json, bundle_json
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    analysis_id,
+                    created_at,
+                    capture_sha256,
+                    parser_version,
+                    rule_set_version,
+                    policy_hash,
+                    json.dumps(manifest, separators=(",", ":")),
+                    str(row["evidence"]),
+                ),
+            )
+            return manifest
+
+    def get_snapshot(self, analysis_id: str, snapshot_id: str | None = None) -> dict | None:
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection() as db:
+            if snapshot_id:
+                row = db.execute(
+                    "SELECT * FROM analysis_snapshots WHERE analysis_id=? AND snapshot_id=?",
+                    (analysis_id, snapshot_id),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT * FROM analysis_snapshots WHERE analysis_id=? ORDER BY created_at DESC LIMIT 1",
+                    (analysis_id,),
+                ).fetchone()
+        if row is None:
+            return None
+        manifest = json.loads(row["manifest_json"])
+        manifest["_bundle_json"] = row["bundle_json"]
+        return manifest
+
+    def get_or_create_snapshot(self, analysis_id: str, snapshot_id: str | None = None) -> dict:
+        existing = self.get_snapshot(analysis_id, snapshot_id=snapshot_id)
+        if existing is not None:
+            return existing
+        if snapshot_id is not None:
+            raise StoreError("snapshot_not_found", 404)
+        self.create_snapshot(analysis_id)
+        created = self.get_snapshot(analysis_id)
+        if created is None:
+            raise StoreError("snapshot_not_found", 404)
+        return created
+
+    # --- YARA & Carved Artifact Inventory (M4) ---
+
+    def list_artifacts(self, analysis_id: str) -> list[dict]:
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection() as db:
+            job_row = db.execute("SELECT evidence FROM jobs WHERE id=?", (analysis_id,)).fetchone()
+            if job_row is None:
+                raise StoreError("job_not_found", 404)
+            if not job_row["evidence"]:
+                raise StoreError("evidence_not_ready", 409)
+            rows = db.execute(
+                "SELECT * FROM analysis_artifacts WHERE analysis_id=? ORDER BY artifact_id ASC",
+                (analysis_id,),
+            ).fetchall()
+        if rows:
+            return [
+                {
+                    "artifact_id": r["artifact_id"],
+                    "filename": r["filename"],
+                    "content_type": r["content_type"],
+                    "size_bytes": int(r["size_bytes"]),
+                    "sha256": r["sha256"],
+                    "md5": r["md5"],
+                    "sha1": r["sha1"],
+                    "source_protocol": r["source_protocol"],
+                    "packet_refs": json.loads(r["packet_refs"]),
+                    "matched_rules": json.loads(r["matched_rules"]),
+                }
+                for r in rows
+            ]
+        bundle_obj = json.loads(job_row["evidence"])
+        artifacts = bundle_obj.get("artifacts")
+        if isinstance(artifacts, list) and artifacts:
+            return artifacts
+        synthesized: list[dict] = []
+        for idx, ev in enumerate(bundle_obj.get("evidence") or [], 1):
+            if not isinstance(ev, dict) or ev.get("kind") != "yara":
+                continue
+            attrs = ev.get("attributes") or {}
+            sha = str(attrs.get("object_sha256") or attrs.get("artifact_sha256") or "")
+            if len(sha) != 64:
+                continue
+            rule_val = attrs.get("rule_id") or attrs.get("rule")
+            synthesized.append(
+                {
+                    "artifact_id": f"ART-{idx:04d}-{sha[:8]}",
+                    "filename": str(attrs.get("filename") or f"carved-{idx:04d}.bin"),
+                    "content_type": str(attrs.get("content_type") or "application/octet-stream"),
+                    "size_bytes": int(attrs.get("object_size_bytes") or attrs.get("size_bytes") or 0),
+                    "sha256": sha,
+                    "md5": attrs.get("artifact_md5"),
+                    "sha1": attrs.get("artifact_sha1"),
+                    "source_protocol": "http",
+                    "packet_refs": list(ev.get("packet_refs") or []),
+                    "matched_rules": [str(rule_val)] if rule_val else [],
+                }
+            )
+        return synthesized
+
+    def get_artifact(self, analysis_id: str, artifact_id: str) -> dict:
+        items = self.list_artifacts(analysis_id)
+        for item in items:
+            if item.get("artifact_id") == artifact_id:
+                return item
+        raise StoreError("artifact_not_found", 404)
+
+    # --- Scoped API Credentials & Audit (M7) ---
+
+    def create_scoped_api_key(
+        self,
+        *,
+        label: str,
+        scopes: list[str],
+        expires_in_days: int | None = 30,
+        rate_limit_per_minute: int = 60,
+        quota_limit: int = 1000,
+    ) -> dict:
+        clean_label = (label or "").strip()
+        if not clean_label or len(clean_label) > 120:
+            raise StoreError("invalid_api_key_label", 400)
+        if not scopes:
+            raise StoreError("invalid_api_key_scopes", 400)
+        eff_rate = max(1, int(rate_limit_per_minute))
+        eff_quota = max(1, int(quota_limit))
+        raw_secret = "phk_" + uuid.uuid4().hex + uuid.uuid4().hex[:8]
+        token_prefix = raw_secret[:12]
+        token_sha256 = hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
+        key_id = "KEY-" + uuid.uuid4().hex[:16]
+        now_dt = datetime.now(timezone.utc)
+        created_at = now_dt.isoformat().replace("+00:00", "Z")
+        expires_at = None
+        if expires_in_days is not None:
+            exp_ts = now_dt.timestamp() + int(expires_in_days) * 86400
+            expires_at = datetime.fromtimestamp(exp_ts, timezone.utc).isoformat().replace("+00:00", "Z")
+        normalized_scopes = sorted(set(scopes))
+        with self.connection(write=True) as db:
+            db.execute(
+                """INSERT INTO api_keys(
+                     key_id, label, token_prefix, token_sha256, scopes,
+                     created_at, expires_at, rate_limit_per_minute, quota_limit
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    key_id,
+                    clean_label,
+                    token_prefix,
+                    token_sha256,
+                    json.dumps(normalized_scopes),
+                    created_at,
+                    expires_at,
+                    eff_rate,
+                    eff_quota,
+                ),
+            )
+            db.execute(
+                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                (key_id, "created", "/api/v1/auth/keys", created_at),
+            )
+        return {
+            "key_id": key_id,
+            "name": clean_label,
+            "label": clean_label,
+            "token": raw_secret,
+            "token_prefix": token_prefix,
+            "scopes": normalized_scopes,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "revoked_at": None,
+            "rate_limit_per_minute": eff_rate,
+            "rate_limit_rpm": eff_rate,
+            "quota_limit": eff_quota,
+            "total_requests": 0,
+        }
+
+    def list_scoped_api_keys(self) -> list[dict]:
+        with self.connection() as db:
+            rows = db.execute("SELECT * FROM api_keys ORDER BY created_at DESC, key_id DESC").fetchall()
+        return [
+            {
+                "key_id": r["key_id"],
+                "name": r["label"],
+                "label": r["label"],
+                "token_prefix": r["token_prefix"],
+                "scopes": json.loads(r["scopes"]),
+                "created_at": r["created_at"],
+                "expires_at": r["expires_at"],
+                "revoked_at": r["revoked_at"],
+                "last_used_at": r["last_used_at"],
+                "rate_limit_per_minute": int(r["rate_limit_per_minute"]),
+                "rate_limit_rpm": int(r["rate_limit_per_minute"]),
+                "quota_limit": int(r["quota_limit"]) if "quota_limit" in r.keys() and r["quota_limit"] is not None else 1000,
+                "total_requests": int(r["total_requests"]),
+            }
+            for r in rows
+        ]
+
+    def revoke_scoped_api_key(self, key_id: str) -> dict:
+        now = utcnow()
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM api_keys WHERE key_id=?", (key_id,)).fetchone()
+            if row is None:
+                raise StoreError("api_key_not_found", 404)
+            db.execute("UPDATE api_keys SET revoked_at=? WHERE key_id=?", (now, key_id))
+            db.execute(
+                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                (key_id, "revoked", f"/api/v1/auth/keys/{key_id}", now),
+            )
+            updated = db.execute("SELECT * FROM api_keys WHERE key_id=?", (key_id,)).fetchone()
+        return {
+            "key_id": updated["key_id"],
+            "name": updated["label"],
+            "label": updated["label"],
+            "token_prefix": updated["token_prefix"],
+            "scopes": json.loads(updated["scopes"]),
+            "created_at": updated["created_at"],
+            "expires_at": updated["expires_at"],
+            "revoked_at": updated["revoked_at"],
+            "rate_limit_per_minute": int(updated["rate_limit_per_minute"]),
+            "rate_limit_rpm": int(updated["rate_limit_per_minute"]),
+            "quota_limit": int(updated["quota_limit"]) if "quota_limit" in updated.keys() and updated["quota_limit"] is not None else 1000,
+            "total_requests": int(updated["total_requests"]),
+        }
+
+    def verify_scoped_api_key(self, raw_token: str, *, required_scope: str | Sequence[str], endpoint: str = "") -> dict:
+        if not raw_token or not raw_token.startswith("phk_"):
+            raise StoreError("unauthorized", 401)
+        token_sha256 = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        now_dt = datetime.now(timezone.utc)
+        now_iso = now_dt.isoformat().replace("+00:00", "Z")
+        current_minute = int(now_dt.timestamp() // 60)
+        required_options = [required_scope] if isinstance(required_scope, str) else list(required_scope)
+        denied: tuple[str, int] | None = None
+        result: dict | None = None
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM api_keys WHERE token_sha256=?", (token_sha256,)).fetchone()
+            if row is None:
+                denied = ("unauthorized", 401)
+            elif row["revoked_at"]:
+                db.execute(
+                    "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                    (row["key_id"], "denied_revoked", endpoint, now_iso),
+                )
+                denied = ("api_key_revoked", 401)
+            elif row["expires_at"] and str(row["expires_at"]) <= now_iso:
+                db.execute(
+                    "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                    (row["key_id"], "denied_expired", endpoint, now_iso),
+                )
+                denied = ("api_key_expired", 401)
+            else:
+                scopes = set(json.loads(row["scopes"]))
+                if not any(req in scopes for req in required_options) and "admin:keys" not in scopes:
+                    first_req = required_options[0] if required_options else ""
+                    db.execute(
+                        "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                        (row["key_id"], f"denied_scope:{first_req}", endpoint, now_iso),
+                    )
+                    denied = ("insufficient_scope", 403)
+                else:
+                    quota_lim = int(row["quota_limit"]) if "quota_limit" in row.keys() and row["quota_limit"] is not None else 1000
+                    if int(row["total_requests"]) >= quota_lim:
+                        db.execute(
+                            "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                            (row["key_id"], "quota_exceeded", endpoint, now_iso),
+                        )
+                        denied = ("api_key_quota_exceeded", 429)
+                    else:
+                        win_min = int(row["window_epoch_minute"])
+                        win_cnt = int(row["window_request_count"]) if win_min == current_minute else 0
+                        limit = int(row["rate_limit_per_minute"])
+                        if win_cnt >= limit:
+                            db.execute(
+                                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                                (row["key_id"], "rate_limited", endpoint, now_iso),
+                            )
+                            denied = ("api_key_rate_limited", 429)
+                        else:
+                            db.execute(
+                                """UPDATE api_keys
+                                   SET last_used_at=?, window_epoch_minute=?, window_request_count=?, total_requests=total_requests+1
+                                   WHERE key_id=?""",
+                                (now_iso, current_minute, win_cnt + 1, row["key_id"]),
+                            )
+                            db.execute(
+                                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                                (row["key_id"], "authorized", endpoint, now_iso),
+                            )
+                            result = {
+                                "key_id": row["key_id"],
+                                "scopes": sorted(scopes),
+                                "rate_limit_per_minute": limit,
+                                "quota_limit": quota_lim,
+                            }
+        if denied is not None:
+            raise StoreError(denied[0], denied[1])
+        assert result is not None
+        return result
+
+    def list_api_key_audit(self, limit: int = 100) -> list[dict]:
+        bounded = max(1, min(int(limit), 500))
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT id, key_id, action, endpoint, created_at FROM api_key_audit ORDER BY id DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- OSINT Cache Management (M3) ---
+
+    def put_osint_cache(
+        self,
+        provider: str,
+        indicator_type: str,
+        indicator: str,
+        state: str,
+        summary: dict,
+        ttl_seconds: int = 3600,
+    ) -> dict:
+        indicator_hash = hashlib.sha256(f"{indicator_type}:{indicator}".encode("utf-8")).hexdigest()[:24]
+        cache_id = "OCACHE-" + hashlib.sha256(f"{provider}:{indicator_hash}".encode("utf-8")).hexdigest()[:20]
+        now_iso = utcnow()
+        expires_at = time.time() + max(60, min(int(ttl_seconds), 86400 * 30))
+        with self.connection(write=True) as db:
+            db.execute(
+                """INSERT OR REPLACE INTO osint_cache(
+                     cache_id, provider, indicator_type, indicator_hash, state, summary_json, cached_at, expires_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    cache_id,
+                    provider,
+                    indicator_type,
+                    indicator_hash,
+                    state,
+                    json.dumps(summary, separators=(",", ":")),
+                    now_iso,
+                    expires_at,
+                ),
+            )
+        return {
+            "cache_id": cache_id,
+            "provider": provider,
+            "indicator_type": indicator_type,
+            "indicator_hash": indicator_hash,
+            "state": state,
+            "summary": summary,
+            "cached_at": now_iso,
+            "expires_at": expires_at,
+        }
+
+    def list_osint_cache(self, limit: int = 100) -> list[dict]:
+        now = time.time()
+        with self.connection(write=True) as db:
+            db.execute("DELETE FROM osint_cache WHERE expires_at <= ?", (now,))
+            rows = db.execute(
+                "SELECT * FROM osint_cache ORDER BY cached_at DESC LIMIT ?",
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [
+            {
+                "cache_id": r["cache_id"],
+                "provider": r["provider"],
+                "indicator_type": r["indicator_type"],
+                "indicator_hash": r["indicator_hash"],
+                "state": r["state"],
+                "summary": json.loads(r["summary_json"]),
+                "cached_at": r["cached_at"],
+                "ttl_remaining_seconds": max(0, int(float(r["expires_at"]) - now)),
+            }
+            for r in rows
+        ]
+
+    def clear_osint_cache(self, provider: str | None = None) -> int:
+        with self.connection(write=True) as db:
+            if provider:
+                cur = db.execute("DELETE FROM osint_cache WHERE provider=?", (provider,))
+            else:
+                cur = db.execute("DELETE FROM osint_cache")
+            return int(cur.rowcount)
+
+    def delete_osint_cache_entry(self, cache_id: str) -> None:
+        with self.connection(write=True) as db:
+            cur = db.execute("DELETE FROM osint_cache WHERE cache_id=?", (cache_id,))
+            if cur.rowcount != 1:
+                raise StoreError("osint_cache_entry_not_found", 404)
+
+    # --- Case Custom IOCs & Local Cross-Case IOC Search (M3) ---
+
+    def add_case_ioc(self, case_id: str, values: dict) -> dict:
+        self._validate_case_id(case_id)
+        raw_type = str(values.get("indicator_type") or values.get("ioc_type") or "").strip().lower()
+        indicator = str(values.get("indicator") or values.get("value") or "").strip()
+        severity = str(values.get("severity") or "medium").strip()
+        tags = [str(t).strip() for t in (values.get("tags") or []) if str(t).strip()][:20]
+        notes = str(values.get("notes") or values.get("note") or "").strip()[:1000]
+        if not indicator:
+            raise StoreError("invalid_case_ioc", 400)
+        if raw_type in {"ip", "ipv4", "ipv6"}:
+            try:
+                ip_obj = ipaddress.ip_address(indicator)
+            except ValueError as exc:
+                raise StoreError("invalid_case_ioc", 400) from exc
+            if raw_type == "ipv4" and ip_obj.version != 4:
+                raise StoreError("invalid_case_ioc", 400)
+            if raw_type == "ipv6" and ip_obj.version != 6:
+                raise StoreError("invalid_case_ioc", 400)
+            indicator_type = "ipv4" if ip_obj.version == 4 else "ipv6"
+            indicator = ip_obj.compressed
+        elif raw_type in {"domain", "md5", "sha1", "sha256", "ja3"}:
+            indicator_type = raw_type
+        else:
+            raise StoreError("invalid_case_ioc", 400)
+        ioc_id = "CIOC-" + uuid.uuid4().hex[:16]
+        now = utcnow()
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            db.execute(
+                """INSERT INTO case_iocs(ioc_id, case_id, indicator_type, indicator, severity, tags, notes, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (ioc_id, case_id, indicator_type, indicator, severity, json.dumps(tags), notes, now),
+            )
+        return {
+            "ioc_id": ioc_id,
+            "case_id": case_id,
+            "indicator_type": indicator_type,
+            "ioc_type": indicator_type,
+            "indicator": indicator,
+            "value": indicator,
+            "severity": severity,
+            "tags": tags,
+            "notes": notes,
+            "note": notes,
+            "created_at": now,
+        }
+
+    def list_case_iocs(self, case_id: str) -> list[dict]:
+        self._validate_case_id(case_id)
+        with self.connection() as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            rows = db.execute(
+                "SELECT * FROM case_iocs WHERE case_id=? ORDER BY created_at DESC, ioc_id ASC",
+                (case_id,),
+            ).fetchall()
+        return [
+            {
+                "ioc_id": r["ioc_id"],
+                "case_id": r["case_id"],
+                "indicator_type": r["indicator_type"],
+                "ioc_type": r["indicator_type"],
+                "indicator": r["indicator"],
+                "value": r["indicator"],
+                "severity": r["severity"],
+                "tags": json.loads(r["tags"]),
+                "notes": r["notes"],
+                "note": r["notes"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def delete_case_ioc(self, case_id: str, ioc_id: str) -> None:
+        self._validate_case_id(case_id)
+        with self.connection(write=True) as db:
+            cur = db.execute("DELETE FROM case_iocs WHERE case_id=? AND ioc_id=?", (case_id, ioc_id))
+            if cur.rowcount != 1:
+                raise StoreError("case_ioc_not_found", 404)
+
+    def search_local_iocs(self, query: str = "", limit: int = 50) -> dict:
+        needle = (query or "").strip().lower()
+        bounded = max(1, min(int(limit), 200))
+        aggregated: dict[tuple[str, str], dict] = {}
+        with self.connection() as db:
+            case_rows = db.execute("SELECT * FROM case_iocs ORDER BY created_at DESC LIMIT 500").fetchall()
+            job_rows = db.execute(
+                "SELECT id, evidence FROM jobs WHERE evidence IS NOT NULL ORDER BY created_at DESC LIMIT 100"
+            ).fetchall()
+            links = db.execute("SELECT case_id, analysis_id FROM case_analyses").fetchall()
+
+        analysis_to_cases: dict[str, set[str]] = {}
+        for link in links:
+            analysis_to_cases.setdefault(str(link["analysis_id"]), set()).add(str(link["case_id"]))
+
+        for row in case_rows:
+            ind = str(row["indicator"])
+            ind_type = str(row["indicator_type"])
+            row_tags = " ".join(str(t) for t in json.loads(row["tags"] or "[]")).lower()
+            row_notes = str(row["notes"] or "").lower()
+            if (
+                needle
+                and needle not in ind.lower()
+                and needle not in ind_type.lower()
+                and needle not in row_tags
+                and needle not in row_notes
+            ):
+                continue
+            key = (ind_type, ind)
+            entry = aggregated.setdefault(
+                key,
+                {
+                    "indicator_type": ind_type,
+                    "indicator": ind,
+                    "severity": str(row["severity"]),
+                    "case_ids": set(),
+                    "analysis_ids": set(),
+                    "sources": set(),
+                },
+            )
+            entry["case_ids"].add(str(row["case_id"]))
+            entry["sources"].add("case_ioc")
+
+        for jrow in job_rows:
+            jid = str(jrow["id"])
+            try:
+                bundle_obj = json.loads(jrow["evidence"])
+            except Exception:
+                continue
+            for ioc in bundle_obj.get("iocs") or []:
+                if not isinstance(ioc, dict):
+                    continue
+                ind = str(ioc.get("indicator") or ioc.get("value") or "")
+                ind_type = str(ioc.get("indicator_type") or ioc.get("type") or "")
+                ctx = str(ioc.get("context") or "").lower()
+                if not ind or (
+                    needle
+                    and needle not in ind.lower()
+                    and needle not in ind_type.lower()
+                    and needle not in ctx
+                ):
+                    continue
+                key = (ind_type, ind)
+                entry = aggregated.setdefault(
+                    key,
+                    {
+                        "indicator_type": ind_type,
+                        "indicator": ind,
+                        "severity": str(ioc.get("priority") or ioc.get("priority_label") or "info"),
+                        "case_ids": set(),
+                        "analysis_ids": set(),
+                        "sources": set(),
+                    },
+                )
+                entry["analysis_ids"].add(jid)
+                entry["case_ids"].update(analysis_to_cases.get(jid, set()))
+                entry["sources"].add("analysis_bundle")
+
+        items = [
+            {
+                "indicator_type": val["indicator_type"],
+                "ioc_type": val["indicator_type"],
+                "indicator": val["indicator"],
+                "value": val["indicator"],
+                "severity": val["severity"],
+                "case_ids": sorted(val["case_ids"]),
+                "analysis_ids": sorted(val["analysis_ids"]),
+                "sources": sorted(val["sources"]),
+            }
+            for val in aggregated.values()
+        ]
+        items.sort(key=lambda x: (-len(x["case_ids"]), -len(x["analysis_ids"]), x["indicator"]))
+        return {"items": items[:bounded], "total": len(items)}

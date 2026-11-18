@@ -28,6 +28,7 @@ from statistics import median
 from typing import Any, Callable, Iterable, Sequence
 
 from .models import (
+    ArtifactRecord,
     CaptureMetrics,
     Coverage,
     Evidence,
@@ -41,12 +42,27 @@ from .models import (
 )
 from .dns_analysis import DNSObservation, analyze_dns_candidates
 from .beacon_analysis import BeaconObservation, analyze_beacon_candidates
-from .ja3_analysis import fingerprints_from_zeek_attributes
+from .ja3_analysis import fingerprints_from_zeek_attributes, match_known_ja3_threat
 from .tls_cert_analysis import TLSCertificateObservation, analyze_tls_certificate_metadata
+from .correlation import (
+    build_ioc_inventory,
+    correlate_bundle_findings,
+    correlate_zeek_and_tshark_evidence,
+)
+from .flow_intel import build_flow_analytics
+from .geoip import build_world_map_flows
+from .mitre import ATTACKMapper
 from .system import probe_capabilities, resolve_adaptive_profile
 from .triage import classify_bundle
 from .zeek import NormalizedZeekRow, bounded_directory_size, parse_zeek_logs
-from .yara import NormalizedYaraMatch, RuleSnapshot, YaraRulesError, snapshot_ruleset
+from .yara import (
+    NormalizedYaraMatch,
+    RuleSnapshot,
+    YaraRulesError,
+    default_rules_dir,
+    detect_carved_content_type,
+    snapshot_ruleset,
+)
 
 
 # Canonical 16-field TShark allowlist kept stable for unit tests and base builds.
@@ -2165,6 +2181,7 @@ def _build_bundle(
     zeek_records: Sequence[NormalizedZeekRow] = (),
     yara_stage: Stage | None = None,
     yara_records: Sequence[NormalizedYaraMatch] = (),
+    carved_artifacts: Sequence[dict[str, Any]] = (),
     parser_name: str = "tshark-fields-offline",
     triage_cfg: object | None = None,
     triage_enabled: bool = True,
@@ -2184,6 +2201,7 @@ def _build_bundle(
     zeek_evidence_cap_hit = False
     yara_evidence_cap_hit = False
     yara_evidence_ids: list[str] = []
+    yara_ev_by_sha: dict[str, str] = {}
     retained_zeek_rows: list[tuple[NormalizedZeekRow, str]] = []
 
     # 1. Include conflicting/high-activity ARP IP->MAC claims first (never buried below huge flows)
@@ -2309,7 +2327,7 @@ def _build_bundle(
                 kind="zeek",
                 summary=record.summary,
                 packet_refs=[],
-                attributes=record.attributes,
+                attributes=dict(record.attributes),
             )
         )
         retained_zeek_rows.append((record, evidence_id))
@@ -2349,6 +2367,7 @@ def _build_bundle(
             )
         )
         yara_evidence_ids.append(evidence_id)
+        yara_ev_by_sha.setdefault(record.object_sha256, evidence_id)
     if yara_evidence_cap_hit and yara_stage.state == "completed":
         yara_stage = yara_stage.model_copy(
             update={
@@ -2359,6 +2378,7 @@ def _build_bundle(
 
     tls_fingerprint_count = 0
     tls_evidence_cap_hit = False
+    ja3_threat_matches: list[tuple[str, str, str]] = []
     tls_observations = [
         TLSCertificateObservation(
             evidence_id=evidence_id,
@@ -2382,6 +2402,11 @@ def _build_bundle(
                 "source_row": record.source_row,
                 "source_evidence_id": source_evidence_id,
             }
+            if fingerprint.kind == "ja3":
+                threat_profile = match_known_ja3_threat(fingerprint.digest)
+                if threat_profile:
+                    metadata["ja3_malicious_match"] = True
+                    ja3_threat_matches.append((fingerprint_evidence_id, fingerprint.digest, threat_profile))
             evidence.append(
                 Evidence(
                     evidence_id=fingerprint_evidence_id,
@@ -2397,6 +2422,10 @@ def _build_bundle(
             tls_fingerprint_count += 1
         if tls_evidence_cap_hit:
             break
+
+    # Cross-link Zeek rows (conn.log, dns.log, ssl.log, x509.log) with TShark flow/dns/tls rows
+    if retained_zeek_rows:
+        correlate_zeek_and_tshark_evidence(evidence)
 
     tls_analysis = analyze_tls_certificate_metadata(tls_observations)
     tls_cap_hit = tls_analysis.truncated or tls_evidence_cap_hit
@@ -2425,6 +2454,48 @@ def _build_bundle(
         )
 
     findings = _detect_findings(accumulator, flow_evidence, dns_evidence, arp_evidence)
+
+    # Evaluate Zeek dns.log answers/TTLs for fast-flux and per-origin NXDOMAIN ratio
+    zeek_dns_obs: list[DNSObservation] = []
+    for record, zeek_ev_id in retained_zeek_rows:
+        if record.log_name != "dns.log":
+            continue
+        q = str(record.attributes.get("query") or "")
+        if not q:
+            continue
+        ans_raw = str(record.attributes.get("dns_answers") or "")
+        answers = tuple(a.strip() for a in ans_raw.split(",") if a.strip()) if ans_raw else ()
+        min_ttl_raw = record.attributes.get("dns_ttl_min")
+        min_ttl = int(min_ttl_raw) if isinstance(min_ttl_raw, int) and not isinstance(min_ttl_raw, bool) else None
+        rcode_raw = record.attributes.get("rcode")
+        rcode = int(rcode_raw) if isinstance(rcode_raw, int) and not isinstance(rcode_raw, bool) else None
+        src_str = str(record.attributes.get("src") or "") or None
+        zeek_dns_obs.append(
+            DNSObservation(
+                query=q,
+                evidence_id=zeek_ev_id,
+                source=src_str,
+                response_code=rcode,
+                answers=answers,
+                min_ttl=min_ttl,
+            )
+        )
+    if zeek_dns_obs:
+        zeek_dns_res = analyze_dns_candidates(zeek_dns_obs)
+        existing_det_ev = {(f.detector, tuple(f.evidence_ids)) for f in findings}
+        for candidate in zeek_dns_res.candidates:
+            if (candidate.detector, candidate.evidence_ids) not in existing_det_ev:
+                _finding(
+                    findings,
+                    detector=candidate.detector,
+                    title=candidate.title,
+                    severity="medium" if candidate.detector == "dns_fast_flux_heuristic" else "low",
+                    confidence="low",
+                    summary=candidate.summary,
+                    evidence_ids=list(candidate.evidence_ids),
+                    limitations=list(candidate.limitations),
+                )
+
     for candidate in tls_analysis.candidates:
         _finding(
             findings,
@@ -2435,6 +2506,20 @@ def _build_bundle(
             summary=candidate.summary,
             evidence_ids=list(candidate.evidence_ids),
             limitations=list(candidate.limitations),
+        )
+    for fp_ev_id, _digest, profile_label in ja3_threat_matches:
+        _finding(
+            findings,
+            detector="tls_ja3_known_signature",
+            title="JA3 client fingerprint matches known threat profile",
+            severity="medium",
+            confidence="low",
+            summary=f"Retained Zeek TLS ClientHello JA3 digest matched local signature profile ({profile_label}).",
+            evidence_ids=[fp_ev_id],
+            limitations=[
+                "JA3 digests fingerprint TLS client stacks and can be shared by benign HTTP libraries or OS runtimes.",
+                "Corroborate with destination IP/SNI, certificate metadata, and periodic beacon timing before escalation.",
+            ],
         )
     dns_analytics_partial = accumulator.dns_velocity_cap_hit or accumulator.dns_analysis_cap_hit
     dns_analysis_stage = _stage(
@@ -2622,6 +2707,59 @@ def _build_bundle(
             escalated_evidence_ids=triage_report.escalated_evidence_ids[:500],
         )
 
+    # Build opaque YARA / carved HTTP artifact metadata records (never sent to external AI)
+    artifacts_by_sha: dict[str, ArtifactRecord] = {}
+    for raw_art in carved_artifacts[:200]:
+        sha = str(raw_art.get("sha256") or "")
+        if not re.fullmatch(r"[a-f0-9]{64}", sha):
+            continue
+        artifacts_by_sha[sha] = ArtifactRecord(
+            artifact_id=f"ART-{sha[:16]}",
+            sha256=sha,
+            size_bytes=max(1, int(raw_art.get("size_bytes") or 1)),
+            content_type=str(raw_art.get("content_type") or "application/octet-stream")[:120],
+            protocol="HTTP",
+            object_index=max(1, int(raw_art.get("object_index") or 1)),
+            matched_rules=[str(r)[:128] for r in (raw_art.get("matched_rules") or [])][:32],
+            evidence_id=yara_ev_by_sha.get(sha),
+            header_hex=str(raw_art.get("header_hex") or "")[:64],
+        )
+    for record in yara_records:
+        sha = record.object_sha256
+        existing_art = artifacts_by_sha.get(sha)
+        if existing_art is None:
+            artifacts_by_sha[sha] = ArtifactRecord(
+                artifact_id=f"ART-{sha[:16]}",
+                sha256=sha,
+                size_bytes=max(1, record.object_size_bytes),
+                content_type="application/octet-stream",
+                protocol="HTTP",
+                object_index=max(1, record.object_index),
+                matched_rules=[record.rule_id],
+                evidence_id=yara_ev_by_sha.get(sha),
+                header_hex="",
+            )
+        elif record.rule_id not in existing_art.matched_rules and len(existing_art.matched_rules) < 32:
+            artifacts_by_sha[sha] = existing_art.model_copy(
+                update={
+                    "matched_rules": [*existing_art.matched_rules, record.rule_id],
+                    "evidence_id": existing_art.evidence_id or yara_ev_by_sha.get(sha),
+                }
+            )
+    artifacts_list = list(artifacts_by_sha.values())[:200]
+
+    flow_analytics = build_flow_analytics(
+        evidence,
+        findings=findings,
+        duration_seconds=duration_s,
+        total_packets=packets_analyzed,
+        total_bytes=accumulator.total_bytes,
+    )
+    geoip_summary = build_world_map_flows(evidence)
+    correlations_list = [item.to_dict() for item in correlate_bundle_findings(evidence, findings)]
+    mitre_dict = ATTACKMapper().map_analysis(findings=findings).to_dict()
+    ioc_inventory = build_ioc_inventory(evidence, findings)
+
     try:
         return EvidenceBundle(
             capture_sha256=capture_sha256,
@@ -2630,6 +2768,12 @@ def _build_bundle(
             findings=findings,
             triage=triage_summary,
             telemetry=telemetry,
+            mitre_attack=mitre_dict,
+            correlations=correlations_list,
+            artifacts=artifacts_list,
+            flow_analytics=flow_analytics,
+            geoip=geoip_summary,
+            iocs=ioc_inventory,
         )
     except Exception:
         raise PipelineError("INTERNAL_CONTRACT_ERROR", "Parser output failed the evidence contract") from None
@@ -2706,6 +2850,7 @@ def _run_yara(
     limits: _Limits,
     deadline: float,
     is_cancelled: Callable[[], bool],
+    carved_artifacts_out: list[dict[str, Any]] | None = None,
 ) -> tuple[Stage, list[NormalizedYaraMatch]]:
     """Carve bounded HTTP objects and scan them locally; never retain object bytes."""
     if not limits.yara_enabled:
@@ -2804,6 +2949,7 @@ def _run_yara(
                 return _stage("yara", "failed", "TShark HTTP object export failed; TShark and Zeek evidence were retained."), []
 
             object_meta: dict[int, tuple[str, int]] = {}
+            object_headers: dict[int, tuple[str, str]] = {}
             for object_index, original_name in enumerate(names, start=1):
                 if is_cancelled():
                     raise PipelineError("CANCELLED", "Offline parser cancelled")
@@ -2825,6 +2971,7 @@ def _run_yara(
                     fd = os.open(safe_path, flags)
                     digest = hashlib.sha256()
                     size = 0
+                    first_head = b""
                     with os.fdopen(fd, "rb") as object_file:
                         opened = os.fstat(object_file.fileno())
                         if not stat.S_ISREG(opened.st_mode) or opened.st_size != info.st_size:
@@ -2840,6 +2987,8 @@ def _run_yara(
                             block = object_file.read(64 * 1024)
                             if not block:
                                 break
+                            if not first_head:
+                                first_head = block[:256]
                             size += len(block)
                             if size > limits.yara_max_object_bytes or carved_bytes + size > limits.yara_max_total_bytes:
                                 partial = True
@@ -2853,6 +3002,10 @@ def _run_yara(
                         continue
                     carved_bytes += size
                     object_meta[object_index] = (digest.hexdigest(), size)
+                    object_headers[object_index] = (
+                        detect_carved_content_type(first_head),
+                        first_head[:32].hex(),
+                    )
                 except PipelineError:
                     raise
                 except OSError:
@@ -2960,6 +3113,25 @@ def _run_yara(
                         partial = True
                     if yara_state == "failed" and not matches:
                         return _stage("yara", "failed", "The local YARA scan failed; TShark and Zeek evidence were retained."), []
+
+            if carved_artifacts_out is not None and object_meta:
+                matched_by_idx: dict[int, list[str]] = {}
+                for m in matches:
+                    rules_for_obj = matched_by_idx.setdefault(m.object_index, [])
+                    if m.rule_id not in rules_for_obj:
+                        rules_for_obj.append(m.rule_id)
+                for idx, (obj_sha, obj_size) in sorted(object_meta.items()):
+                    ctype, hhex = object_headers.get(idx, ("application/octet-stream", ""))
+                    carved_artifacts_out.append(
+                        {
+                            "object_index": idx,
+                            "sha256": obj_sha,
+                            "size_bytes": obj_size,
+                            "content_type": ctype,
+                            "header_hex": hhex,
+                            "matched_rules": matched_by_idx.get(idx, []),
+                        }
+                    )
 
             detail = (
                 f"Offline YARA scanned {objects_scanned} HTTP object(s), retained {len(matches)} rule match(es), "
@@ -3378,11 +3550,13 @@ def analyze_capture(
             "skipped",
             "Disabled by PCAP_ZEEK_ENABLED; set it to 1 to run offline Zeek (requires zeek on PATH).",
         )
+    carved_artifacts: list[dict[str, Any]] = []
     yara_stage, yara_records = _run_yara(
         path,
         limits=limits,
         deadline=deadline,
         is_cancelled=is_cancelled,
+        carved_artifacts_out=carved_artifacts,
     )
     return _build_bundle(
         accumulator,
@@ -3394,6 +3568,7 @@ def analyze_capture(
         zeek_records=zeek_records,
         yara_stage=yara_stage,
         yara_records=yara_records,
+        carved_artifacts=carved_artifacts,
         triage_cfg=triage_cfg,
         triage_enabled=triage_enabled,
         triage_endpoint_consent=triage_endpoint_consent,

@@ -43,6 +43,20 @@ export interface TriageConfigInfo {
   etbert_endpoint_url?: string | null;
   etbert_enabled?: boolean;
   etbert_endpoint_configured?: boolean;
+  etbert_checkpoint_configured?: boolean;
+  etbert_checkpoint_path?: string | null;
+  etbert_checkpoint_info?: {
+    path?: string;
+    exists?: boolean;
+    valid?: boolean;
+    size_bytes?: number;
+    sha256_prefix?: string;
+    tensor_count?: number;
+    vocab_size?: number;
+    hidden_size?: number;
+    num_layers?: number;
+    architecture?: string;
+  } | null;
   etbert_model_name?: string;
   high_confidence_threshold: number;
   low_confidence_threshold: number;
@@ -99,6 +113,8 @@ export interface WorkspaceConfigState {
   data_dir: string;
   local_ingest_roots: string[];
   resource_mode: ResourceMode;
+  etbert_checkpoint_path?: string | null;
+  etbert_checkpoint_info?: TriageConfigInfo["etbert_checkpoint_info"];
   native_picker_available: boolean;
   picker_backend: string | null;
   persisted: boolean;
@@ -111,9 +127,11 @@ export interface WorkspaceUpdatePayload {
   add_local_ingest_root?: string;
   remove_local_ingest_root?: string;
   resource_mode?: ResourceMode;
+  etbert_checkpoint_path?: string;
+  etbert_enabled?: boolean;
 }
 
-export type NativePickPurpose = "data_dir" | "capture_root" | "capture_file";
+export type NativePickPurpose = "data_dir" | "capture_root" | "capture_file" | "model_file";
 
 export interface NativePickResponse {
   cancelled: boolean;
@@ -124,6 +142,7 @@ export interface NativePickResponse {
   size_bytes?: number | null;
   sha256?: string | null;
   grant_expires_in_seconds?: number | null;
+  etbert_checkpoint?: TriageConfigInfo["etbert_checkpoint_info"];
   workspace: WorkspaceConfigState;
 }
 
@@ -301,6 +320,91 @@ export interface CaptureMetrics {
   sample_packets: SamplePacket[];
 }
 
+export interface ArtifactRecord {
+  artifact_id: string;
+  sha256: string;
+  size_bytes: number;
+  content_type: string;
+  protocol?: string;
+  object_index?: number;
+  matched_rules: string[];
+  evidence_id?: string | null;
+  header_hex?: string;
+  review_available?: boolean;
+}
+
+export interface FlowAnalyticsBundle {
+  packet_size_histogram: { bucket: string; count: number }[];
+  iat_histogram: { bucket: string; count: number }[];
+  top_src_ips: { ip: string; packets: number }[];
+  top_dst_ips: { ip: string; packets: number }[];
+  top_public_dst_ips?: { ip: string; packets: number }[];
+  top_dst_ports: { port: number; packets: number }[];
+  top_protos: { protocol: string; packets: number }[];
+  top_domains: { domain: string; count: number }[];
+  sankey_links: { source: string; target: string; service: string; bytes: number; packets: number }[];
+  network_graph: {
+    nodes: { id: string; bytes: number; is_public: boolean }[];
+    edges: { source: string; target: string; bytes: number; packets: number; label: string }[];
+  };
+  traffic_heatmap: { ip: string; buckets: number[] }[];
+}
+
+export interface GeoIPSummary {
+  home?: { lat: number; lon: number; city: string; country: string; continent: string };
+  arcs: {
+    src_id: string;
+    src_label: string;
+    src_lat: number;
+    src_lon: number;
+    dst_id: string;
+    dst_label: string;
+    dst_lat: number;
+    dst_lon: number;
+    packets: number;
+    bytes: number;
+    flows: number;
+    risk: "normal" | "medium" | "high";
+  }[];
+  points: {
+    ip: string;
+    lat: number;
+    lon: number;
+    city: string;
+    country: string;
+    continent: string;
+    packets: number;
+    bytes: number;
+    flows: number;
+    risk: "normal" | "medium" | "high";
+    ptr?: string | null;
+  }[];
+  countries: { country: string; continent: string; packets: number; bytes: number; unique_ips: number }[];
+  continents?: { continent: string; packets: number; bytes: number }[];
+  mapped_public_ips?: number;
+  unmapped_public_ips?: number;
+}
+
+export interface MitreTechniqueCandidate {
+  technique_id: string;
+  technique_name: string;
+  tactic: string;
+  confidence: number;
+  evidence: string[];
+  evidence_ids?: string[];
+  analytic_id?: string;
+  disposition?: string;
+}
+
+export interface MitreAttackMapping {
+  attack_version?: string;
+  schema_version?: string;
+  techniques: MitreTechniqueCandidate[];
+  tactics_summary: Record<string, number>;
+  kill_chain_phase: string;
+  overall_severity: string;
+}
+
 export interface EvidenceBundle {
   schema_version: string;
   capture_sha256: string;
@@ -310,6 +414,12 @@ export interface EvidenceBundle {
   findings: BackendFinding[];
   triage?: Tier1Summary | null;
   telemetry?: CaptureMetrics | null;
+  mitre_attack?: MitreAttackMapping | null;
+  correlations?: Record<string, unknown>[];
+  artifacts?: ArtifactRecord[];
+  flow_analytics?: FlowAnalyticsBundle | null;
+  geoip?: GeoIPSummary | null;
+  iocs?: Record<string, unknown>[];
 }
 
 export interface AIResult {
@@ -425,7 +535,7 @@ export interface BackendReport {
   disclaimer: string;
 }
 
-export type OSINTProviderId = "virustotal" | "abuseipdb" | "greynoise" | "shodan" | "otx";
+export type OSINTProviderId = "virustotal" | "abuseipdb" | "greynoise" | "shodan" | "otx" | "rdns" | "rdap";
 
 export interface OSINTProviderCapability {
   id: OSINTProviderId;
@@ -1002,5 +1112,61 @@ export class PcapApiClient {
     });
     if (!response.ok) await this.throwProblem(response);
     return response.text();
+  }
+
+  createSnapshot(analysisId: string): Promise<Record<string, unknown>> {
+    return this.requestJson<Record<string, unknown>>(`/api/v1/analyses/${analysisId}/snapshot`, {
+      method: "POST",
+    });
+  }
+
+  async getExportCsv(analysisId: string): Promise<string> {
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.csv`), {
+      headers: this.authHeaders({ Accept: "text/csv" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
+  }
+
+  async getExportCef(analysisId: string): Promise<string> {
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.cef`), {
+      headers: this.authHeaders({ Accept: "text/plain" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
+  }
+
+  async getExportNavigatorJson(analysisId: string): Promise<string> {
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.navigator.json`), {
+      headers: this.authHeaders({ Accept: "application/json" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
+  }
+
+  async getExportPdfBlob(analysisId: string): Promise<Blob> {
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.pdf`), {
+      headers: this.authHeaders({ Accept: "application/pdf" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.blob();
+  }
+
+  listArtifacts(analysisId: string): Promise<{ analysis_id: string; items: ArtifactRecord[]; total: number }> {
+    return this.requestJson(`/api/v1/analyses/${analysisId}/artifacts`);
+  }
+
+  listOSINTCache(limit = 50): Promise<{ items: Record<string, unknown>[]; total: number }> {
+    return this.requestJson(`/api/v1/osint/cache?limit=${limit}`);
+  }
+
+  clearOSINTCache(provider?: string): Promise<{ deleted_count: number }> {
+    const q = provider ? `?provider=${encodeURIComponent(provider)}` : "";
+    return this.requestJson(`/api/v1/osint/cache${q}`, { method: "DELETE" });
+  }
+
+  searchLocalIOCs(query = "", limit = 50): Promise<{ items: Record<string, unknown>[]; total: number }> {
+    const q = new URLSearchParams({ query, limit: String(limit) });
+    return this.requestJson(`/api/v1/iocs/search?${q.toString()}`);
   }
 }

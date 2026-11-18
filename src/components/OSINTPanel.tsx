@@ -17,13 +17,15 @@ type Props = {
   onOpenEvidence: (evidenceId: string) => void;
 };
 
-const providerOrder: OSINTProviderId[] = ["virustotal", "abuseipdb", "greynoise", "shodan", "otx"];
+const providerOrder: OSINTProviderId[] = ["virustotal", "abuseipdb", "greynoise", "shodan", "otx", "rdns", "rdap"];
 const providerNames: Record<OSINTProviderId, string> = {
   virustotal: "VirusTotal",
   abuseipdb: "AbuseIPDB",
   greynoise: "GreyNoise",
   shodan: "Shodan",
   otx: "AlienVault OTX",
+  rdns: "Reverse DNS (PTR)",
+  rdap: "RDAP / WHOIS",
 };
 const uncertainProviderStates = new Set([
   "provider_timeout", "operation_timeout", "provider_error", "invalid_provider_response", "response_too_large", "redirect_blocked",

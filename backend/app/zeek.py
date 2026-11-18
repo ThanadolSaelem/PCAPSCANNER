@@ -244,6 +244,42 @@ def _normalize_row(log_name: str, source_row: int, row: dict[str, object]) -> No
         answer_count = _answer_count(row.get("answers"))
         if answer_count is not None:
             attrs["dns_answer_count"] = answer_count
+        raw_answers = row.get("answers")
+        ip_answers: list[str] = []
+        if isinstance(raw_answers, (list, tuple)):
+            candidates_iter = [str(item).strip() for item in raw_answers[:32]]
+        elif isinstance(raw_answers, str) and raw_answers not in {"", "-", "(empty)"}:
+            candidates_iter = [part.strip() for part in raw_answers.split(",")[:32]]
+        else:
+            candidates_iter = []
+        for ans in candidates_iter:
+            try:
+                ip_str = str(ipaddress.ip_address(ans))
+                if ip_str not in ip_answers:
+                    ip_answers.append(ip_str)
+                if len(ip_answers) >= 16:
+                    break
+            except ValueError:
+                continue
+        if ip_answers:
+            attrs["dns_answers"] = ",".join(ip_answers)
+        raw_ttls = row.get("TTLs")
+        ttl_vals: list[int] = []
+        if isinstance(raw_ttls, (list, tuple)):
+            ttl_iter = raw_ttls[:32]
+        elif isinstance(raw_ttls, str) and raw_ttls not in {"", "-", "(empty)"}:
+            ttl_iter = raw_ttls.split(",")[:32]
+        else:
+            ttl_iter = []
+        for item in ttl_iter:
+            try:
+                val = float(str(item).strip())
+                if math.isfinite(val) and 0 <= val <= 2_147_483_647:
+                    ttl_vals.append(int(val))
+            except (TypeError, ValueError):
+                continue
+        if ttl_vals:
+            attrs["dns_ttl_min"] = min(ttl_vals)
         rejected = _boolean(row, "rejected")
         if rejected is not None:
             attrs["dns_rejected"] = rejected
@@ -285,6 +321,12 @@ def _normalize_row(log_name: str, source_row: int, row: dict[str, object]) -> No
         cert_version = _integer(row, "certificate.version", 10_000)
         if cert_version is not None:
             attrs["certificate_version"] = cert_version
+        not_before = _number(row, "certificate.not_valid_before")
+        if not_before is not None and not_before > 0:
+            attrs["certificate_not_valid_before"] = int(not_before)
+        not_after = _number(row, "certificate.not_valid_after")
+        if not_after is not None and not_after > 0:
+            attrs["certificate_not_valid_after"] = int(not_after)
 
     summary = f"{_summary(log_name, attrs)} [{log_name} row {source_row}]"
     return NormalizedZeekRow(log_name=log_name, source_row=source_row, summary=summary, attributes=attrs)

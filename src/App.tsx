@@ -13,10 +13,13 @@ import type {
   WorkspaceConfigState,
 } from "./api/client";
 import { ApiProblemError, PcapApiClient, normalizeBaseUrl } from "./api/client";
+import { AnalyticsVisuals } from "./components/AnalyticsVisuals";
 import ArchitectureExplorer from "./components/ArchitectureExplorer";
 import BatchIntakePanel from "./components/BatchIntakePanel";
 import CasesPage from "./components/CasesPage";
 import OSINTPanel from "./components/OSINTPanel";
+import { WorldFlowMap } from "./components/WorldFlowMap";
+import { PrivacyRedactor } from "./utils/privacy";
 import type {
   WorkspaceFinding,
   WorkspaceFlow,
@@ -665,7 +668,9 @@ function App() {
     navigate("traffic");
   };
 
-  const handleExport = async (kind: "json" | "markdown" | "triage-jsonl" | "stix") => {
+  const handleExport = async (
+    kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
+  ) => {
     if (activeReport.origin === "empty") {
       setToast("ยังไม่มีผลวิเคราะห์จริงให้ส่งออก");
       return;
@@ -681,15 +686,40 @@ function App() {
       setToast(`ดาวน์โหลด ${slug}-report.md แล้ว`);
       return;
     }
-    if (kind === "stix") {
+    if (kind === "stix" || kind === "csv" || kind === "cef" || kind === "navigator" || kind === "pdf") {
       if (activeReport.origin !== "live" || connectionStatus !== "connected") {
-        setToast("STIX 2.1 export ต้องเชื่อมต่อ backend และใช้ผลวิเคราะห์ live");
+        setToast(`${kind.toUpperCase()} export ต้องเชื่อมต่อ backend และใช้ผลวิเคราะห์ live`);
         return;
       }
       try {
-        const stix = await api.getStixJson(activeReport.analysisId);
-        downloadTextFile(`${slug}-stix-2.1.json`, stix, "application/stix+json");
-        setToast(`ดาวน์โหลด ${slug}-stix-2.1.json แล้ว`);
+        if (kind === "stix") {
+          const stix = await api.getStixJson(activeReport.analysisId);
+          downloadTextFile(`${slug}-stix-2.1.json`, stix, "application/stix+json");
+          setToast(`ดาวน์โหลด ${slug}-stix-2.1.json แล้ว`);
+        } else if (kind === "csv") {
+          const csv = await api.getExportCsv(activeReport.analysisId);
+          downloadTextFile(`${slug}-export.csv`, csv, "text/csv");
+          setToast(`ดาวน์โหลด ${slug}-export.csv แล้ว`);
+        } else if (kind === "cef") {
+          const cef = await api.getExportCef(activeReport.analysisId);
+          downloadTextFile(`${slug}-findings.cef`, cef, "text/plain");
+          setToast(`ดาวน์โหลด ${slug}-findings.cef แล้ว`);
+        } else if (kind === "navigator") {
+          const nav = await api.getExportNavigatorJson(activeReport.analysisId);
+          downloadTextFile(`${slug}-attack-navigator.json`, nav, "application/json");
+          setToast(`ดาวน์โหลด ${slug}-attack-navigator.json แล้ว`);
+        } else if (kind === "pdf") {
+          const blob = await api.getExportPdfBlob(activeReport.analysisId);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${slug}-report.pdf`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          setToast(`ดาวน์โหลด ${slug}-report.pdf แล้ว`);
+        }
       } catch (err) {
         setToast(safeFormatError(err));
       }
@@ -755,6 +785,10 @@ function App() {
         setToast(`สลับ Data Directory เป็น ${res.selected_path} แล้ว (API และ Worker ซิงค์อัตโนมัติ)`);
       } else if (purpose === "capture_root") {
         setToast(`เพิ่มโฟลเดอร์ PCAP: ${res.selected_path}`);
+      } else if (purpose === "model_file") {
+        setToast(
+          `เชื่อมต่อโมเดล ET-BERT: ${res.selected_path ?? res.filename ?? "pre-trained_model.bin"} เรียบร้อยแล้ว`,
+        );
       } else if (purpose === "capture_file") {
         if (!res.file_grant_token) {
           setToast("Backend ไม่ได้ออก one-time file grant; เลือกไฟล์ใหม่หรือตรวจรุ่น backend");
@@ -786,6 +820,23 @@ function App() {
       const ws = await api.updateWorkspaceConfig({ data_dir: clean });
       setWorkspaceConfig(ws);
       setToast(`ตั้งค่า Data Directory เป็น ${ws.data_dir} แล้ว`);
+      await refreshWorkspace(true);
+    } catch (err) {
+      setToast(safeFormatError(err));
+    }
+  };
+
+  const handleUpdateModelPath = async (nextPath: string) => {
+    const clean = nextPath.trim();
+    if (!clean) return;
+    if (connectionStatus !== "connected") {
+      setConnectionModalOpen(true);
+      return;
+    }
+    try {
+      const ws = await api.updateWorkspaceConfig({ etbert_checkpoint_path: clean, etbert_enabled: true });
+      setWorkspaceConfig(ws);
+      setToast(`ตั้งค่าไฟล์โมเดล ET-BERT เป็น ${ws.etbert_checkpoint_path ?? clean} แล้ว`);
       await refreshWorkspace(true);
     } catch (err) {
       setToast(safeFormatError(err));
@@ -1020,7 +1071,25 @@ function App() {
           )}
 
           {screen === "overview" && (
-            <OverviewPage report={activeReport} onNavigate={navigate} onSelectFinding={openEvidence} />
+            <OverviewPage
+              report={activeReport}
+              onNavigate={navigate}
+              onSelectFinding={openEvidence}
+              onFilterByIp={(ip) => {
+                setPacketSearch(ip);
+                setProtocolFilter("All protocols");
+                navigate("traffic");
+              }}
+              onFilterByProtocol={(proto) => {
+                const upper = proto.toUpperCase();
+                const matched =
+                  activeReport.packets.find((p) => p.protocol.toUpperCase() === upper)?.protocol ??
+                  activeReport.flows.find((f) => f.protocol.toUpperCase() === upper)?.protocol ??
+                  proto;
+                setProtocolFilter(matched);
+                navigate("traffic");
+              }}
+            />
           )}
 
           {screen === "analyze" && (
@@ -1174,6 +1243,7 @@ function App() {
           isPickingPath={isPickingPath}
           onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
           onUpdateDataDir={(dir) => void handleUpdateDataDir(dir)}
+          onUpdateModelPath={(path) => void handleUpdateModelPath(path)}
           onRemoveRoot={(root) => void handleRemoveLocalRoot(root)}
           onClose={() => setConnectionModalOpen(false)}
           onSave={saveConnectionSettings}
@@ -1202,6 +1272,7 @@ function ConnectionModal({
   isPickingPath,
   onPickNativePath,
   onUpdateDataDir,
+  onUpdateModelPath,
   onRemoveRoot,
   onClose,
   onSave,
@@ -1217,6 +1288,7 @@ function ConnectionModal({
   isPickingPath: boolean;
   onPickNativePath: (purpose: NativePickPurpose) => void;
   onUpdateDataDir: (dir: string) => void;
+  onUpdateModelPath: (path: string) => void;
   onRemoveRoot: (root: string) => void;
   onClose: () => void;
   onSave: (url: string, token: string) => void;
@@ -1226,14 +1298,28 @@ function ConnectionModal({
   const [urlInput, setUrlInput] = useState(initialUrl);
   const [tokenInput, setTokenInput] = useState(initialToken);
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
+  const resolvedModelPath =
+    workspaceConfig?.etbert_checkpoint_path ??
+    capabilities?.triage.etbert_checkpoint_path ??
+    "/Users/thanadol/Downloads/pre-trained_model.bin";
   const [dataDirDraft, setDataDirDraft] = useState(resolvedDataDir);
+  const [modelPathDraft, setModelPathDraft] = useState(resolvedModelPath);
 
   useEffect(() => {
     setDataDirDraft(workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "");
   }, [workspaceConfig?.data_dir, capabilities?.limits.data_dir]);
 
+  useEffect(() => {
+    setModelPathDraft(
+      workspaceConfig?.etbert_checkpoint_path ??
+        capabilities?.triage.etbert_checkpoint_path ??
+        "/Users/thanadol/Downloads/pre-trained_model.bin",
+    );
+  }, [workspaceConfig?.etbert_checkpoint_path, capabilities?.triage.etbert_checkpoint_path]);
+
   const roots = workspaceConfig?.local_ingest_roots ?? capabilities?.limits.local_ingest_roots ?? [];
   const pickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? true;
+  const ckptInfo = workspaceConfig?.etbert_checkpoint_info ?? capabilities?.triage.etbert_checkpoint_info ?? null;
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="conn-modal-title">
@@ -1303,6 +1389,43 @@ function ConnectionModal({
                   onClick={() => onUpdateDataDir(dataDirDraft)}
                 >
                   Apply Path
+                </button>
+              </div>
+
+              <div className="workspace-picker-head workspace-roots-head">
+                <div>
+                  <strong>ET-BERT Local Model Checkpoint (`PCAP_ETBERT_MODEL_BIN`)</strong>
+                  <small>
+                    เชื่อมไฟล์โมเดล <code>pre-trained_model.bin</code> โดยตรงโดยไม่ต้องพึ่งพา Trainer-Pipeline
+                    {ckptInfo?.valid
+                      ? ` · Ready (${ckptInfo.architecture ?? "ET-BERT"} · ${ckptInfo.tensor_count ?? 0} tensors)`
+                      : ""}
+                  </small>
+                </div>
+                <button
+                  type="button"
+                  className="secondary-button tiny-btn"
+                  disabled={isPickingPath || !pickerAvailable}
+                  onClick={() => onPickNativePath("model_file")}
+                >
+                  <Icon name="spark" size={13} />{" "}
+                  {isPickingPath ? "รอเลือก..." : "เลือกไฟล์ .bin (Popup)"}
+                </button>
+              </div>
+              <div className="local-path-row">
+                <input
+                  type="text"
+                  value={modelPathDraft}
+                  onChange={(e) => setModelPathDraft(e.target.value)}
+                  placeholder="/Users/thanadol/Downloads/pre-trained_model.bin"
+                />
+                <button
+                  type="button"
+                  className="secondary-button tiny-btn"
+                  disabled={!modelPathDraft.trim()}
+                  onClick={() => onUpdateModelPath(modelPathDraft)}
+                >
+                  Bind .bin Model
                 </button>
               </div>
 
@@ -1478,10 +1601,14 @@ function OverviewPage({
   report,
   onNavigate,
   onSelectFinding,
+  onFilterByIp,
+  onFilterByProtocol,
 }: {
   report: WorkspaceReport;
   onNavigate: (screen: Screen) => void;
   onSelectFinding: (finding: WorkspaceFinding) => void;
+  onFilterByIp?: (ip: string) => void;
+  onFilterByProtocol?: (proto: string) => void;
 }) {
   const highCount = report.findings.filter((f) => f.severity === "high" || f.severity === "critical").length;
   const medCount = report.findings.filter((f) => f.severity === "medium").length;
@@ -1760,6 +1887,30 @@ function OverviewPage({
           </div>
         </section>
       </div>
+
+      {report.rawBundle?.flow_analytics && (
+        <section className="panel" style={{ marginTop: "1rem" }}>
+          <PanelTitle
+            title="Flow Analytics & Topology"
+            detail="Capped Top Talkers, Protocol Breakdown, Packet Size / IAT Histograms, Sankey & Topology"
+          />
+          <AnalyticsVisuals
+            analytics={report.rawBundle.flow_analytics}
+            protocolCounts={report.rawBundle.telemetry?.protocol_counts}
+            onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
+            onSelectProtocolFilter={(proto) => (onFilterByProtocol ? onFilterByProtocol(proto) : onNavigate("traffic"))}
+          />
+        </section>
+      )}
+
+      {report.rawBundle?.geoip && (
+        <section className="panel" style={{ marginTop: "1rem" }}>
+          <WorldFlowMap
+            geoip={report.rawBundle.geoip}
+            onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
+          />
+        </section>
+      )}
     </>
   );
 }
@@ -3023,48 +3174,49 @@ function TrafficPage({
   }, [report, selectedFinding, packetSearch]);
 
   const protocolOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of report.packets) if (p.protocol) set.add(p.protocol);
-    for (const f of report.flows) if (f.protocol) set.add(f.protocol);
-    return ["All protocols", ...Array.from(set).sort()];
-  }, [report.packets, report.flows]);
+    const map = new Map<string, string>();
+    for (const p of report.packets) if (p.protocol) map.set(p.protocol.toUpperCase(), p.protocol);
+    for (const f of report.flows) if (f.protocol) map.set(f.protocol.toUpperCase(), f.protocol);
+    if (protocolFilter !== "All protocols" && !map.has(protocolFilter.toUpperCase())) {
+      map.set(protocolFilter.toUpperCase(), protocolFilter);
+    }
+    return ["All protocols", ...Array.from(map.values()).sort()];
+  }, [report.packets, report.flows, protocolFilter]);
 
   const severityEvidence = useMemo(() => {
     if (severityFilter === "all") return null;
     return new Set(report.findings.filter((finding) => finding.severity === severityFilter).flatMap((finding) => finding.evidence));
   }, [report.findings, severityFilter]);
 
-  const visiblePackets = useMemo(
-    () =>
-      report.packets.filter((packet) => {
-        if (severityEvidence && (!packet.evidence || !severityEvidence.has(packet.evidence))) return false;
-        const matchesProtocol = protocolFilter === "All protocols" || packet.protocol === protocolFilter;
-        const query = packetSearch.toLowerCase().trim();
-        const matchesSearch =
-          !query ||
-          `${packet.no} ${packet.time} ${packet.source} ${packet.destination} ${packet.protocol} ${packet.info} ${packet.evidence ?? ""} ${packet.triageLabel ?? ""}`
-            .toLowerCase()
-            .includes(query);
-        return matchesProtocol && matchesSearch;
-      }),
-    [report.packets, protocolFilter, packetSearch, severityEvidence],
-  );
+  const visiblePackets = useMemo(() => {
+    const normalizedProto = protocolFilter.toUpperCase();
+    return report.packets.filter((packet) => {
+      if (severityEvidence && (!packet.evidence || !severityEvidence.has(packet.evidence))) return false;
+      const matchesProtocol = protocolFilter === "All protocols" || packet.protocol.toUpperCase() === normalizedProto;
+      const query = packetSearch.toLowerCase().trim();
+      const matchesSearch =
+        !query ||
+        `${packet.no} ${packet.time} ${packet.source} ${packet.destination} ${packet.protocol} ${packet.info} ${packet.evidence ?? ""} ${packet.triageLabel ?? ""}`
+          .toLowerCase()
+          .includes(query);
+      return matchesProtocol && matchesSearch;
+    });
+  }, [report.packets, protocolFilter, packetSearch, severityEvidence]);
 
-  const visibleFlows = useMemo(
-    () =>
-      report.flows.filter((flow) => {
-        if (severityEvidence && !severityEvidence.has(flow.evidence)) return false;
-        const matchesProtocol = protocolFilter === "All protocols" || flow.protocol === protocolFilter;
-        const query = packetSearch.toLowerCase().trim();
-        const matchesSearch =
-          !query ||
-          `${flow.id} ${flow.firstSeen} ${flow.source} ${flow.destination} ${flow.protocol} ${flow.evidence} ${flow.note}`
-            .toLowerCase()
-            .includes(query);
-        return matchesProtocol && matchesSearch;
-      }),
-    [report.flows, protocolFilter, packetSearch, severityEvidence],
-  );
+  const visibleFlows = useMemo(() => {
+    const normalizedProto = protocolFilter.toUpperCase();
+    return report.flows.filter((flow) => {
+      if (severityEvidence && !severityEvidence.has(flow.evidence)) return false;
+      const matchesProtocol = protocolFilter === "All protocols" || flow.protocol.toUpperCase() === normalizedProto;
+      const query = packetSearch.toLowerCase().trim();
+      const matchesSearch =
+        !query ||
+        `${flow.id} ${flow.firstSeen} ${flow.source} ${flow.destination} ${flow.protocol} ${flow.evidence} ${flow.note}`
+          .toLowerCase()
+          .includes(query);
+      return matchesProtocol && matchesSearch;
+    });
+  }, [report.flows, protocolFilter, packetSearch, severityEvidence]);
 
   const selectedPacket: WorkspacePacket | null =
     visiblePackets.find((p) => p.no === selectedPacketNo) ?? visiblePackets[0] ?? report.packets[0] ?? null;
@@ -3404,13 +3556,17 @@ function ReportsPage({
   report: WorkspaceReport;
   apiClient: PcapApiClient;
   connected: boolean;
-  onExport: (kind: "json" | "markdown" | "triage-jsonl" | "stix") => void;
+  onExport: (
+    kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
+  ) => void;
   onChat: (question: string, consent: boolean) => Promise<GroundedChatResponse>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
 }) {
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   const aiActive = report.ai?.state === "completed" && Boolean(report.ai.report);
+  const [privacyMode, setPrivacyMode] = useState(false);
+  const redactor = useMemo(() => new PrivacyRedactor(privacyMode), [privacyMode]);
   const [chatQuestion, setChatQuestion] = useState("");
   const [chatConsent, setChatConsent] = useState(false);
   const [chatPending, setChatPending] = useState(false);
@@ -3452,6 +3608,9 @@ function ReportsPage({
     }
   };
 
+  const mitreTechniques = report.rawBundle?.mitre_attack?.techniques ?? [];
+  const carvedArtifacts = report.rawBundle?.artifacts ?? [];
+
   return (
     <>
       <PageHeading
@@ -3459,7 +3618,15 @@ function ReportsPage({
         title="Analysis report"
         detail="แยกผล detector ที่อิง packet evidence, การคัดกรอง Tier-1 และคำอธิบาย AI อย่างชัดเจน"
         actions={
-          <div className="heading-actions">
+          <div className="heading-actions" style={{ flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setPrivacyMode((prev) => !prev)}
+              title="Pseudonymize IPs, domains, and hashes for documentation screenshots without exporting reverse maps"
+            >
+              <Icon name="shield" size={15} /> {privacyMode ? "Privacy Redaction: ON" : "Privacy Redaction: OFF"}
+            </button>
             <button type="button" className="secondary-button" onClick={() => onExport("triage-jsonl")}>
               <Icon name="download" size={15} /> Export JSONL
             </button>
@@ -3467,9 +3634,23 @@ function ReportsPage({
               <Icon name="download" size={15} /> Export MD
             </button>
             {report.origin === "live" && (
-              <button type="button" className="secondary-button" onClick={() => onExport("stix")}>
-                <Icon name="download" size={15} /> Export STIX 2.1
-              </button>
+              <>
+                <button type="button" className="secondary-button" onClick={() => onExport("pdf")}>
+                  <Icon name="download" size={15} /> Export PDF
+                </button>
+                <button type="button" className="secondary-button" onClick={() => onExport("csv")}>
+                  <Icon name="download" size={15} /> Export CSV
+                </button>
+                <button type="button" className="secondary-button" onClick={() => onExport("cef")}>
+                  <Icon name="download" size={15} /> Export CEF
+                </button>
+                <button type="button" className="secondary-button" onClick={() => onExport("navigator")}>
+                  <Icon name="download" size={15} /> ATT&amp;CK Navigator
+                </button>
+                <button type="button" className="secondary-button" onClick={() => onExport("stix")}>
+                  <Icon name="download" size={15} /> Export STIX 2.1
+                </button>
+              </>
             )}
             <button type="button" className="primary-button" onClick={() => onExport("json")}>
               <Icon name="download" size={15} /> Export JSON
@@ -3537,11 +3718,11 @@ function ReportsPage({
                     <SeverityPill severity={finding.severity} />
                     <div>
                       <strong>
-                        {finding.id} — {finding.title}
+                        {finding.id} — {redactor.redactFreeText(finding.title)}
                       </strong>
-                      <small>{finding.summary}</small>
+                      <small>{redactor.redactFreeText(finding.summary)}</small>
                       <span className="mono">
-                        Target: {finding.destination} · Evidence:{" "}
+                        Target: {redactor.redactEndpoint(finding.destination)} · Evidence:{" "}
                         {finding.evidence.map((ev, i) => (
                           <span key={ev}>
                             {i > 0 ? ", " : ""}
@@ -3557,6 +3738,59 @@ function ReportsPage({
               </div>
             )}
           </div>
+
+          {mitreTechniques.length > 0 && (
+            <div className="report-section" id="report-mitre">
+              <span className="section-kicker">
+                02B / MITRE ATT&amp;CK v19.1 CANDIDATES ({mitreTechniques.length})
+              </span>
+              <h3>Candidate Techniques (Analyst Verification Required)</h3>
+              <div className="report-finding-list">
+                {mitreTechniques.map((tech) => (
+                  <div className="report-finding" key={`${tech.technique_id}-${tech.tactic}`}>
+                    <span className="triage-chip mono">{tech.technique_id}</span>
+                    <div>
+                      <strong>
+                        {tech.technique_name} <span className="mono">({tech.tactic})</span>
+                      </strong>
+                      <small>{redactor.redactFreeText((tech.evidence ?? []).join(" · "))}</small>
+                      <span className="mono">
+                        Candidate Confidence: {Math.round(tech.confidence * 100)}% · Status:{" "}
+                        {tech.disposition ?? "unreviewed"}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {carvedArtifacts.length > 0 && (
+            <div className="report-section" id="report-artifacts">
+              <span className="section-kicker">
+                02C / CARVED HTTP &amp; YARA ARTIFACT INVENTORY ({carvedArtifacts.length})
+              </span>
+              <h3>Opaque Artifact Metadata (Safe Analyst Review)</h3>
+              <div className="report-finding-list">
+                {carvedArtifacts.map((art) => (
+                  <div className="report-finding" key={art.artifact_id}>
+                    <span className="triage-chip mono">{art.artifact_id}</span>
+                    <div>
+                      <strong>
+                        {art.content_type} · {formatBytes(art.size_bytes)}
+                      </strong>
+                      <small className="mono">SHA-256: {redactor.redactHash(art.sha256)}</small>
+                      <span className="mono">
+                        Matched YARA Rules:{" "}
+                        {art.matched_rules.length > 0 ? art.matched_rules.join(", ") : "None (Carved Object)"}
+                        {art.evidence_id ? ` · Evidence: ${art.evidence_id}` : ""}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="report-section ai-report-section" id="report-ai">
             <div className="ai-report-title">
@@ -3591,7 +3825,8 @@ function ReportsPage({
                 <ul className="ai-summary-list">
                   {report.ai.report.summary.map((claim, idx) => (
                     <li key={idx}>
-                      {claim.claim} {claim.evidence_ids.map((eid) => (
+                      {redactor.redactFreeText(claim.claim)}{" "}
+                      {claim.evidence_ids.map((eid) => (
                         <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
                       ))}
                     </li>
@@ -3601,7 +3836,7 @@ function ReportsPage({
                   <ul className="ai-assessment-list">
                     {report.ai.report.assessments.map((a) => (
                       <li key={a.finding_id}>
-                        <b>[{a.finding_id}]</b> ({a.confidence}) {a.interpretation}{" "}
+                        <b>[{a.finding_id}]</b> ({a.confidence}) {redactor.redactFreeText(a.interpretation)}{" "}
                         {a.evidence_ids.map((eid) => (
                           <button key={eid} onClick={() => onOpenEvidence(null, eid)}>
                             [{eid}]
@@ -3615,7 +3850,8 @@ function ReportsPage({
                   <ul className="ai-limitation-list">
                     {report.ai.report.limitations.map((claim, idx) => (
                       <li key={idx}>
-                        Limitation: {claim.claim} {claim.evidence_ids.map((eid) => (
+                        Limitation: {redactor.redactFreeText(claim.claim)}{" "}
+                        {claim.evidence_ids.map((eid) => (
                           <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
                         ))}
                       </li>
@@ -3626,7 +3862,8 @@ function ReportsPage({
                   <ul className="ai-action-list">
                     {report.ai.report.recommended_actions.map((act, idx) => (
                       <li key={idx}>
-                        Action: {act.action} {act.evidence_ids.map((eid) => (
+                        Action: {redactor.redactFreeText(act.action)}{" "}
+                        {act.evidence_ids.map((eid) => (
                           <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
                         ))}
                       </li>
@@ -3664,11 +3901,11 @@ function ReportsPage({
                 </p>
                 {chatTurns.map((turn, turnIndex) => (
                   <div className="grounded-chat-turn" key={`${report.analysisId}-${turnIndex}`}>
-                    <strong>Q: {turn.question}</strong>
+                    <strong>Q: {redactor.redactFreeText(turn.question)}</strong>
                     <ul>
                       {turn.claims.map((claim, claimIndex) => (
                         <li key={claimIndex}>
-                          {claim.claim}{" "}
+                          {redactor.redactFreeText(claim.claim)}{" "}
                           {claim.evidence_ids.map((evidenceId) => (
                             <button key={evidenceId} type="button" className="inline-ev-btn" onClick={() => onOpenEvidence(null, evidenceId)}>
                               [{evidenceId}]
@@ -3719,7 +3956,7 @@ function ReportsPage({
               {report.warnings.map((w, idx) => (
                 <li key={idx}>{w}</li>
               ))}
-              <li>SHA-256: <code className="mono">{report.fullSha}</code></li>
+              <li>SHA-256: <code className="mono">{redactor.redactHash(report.fullSha)}</code></li>
             </ul>
           </div>
         </section>

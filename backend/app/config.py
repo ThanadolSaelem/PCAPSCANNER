@@ -204,6 +204,29 @@ class AIConfig(BaseModel):
         return self
 
 
+DEFAULT_ETBERT_MODEL_CANDIDATES: tuple[str, ...] = (
+    "/Users/thanadol/Downloads/pre-trained_model.bin",
+    str(Path.home() / "Downloads" / "pre-trained_model.bin"),
+)
+
+
+def resolve_default_etbert_checkpoint() -> str | None:
+    env_val = (
+        os.environ.get("PCAP_ETBERT_MODEL_BIN")
+        or os.environ.get("PCAP_TRIAGE_ETBERT_CHECKPOINT_PATH")
+        or ""
+    ).strip()
+    if env_val:
+        return env_val
+    for cand in DEFAULT_ETBERT_MODEL_CANDIDATES:
+        try:
+            if Path(cand).expanduser().is_file():
+                return str(Path(cand).expanduser().resolve())
+        except OSError:
+            continue
+    return None
+
+
 class TriageConfig(BaseModel):
     """Non-secret configuration for the Tier-1 fast calibrated classifier."""
 
@@ -214,6 +237,7 @@ class TriageConfig(BaseModel):
     endpoint_url: str | None = None
     etbert_enabled: bool = False
     etbert_endpoint_url: str | None = None
+    etbert_checkpoint_path: str | None = Field(default_factory=resolve_default_etbert_checkpoint)
     data_boundary: DataBoundary = "local"
     allowed_origins: list[str] = Field(default_factory=list, max_length=20)
     model_name: str = Field(default="openjev-cal-tier1", min_length=1, max_length=120)
@@ -439,6 +463,8 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_TRIAGE_ENDPOINT_URL": ("endpoint_url", "str"),
         "PCAP_TRIAGE_ETBERT_ENABLED": ("etbert_enabled", "bool"),
         "PCAP_TRIAGE_ETBERT_ENDPOINT_URL": ("etbert_endpoint_url", "str"),
+        "PCAP_TRIAGE_ETBERT_CHECKPOINT_PATH": ("etbert_checkpoint_path", "str"),
+        "PCAP_ETBERT_MODEL_BIN": ("etbert_checkpoint_path", "str"),
         "PCAP_TRIAGE_ETBERT_MODEL": ("etbert_model_name", "str"),
         "PCAP_TRIAGE_ETBERT_TIMEOUT_SECONDS": ("etbert_timeout_seconds", "int"),
         "PCAP_TRIAGE_DATA_BOUNDARY": ("data_boundary", "str"),
@@ -558,6 +584,13 @@ def load_settings() -> AppSettings:
             ws_overlay["local_ingest_roots"] = ws_raw["local_ingest_roots"]
         if ws_raw.get("resource_mode"):
             ws_overlay["resource_mode"] = ws_raw["resource_mode"]
+        ws_triage: dict[str, Any] = {}
+        if ws_raw.get("etbert_checkpoint_path"):
+            ws_triage["etbert_checkpoint_path"] = ws_raw["etbert_checkpoint_path"]
+        if isinstance(ws_raw.get("etbert_enabled"), bool):
+            ws_triage["etbert_enabled"] = ws_raw["etbert_enabled"]
+        if ws_triage:
+            ws_overlay["triage"] = ws_triage
         _assert_nonsecret(ws_overlay)
         if ws_raw.get("prefer_workspace"):
             # Desktop UI-picked paths take precedence over ambient shell defaults.
@@ -574,4 +607,4 @@ def load_settings() -> AppSettings:
     return AppSettings.model_validate(merged)
 
 
-__all__ = ["AIConfig", "AppSettings", "ProviderName", "TriageConfig", "load_settings"]
+__all__ = ["AIConfig", "AppSettings", "ProviderName", "TriageConfig", "load_settings", "resolve_default_etbert_checkpoint"]

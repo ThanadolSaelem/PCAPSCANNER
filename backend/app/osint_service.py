@@ -14,11 +14,12 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 from urllib.parse import quote
 
 import httpx
@@ -26,7 +27,7 @@ import httpx
 from .models import EvidenceBundle
 
 MAX_IOCS_PER_OPERATION = 12
-MAX_PROVIDERS_PER_OPERATION = 5
+MAX_PROVIDERS_PER_OPERATION = 7
 MAX_TOTAL_LOOKUPS = MAX_IOCS_PER_OPERATION * MAX_PROVIDERS_PER_OPERATION
 MAX_REQUEST_BYTES = 4 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
@@ -36,7 +37,7 @@ MAX_CANDIDATES_PER_REPORT = 200
 MAX_PROVIDER_RESULT_TEXT = 120
 MAX_RATE_RETRY_AFTER_SECONDS = 300
 
-ProviderId = Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx"]
+ProviderId = Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx", "rdns", "rdap"]
 IndicatorType = Literal["ipv4", "ipv6", "domain", "md5", "sha1", "sha256"]
 
 _PROVIDER_NAMES: dict[str, str] = {
@@ -45,6 +46,8 @@ _PROVIDER_NAMES: dict[str, str] = {
     "greynoise": "GreyNoise",
     "shodan": "Shodan",
     "otx": "AlienVault OTX",
+    "rdns": "Reverse DNS (PTR)",
+    "rdap": "RDAP / WHOIS",
 }
 _KEY_ENV = {
     "virustotal": "PCAP_OSINT_VIRUSTOTAL_API_KEY",
@@ -59,6 +62,8 @@ _ACK_ENV = {
     "greynoise": "PCAP_OSINT_GREYNOISE_LICENSE_ACK",
     "shodan": "PCAP_OSINT_SHODAN_AUTOMATION_ACK",
     "otx": "PCAP_OSINT_OTX_AUTHORIZED_USE_ACK",
+    "rdns": "PCAP_OSINT_RDNS_ACK",
+    "rdap": "PCAP_OSINT_RDAP_ACK",
 }
 _SHODAN_LOG_REDACTION_ACK_ENV = "PCAP_OSINT_SHODAN_QUERY_LOG_REDACTION_ACK"
 _PRIVATE_DOMAIN_SUFFIXES = {
@@ -98,6 +103,8 @@ _REFERENCE_DOCS = {
     "greynoise": "https://docs.greynoise.io/reference/getcommunityip",
     "shodan": "https://developer.shodan.io/api",
     "otx": "https://otx.alienvault.com/api",
+    "rdns": "https://www.rfc-editor.org/rfc/rfc1035",
+    "rdap": "https://www.rfc-editor.org/rfc/rfc9083",
 }
 _MIN_REQUEST_INTERVAL_SECONDS = {
     "virustotal": 1.0,
@@ -105,6 +112,8 @@ _MIN_REQUEST_INTERVAL_SECONDS = {
     "greynoise": 1.0,
     "shodan": 1.0,
     "otx": 1.0,
+    "rdns": 0.25,
+    "rdap": 0.5,
 }
 _SUPPORTED_TYPES: dict[str, set[str]] = {
     "virustotal": {"ipv4", "ipv6", "domain", "md5", "sha1", "sha256"},
@@ -112,6 +121,8 @@ _SUPPORTED_TYPES: dict[str, set[str]] = {
     "greynoise": {"ipv4", "ipv6"},
     "shodan": {"ipv4", "domain"},
     "otx": {"ipv4", "ipv6", "domain", "md5", "sha1", "sha256"},
+    "rdns": {"ipv4", "ipv6"},
+    "rdap": {"ipv4", "ipv6", "domain"},
 }
 _IP_ATTRIBUTE_KEYS = {"src", "dst", "src_ip", "dst_ip", "source_ip", "destination_ip", "id_orig_h", "id_resp_h"}
 _DOMAIN_ATTRIBUTE_KEYS = {"query", "tls_server_name", "server_name", "hostname", "domain", "dns_qry_name"}
@@ -365,25 +376,75 @@ def _allowlisted_summary(provider: str, payload: object) -> dict[str, Any]:
         validation = attrs.get("validation", payload.get("validation"))
         if isinstance(validation, bool):
             summary["validated"] = validation
+    elif provider == "rdns":
+        ptr_host = _safe_string(attrs.get("ptr_hostname"), 253)
+        if ptr_host:
+            summary["ptr_hostname"] = ptr_host
+        alias_count = _safe_int(attrs.get("aliases_count"), 0, 100)
+        if alias_count is not None:
+            summary["aliases_count"] = alias_count
+    elif provider == "rdap":
+        for key, out_key in (
+            ("handle", "handle"),
+            ("name", "network_name"),
+            ("country", "country"),
+            ("ldhName", "ldh_name"),
+            ("startAddress", "start_address"),
+            ("endAddress", "end_address"),
+        ):
+            val = _safe_string(attrs.get(key, payload.get(key)), 120)
+            if val:
+                summary[out_key] = val
+        statuses = attrs.get("status", payload.get("status"))
+        if isinstance(statuses, list):
+            clean_statuses = [s for x in statuses if (s := _safe_string(x, 64))]
+            if clean_statuses:
+                summary["status"] = clean_statuses[:8]
     return summary
 
 
 class OSINTService:
     """Read-only fixed-origin provider broker with fresh consent per operation."""
 
-    def __init__(self, transport: httpx.AsyncBaseTransport | None = None, *, env: Mapping[str, str] | None = None, minimum_interval_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        minimum_interval_seconds: float = 1.0,
+        rdns_resolver: Callable[[str], tuple[str, list[str], list[str]]] | None = None,
+    ) -> None:
         self._transport = transport
         self._env = env if env is not None else os.environ
         self._minimum_interval_seconds = max(0.0, min(float(minimum_interval_seconds), 60.0))
+        self._rdns_resolver = rdns_resolver
+        self._rotated_keys: dict[str, str] = {}
+
+    def rotate_key(self, provider: str, api_key: str) -> dict[str, Any]:
+        """Rotate an in-memory provider API key without exposing secret material."""
+        if provider not in _KEY_ENV:
+            raise ValueError("unsupported_provider_key_rotation")
+        cleaned = _clean_key(api_key)
+        if cleaned is None:
+            raise ValueError("invalid_api_key_format")
+        self._rotated_keys[provider] = cleaned
+        return {
+            "provider": provider,
+            "state": "rotated",
+            "key_fingerprint": hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12],
+            "rotated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
 
     def _provider_config(self, provider: str) -> _ProviderConfig:
         ack = _truthy(self._env.get(_ACK_ENV[provider]))
-        raw_key = self._env.get(_KEY_ENV[provider])
+        raw_key = self._rotated_keys.get(provider) or (self._env.get(_KEY_ENV[provider]) if provider in _KEY_ENV else None)
         key = _clean_key(raw_key)
         if provider == "shodan" and not _truthy(self._env.get(_SHODAN_LOG_REDACTION_ACK_ENV)):
             return _ProviderConfig(key, False, "query_log_redaction_ack_required")
         if not ack:
             return _ProviderConfig(key, False, "terms_ack_required")
+        if provider in {"rdns", "rdap"}:
+            return _ProviderConfig(None, True, "ready")
         if provider == "greynoise" and key is None:
             return _ProviderConfig(None, True, "community")
         if key is None:
@@ -523,6 +584,28 @@ class OSINTService:
 
     async def _request_one(self, client: httpx.AsyncClient, provider: str, candidate: IOCCandidate, key: str | None) -> dict[str, Any]:
         indicator = candidate.indicator
+        if provider == "rdns":
+            resolver = self._rdns_resolver or socket.gethostbyaddr
+            try:
+                host_tuple = await asyncio.wait_for(
+                    asyncio.to_thread(resolver, indicator),
+                    timeout=PER_REQUEST_TIMEOUT_SECONDS,
+                )
+            except (socket.herror, socket.gaierror):
+                return self._result(candidate, provider, "not_found")
+            except (asyncio.TimeoutError, TimeoutError):
+                return self._result(candidate, provider, "provider_timeout")
+            except OSError:
+                return self._result(candidate, provider, "provider_error")
+            hostname = str(host_tuple[0] or "").rstrip(".").lower() if host_tuple else ""
+            aliases = host_tuple[1] if len(host_tuple) > 1 and isinstance(host_tuple[1], list) else []
+            return self._result(
+                candidate,
+                provider,
+                "completed" if hostname else "not_found",
+                _allowlisted_summary("rdns", {"ptr_hostname": hostname, "aliases_count": len(aliases)}),
+            )
+
         encoded = quote(indicator, safe=".-")
         headers: dict[str, str] = {}
         params: dict[str, str] = {}
@@ -552,6 +635,12 @@ class OSINTService:
             # Shodan's documented REST API places the key in a query parameter.
             # Do not log request URLs or propagate HTTP exceptions.
             params["key"] = key or ""
+        elif provider == "rdap":
+            if candidate.indicator_type == "domain":
+                url = f"https://rdap.org/domain/{encoded}"
+            else:
+                url = f"https://rdap.arin.net/registry/ip/{encoded}"
+            headers["Accept"] = "application/rdap+json, application/json"
         else:
             kind = "IPv4" if candidate.indicator_type == "ipv4" else "IPv6" if candidate.indicator_type == "ipv6" else "domain" if candidate.indicator_type == "domain" else "file"
             url = f"https://otx.alienvault.com/api/v1/indicators/{kind}/{encoded}/general"

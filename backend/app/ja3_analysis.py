@@ -201,3 +201,21 @@ def fingerprints_from_zeek_attributes(
         if digest is not None:
             records.append(TLSFingerprint(kind=kind, digest=digest, tls_version=version, cipher=cipher))
     return tuple(records)
+
+
+KNOWN_SUSPICIOUS_JA3: dict[str, str] = {
+    "72a589da586844d7f0818ce684948eea": "Cobalt Strike / Malicious C2 Client Profile",
+    "a0e9f5d64349fb13191bc781f81f42e1": "Metasploit / Meterpreter TLS Profile",
+    "51c64c77e60f3980eea90869b68c58a8": "TrickBot / Banking Trojan TLS Profile",
+    "e7d705a3286e19ea42f587b344ee6865": "AsyncRAT / .NET C2 TLS Profile",
+    "6734f37431670b3ab4292b8f60f29984": "QakBot / IcedID TLS Profile",
+    "4d7a28d6f2263ed61de88ca66eb011e3": "Emotet Loader TLS Profile",
+}
+
+
+def match_known_ja3_threat(digest: object) -> str | None:
+    """Return a known threat profile label if the validated 32-hex JA3 digest matches."""
+    normalized = validate_ja3_hash(digest)
+    if normalized is None:
+        return None
+    return KNOWN_SUSPICIOUS_JA3.get(normalized)

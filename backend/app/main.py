@@ -31,19 +31,23 @@ from .models import (
     CaseAnalysisLinkRequest,
     CaseCreateRequest,
     CaseDetail,
+    CaseIOCCreateRequest,
     CaseListResponse,
     CaseNoteCreateRequest,
     CasePatchRequest,
     ChunkUploadInitRequest,
     EvidenceBundle,
     GroundedChatRequest,
+    OSINTKeyRotateRequest,
     OSINTLookupRequest,
     LocalCaptureRequest,
     NativePickRequest,
     ProblemDetails,
+    ScopedKeyCreateRequest,
     WorkspaceUpdateRequest,
 )
 from .picker import (
+    ALLOWED_MODEL_EXTENSIONS,
     PickerError,
     detect_picker_backend,
     is_loopback_client,
@@ -56,6 +60,13 @@ from .picker import (
 from .store import ACTIVE, Store, StoreError
 from .system import build_capabilities_payload, probe_capabilities, recommended_chunk_size_bytes
 from .triage import bundle_to_triage_jsonl
+from .etbert_bridge import inspect_etbert_checkpoint
+from .yara import default_rules_dir, inspect_yara_rules
+from .geoip import build_world_map_flows
+from .exporters.csv_json import export_findings_and_evidence_csv
+from .exporters.cef import export_findings_cef
+from .exporters.navigator import export_attack_navigator_layer
+from .exporters.pdf_report import export_snapshot_pdf
 from .llm import generate_chat_completion
 from .llm.chat import ChatLimits, answer_question
 from .stix_export import export_stix_bundle
@@ -196,6 +207,30 @@ def problem(status: int, code: str, request_id: str | None = None, headers=None)
     )
 
 
+def _required_scope_for_request(method: str, path: str) -> tuple[str, ...]:
+    if path.startswith("/api/v1/auth/keys"):
+        return ("admin:keys",)
+    if path.endswith((".csv", ".cef", ".navigator.json", ".pdf", ".stix.json", ".jsonl")):
+        return ("export:reports",)
+    if path.endswith("/snapshot"):
+        if method == "GET":
+            return ("read:manifest", "export:reports", "read:analyses")
+        return ("export:reports",)
+    if path.endswith("/report"):
+        return ("read:report", "read:analyses")
+    if path.endswith(("/evidence", "/artifacts", "/geoip")) or "/artifacts/" in path:
+        return ("read:evidence", "read:analyses")
+    if "/osint" in path or path.startswith("/api/v1/iocs"):
+        return ("read:osint", "read:analyses") if method == "GET" else ("write:osint",)
+    if path.startswith("/api/v1/cases"):
+        return ("read:cases",) if method == "GET" else ("write:cases",)
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        return ("write:analyses",)
+    if path.startswith("/api/v1/analyses"):
+        return ("read:status", "read:analyses")
+    return ("read:analyses", "read:status")
+
+
 class BoundaryMiddleware:
     """Authenticate before reading bodies; bound JSON even without Content-Length."""
 
@@ -214,8 +249,25 @@ class BoundaryMiddleware:
                 return await problem(503, "api_credentials_not_configured", rid)(scope, receive, send)
             try:
                 scheme, supplied = headers.get(b"authorization", b"").decode("ascii").split(" ", 1)
-                authorized = scheme.lower() == "bearer" and hmac.compare_digest(supplied, token)
             except (ValueError, UnicodeError):
+                scheme, supplied = "", ""
+            if scheme.lower() != "bearer" or not supplied:
+                return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
+            if hmac.compare_digest(supplied, token):
+                authorized = True
+            elif supplied.startswith("phk_"):
+                app_obj = scope.get("app")
+                store_obj = getattr(getattr(app_obj, "state", None), "store", None)
+                if store_obj is None:
+                    return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
+                req_scope = _required_scope_for_request(scope.get("method", "GET"), scope["path"])
+                try:
+                    store_obj.verify_scoped_api_key(supplied, required_scope=req_scope, endpoint=scope["path"])
+                    authorized = True
+                except StoreError as exc:
+                    hdrs = {"WWW-Authenticate": "Bearer"} if exc.status == 401 else ({"Retry-After": "60"} if exc.status == 429 else None)
+                    return await problem(exc.status, exc.code, rid, hdrs)(scope, receive, send)
+            else:
                 authorized = False
             if not authorized:
                 return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
@@ -322,10 +374,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         cfg_now = _cfg()
         ws_path = resolve_workspace_config_path()
         picker_backend = detect_picker_backend() if is_native_picker_enabled() else None
+        ckpt_path = getattr(cfg_now.triage, "etbert_checkpoint_path", None)
+        ckpt_info = inspect_etbert_checkpoint(ckpt_path)
         return {
             "data_dir": str(Path(cfg_now.data_dir).expanduser().resolve()),
             "local_ingest_roots": [str(r) for r in _allowed_roots(cfg_now)],
             "resource_mode": str(getattr(cfg_now, "resource_mode", "auto")),
+            "etbert_checkpoint_path": ckpt_path,
+            "etbert_checkpoint_configured": bool(ckpt_path),
+            "etbert_enabled": bool(getattr(cfg_now.triage, "etbert_enabled", False) or ckpt_info.get("ready")),
+            "etbert_checkpoint_info": ckpt_info,
+            "etbert_checkpoint_status": ckpt_info,
             "native_picker_available": bool(picker_backend is not None),
             "picker_backend": picker_backend,
             "persisted": bool(ws_path is not None),
@@ -354,6 +413,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         new_data_dir: str | None = None,
         new_roots: list[str] | None = None,
         new_resource_mode: str | None = None,
+        new_etbert_checkpoint_path: str | None = None,
+        new_etbert_enabled: bool | None = None,
     ) -> dict[str, object]:
         cfg_now = _cfg()
         store_now = _store()
@@ -392,6 +453,25 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if new_resource_mode is not None:
             update_fields["resource_mode"] = new_resource_mode
 
+        triage_updates: dict[str, object] = {}
+        if new_etbert_checkpoint_path is not None:
+            cleaned_ckpt = new_etbert_checkpoint_path.strip()
+            if cleaned_ckpt:
+                if "\x00" in cleaned_ckpt:
+                    raise HTTPException(400, "invalid_etbert_checkpoint_path")
+                resolved_ckpt = Path(cleaned_ckpt).expanduser().resolve()
+                if not resolved_ckpt.is_file() or resolved_ckpt.suffix.lower() not in ALLOWED_MODEL_EXTENSIONS:
+                    raise HTTPException(400, "invalid_etbert_checkpoint_path")
+                triage_updates["etbert_checkpoint_path"] = str(resolved_ckpt)
+                if new_etbert_enabled is None:
+                    triage_updates["etbert_enabled"] = True
+            else:
+                triage_updates["etbert_checkpoint_path"] = None
+        if new_etbert_enabled is not None:
+            triage_updates["etbert_enabled"] = bool(new_etbert_enabled)
+        if triage_updates:
+            update_fields["triage"] = cfg_now.triage.model_copy(update=triage_updates)
+
         if update_fields:
             updated_cfg = cfg_now.model_copy(update=update_fields)
             app.state.settings = updated_cfg
@@ -403,6 +483,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     data_dir=str(updated_cfg.data_dir),
                     local_ingest_roots=list(updated_cfg.local_ingest_roots),
                     resource_mode=str(updated_cfg.resource_mode),
+                    etbert_checkpoint_path=updated_cfg.triage.etbert_checkpoint_path,
+                    etbert_enabled=bool(updated_cfg.triage.etbert_enabled),
                     prefer_workspace=True,
                 )
 
@@ -434,6 +516,21 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def capabilities():
         return build_capabilities_payload(_cfg())
 
+    @app.get("/api/v1/system/etbert", tags=["System"])
+    def etbert_status():
+        cfg_now = _cfg()
+        status = inspect_etbert_checkpoint(cfg_now.triage.etbert_checkpoint_path)
+        return {
+            **status,
+            "etbert_enabled": bool(cfg_now.triage.etbert_enabled or status.get("ready")),
+            "mode": str(cfg_now.triage.mode),
+        }
+
+    @app.get("/api/v1/yara/rules", tags=["System"])
+    def yara_rules_inventory():
+        cfg_now = _cfg()
+        return inspect_yara_rules(cfg_now.yara_rules_dir or default_rules_dir())
+
     @app.get("/api/v1/system/workspace", tags=["System"])
     def get_workspace():
         return _workspace_state()
@@ -463,6 +560,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             new_data_dir=body.data_dir,
             new_roots=next_roots,
             new_resource_mode=body.resource_mode,
+            new_etbert_checkpoint_path=body.etbert_checkpoint_path,
+            new_etbert_enabled=body.etbert_enabled,
         )
 
     @app.post("/api/v1/system/pick-path", tags=["System"])
@@ -511,6 +610,24 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "cancelled": False,
                 "purpose": "capture_root",
                 "selected_path": str(picked),
+                "workspace": ws_state,
+            }
+
+        if body.purpose == "model_file":
+            if not picked.is_file() or picked.suffix.lower() not in ALLOWED_MODEL_EXTENSIONS:
+                raise HTTPException(415, "unsupported_model_extension")
+            resolved_model = str(picked.resolve(strict=True))
+            ws_state = _apply_workspace_mutation(
+                new_etbert_checkpoint_path=resolved_model,
+                new_etbert_enabled=True,
+            )
+            ckpt_info = inspect_etbert_checkpoint(resolved_model)
+            return {
+                "cancelled": False,
+                "purpose": "model_file",
+                "selected_path": resolved_model,
+                "etbert_checkpoint": ckpt_info,
+                "etbert_status": ckpt_info,
                 "workspace": ws_state,
             }
 
@@ -932,6 +1049,26 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         _store().delete_case_note(case_id, note_id)
         return Response(status_code=204)
 
+    @app.get("/api/v1/cases/{case_id}/iocs", tags=["Cases"])
+    def list_case_iocs(case_id: str):
+        return {"items": _store().list_case_iocs(case_id)}
+
+    @app.post("/api/v1/cases/{case_id}/iocs", status_code=201, tags=["Cases"])
+    def create_case_ioc(case_id: str, body: CaseIOCCreateRequest):
+        return _store().add_case_ioc(case_id, body.model_dump())
+
+    @app.delete("/api/v1/cases/{case_id}/iocs/{ioc_id}", status_code=204, tags=["Cases"])
+    def delete_case_ioc(case_id: str, ioc_id: str):
+        _store().delete_case_ioc(case_id, ioc_id)
+        return Response(status_code=204)
+
+    @app.get("/api/v1/iocs/search", tags=["OSINT"])
+    def search_iocs(
+        query: Annotated[str, Query(max_length=256)] = "",
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ):
+        return _store().search_local_iocs(query=query, limit=limit)
+
     @app.post("/api/v1/analyses", status_code=202, tags=["Analyses"])
     def analyze(body: AnalysisRequest, idempotency_key: Annotated[str | None, Header(max_length=128)] = None):
         cfg_now = _cfg()
@@ -973,6 +1110,54 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="triage-{analysis_id[:8]}.jsonl"'},
         )
 
+    @app.post("/api/v1/analyses/{analysis_id}/snapshot", status_code=201, tags=["Reports"])
+    def create_analysis_snapshot(analysis_id: str):
+        return _store().create_snapshot(analysis_id)
+
+    @app.get("/api/v1/analyses/{analysis_id}/snapshot", tags=["Reports"])
+    def get_analysis_snapshot(analysis_id: str, snapshot_id: Annotated[str | None, Query(max_length=64)] = None):
+        snap = _store().get_or_create_snapshot(analysis_id, snapshot_id=snapshot_id)
+        return {k: v for k, v in snap.items() if not k.startswith("_")}
+
+    @app.get("/api/v1/analyses/{analysis_id}/artifacts", tags=["Evidence"])
+    def list_analysis_artifacts(analysis_id: str):
+        items = _store().list_artifacts(analysis_id)
+        return {"analysis_id": analysis_id, "items": items, "total": len(items)}
+
+    @app.get("/api/v1/analyses/{analysis_id}/artifacts/{artifact_id}", tags=["Evidence"])
+    def get_analysis_artifact(
+        analysis_id: str,
+        artifact_id: str,
+        download: Annotated[bool, Query()] = False,
+    ):
+        item = _store().get_artifact(analysis_id, artifact_id)
+        if download:
+            safe_meta = json.dumps(
+                {
+                    "artifact": item,
+                    "safety_notice": "Raw carved binary bytes are not served directly; verify SHA-256 and YARA rule metadata offline.",
+                },
+                indent=2,
+            )
+            return Response(
+                content=safe_meta.encode("utf-8"),
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{artifact_id}-metadata.json"',
+                },
+            )
+        return item
+
+    @app.get("/api/v1/analyses/{analysis_id}/geoip", tags=["Evidence"])
+    def get_analysis_geoip(analysis_id: str):
+        row = _store().job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        if bundle.geoip:
+            return bundle.geoip
+        return build_world_map_flows(bundle.evidence)
+
     @app.get("/api/v1/analyses/{analysis_id}/report", tags=["Reports"])
     def report(analysis_id: str):
         store_now = _store()
@@ -999,6 +1184,39 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     @app.get("/api/v1/osint/capabilities", tags=["OSINT"])
     def osint_capabilities():
         return app.state.osint_service.capabilities(enabled=bool(_cfg().osint_enabled))
+
+    @app.get("/api/v1/osint/cache", tags=["OSINT"])
+    def list_osint_cache_entries(limit: Annotated[int, Query(ge=1, le=200)] = 100):
+        items = _store().list_osint_cache(limit=limit)
+        return {"items": items, "total": len(items)}
+
+    @app.post("/api/v1/osint/cache/clear", tags=["OSINT"])
+    def clear_osint_cache_entries(provider: Annotated[str | None, Query(max_length=32)] = None):
+        deleted = _store().clear_osint_cache(provider=provider)
+        return {"deleted": deleted, "deleted_count": deleted, "provider": provider}
+
+    @app.delete("/api/v1/osint/cache", tags=["OSINT"])
+    def delete_all_osint_cache_entries(provider: Annotated[str | None, Query(max_length=32)] = None):
+        deleted = _store().clear_osint_cache(provider=provider)
+        return {"deleted": deleted, "deleted_count": deleted, "provider": provider}
+
+    @app.delete("/api/v1/osint/cache/{cache_id}", status_code=204, tags=["OSINT"])
+    def delete_osint_cache_entry(cache_id: str):
+        _store().delete_osint_cache_entry(cache_id)
+        return Response(status_code=204)
+
+    @app.post("/api/v1/osint/keys/rotate", tags=["OSINT"])
+    def rotate_osint_key(body: OSINTKeyRotateRequest):
+        try:
+            result = app.state.osint_service.rotate_key(body.provider, body.api_key)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        cleared = _store().clear_osint_cache(provider=body.provider) if body.invalidate_cache else 0
+        return {
+            **result,
+            "cache_invalidated": bool(body.invalidate_cache),
+            "deleted_cache_entries": cleared,
+        }
 
     @app.get("/api/v1/analyses/{analysis_id}/osint/candidates", tags=["OSINT"])
     def osint_candidates(analysis_id: str):
@@ -1116,6 +1334,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     enabled=bool(_cfg().osint_enabled),
                 )
                 result["operation_id"] = body.operation_id
+                for item in result.get("results", []):
+                    if isinstance(item, dict) and item.get("state") in {"completed", "partial", "not_found"}:
+                        cand_obj = by_id.get(str(item.get("candidate_id")))
+                        if cand_obj is not None:
+                            store_now.put_osint_cache(
+                                str(item.get("provider")),
+                                cand_obj.indicator_type,
+                                cand_obj.indicator,
+                                str(item.get("state")),
+                                dict(item.get("summary") or {}),
+                            )
                 store_now.save_osint_result(
                     analysis_id,
                     json.dumps(result, separators=(",", ":"), ensure_ascii=True),
@@ -1188,23 +1417,128 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "claims": [claim.model_dump(mode="json") for claim in result.claims],
             "prompt_sha256": result.prompt_sha256,
             "error_code": result.error_code,
+            "usage": result.usage,
             "transcript_persisted": False,
         }
 
-    @app.get("/api/v1/analyses/{analysis_id}/export.stix.json", tags=["Reports"])
-    def export_stix(analysis_id: str):
+    def _resolve_snapshot_and_bundle(
+        analysis_id: str, snapshot_id: str | None = None
+    ) -> tuple[dict, EvidenceBundle]:
         if not re.fullmatch(r"[a-f0-9]{32}", analysis_id):
             raise HTTPException(404, "analysis_not_found")
-        row = _store().job(analysis_id, internal=True)
-        if not row["evidence"]:
-            raise HTTPException(409, "evidence_not_ready")
-        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        snap = _store().get_or_create_snapshot(analysis_id, snapshot_id=snapshot_id)
+        bundle = EvidenceBundle.model_validate_json(snap["_bundle_json"])
+        manifest = {k: v for k, v in snap.items() if not k.startswith("_")}
+        return manifest, bundle
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.stix.json", tags=["Reports"])
+    def export_stix(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
         payload = export_stix_bundle(bundle)
+        payload["x_pcapscanner_snapshot_id"] = manifest["snapshot_id"]
         return JSONResponse(
             content=payload,
             media_type="application/stix+json",
-            headers={"Content-Disposition": f'attachment; filename="pcap-stix-{analysis_id[:8]}.json"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-stix-{analysis_id[:8]}.json"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
         )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.csv", tags=["Reports"])
+    def export_csv(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        csv_text = export_findings_and_evidence_csv(bundle, snapshot_id=manifest["snapshot_id"])
+        return Response(
+            content=csv_text.encode("utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-findings-{analysis_id[:8]}.csv"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.cef", tags=["Reports"])
+    def export_cef(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        cef_text = export_findings_cef(bundle, snapshot_id=manifest["snapshot_id"])
+        return PlainTextResponse(
+            content=cef_text,
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-siem-{analysis_id[:8]}.cef"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.navigator.json", tags=["Reports"])
+    def export_navigator(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        layer = export_attack_navigator_layer(
+            bundle,
+            snapshot_id=manifest["snapshot_id"],
+            analysis_id=analysis_id,
+        )
+        return JSONResponse(
+            content=layer,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-attack-navigator-{analysis_id[:8]}.json"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.pdf", tags=["Reports"])
+    def export_pdf(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        pdf_bytes = export_snapshot_pdf(bundle, snapshot=manifest)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-forensic-report-{analysis_id[:8]}.pdf"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.post("/api/v1/auth/keys", status_code=201, tags=["Auth"])
+    def create_scoped_key(body: ScopedKeyCreateRequest):
+        return _store().create_scoped_api_key(
+            label=body.name,
+            scopes=list(body.scopes),
+            expires_in_days=body.expires_in_days,
+            rate_limit_per_minute=body.rate_limit_rpm,
+            quota_limit=body.quota_limit,
+        )
+
+    @app.get("/api/v1/auth/keys", tags=["Auth"])
+    def list_scoped_keys():
+        items = _store().list_scoped_api_keys()
+        return {"items": items, "total": len(items)}
+
+    @app.delete("/api/v1/auth/keys/{key_id}", tags=["Auth"])
+    def revoke_scoped_key(key_id: str):
+        return _store().revoke_scoped_api_key(key_id)
+
+    @app.get("/api/v1/auth/keys/audit", tags=["Auth"])
+    def list_scoped_key_audit(limit: Annotated[int, Query(ge=1, le=500)] = 100):
+        items = _store().list_api_key_audit(limit=limit)
+        return {"items": items, "total": len(items)}
 
     @app.get("/api/v1/ai/config", tags=["AI"])
     def ai_config():

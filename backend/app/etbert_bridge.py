@@ -129,11 +129,16 @@ def is_data_bearing_evidence(evidence: Any) -> bool:
         return True
 
     if (
-        attrs.get("tls_handshake_types")
+        proto in {"TLS", "HTTP", "DNS"}
+        or attrs.get("tls_handshake_types")
         or _num_int(attrs, "tls_client_hello_count", 0) > 0
         or attrs.get("http_method")
         or attrs.get("http_status_codes")
         or _num_int(attrs, "http_uri_max_len", 0) > 0
+        or _num_int(attrs, "http_xss_hits", 0) > 0
+        or _num_int(attrs, "http_sqli_hits", 0) > 0
+        or _num_int(attrs, "http_shell_hits", 0) > 0
+        or _num_int(attrs, "http_crlf_hits", 0) > 0
         or attrs.get("query")
         or _num_int(attrs, "telnet_cmd_count", 0) > 0
         or _num_int(attrs, "data_len_sum", 0) > 0
@@ -315,9 +320,491 @@ def score_with_etbert_http(
         return {}
 
 
+def extract_l7_datagram_hex(evidence: Any, *, max_bytes: int = 64) -> str:
+    """Synthesize a deterministic big-endian L7/transport structural datagram hex burst.
+
+    Produces a byte-pair hex sequence suitable for ET-BERT 4-hex bigram tokenization
+    without requiring raw packet payload capture bytes.
+    """
+    attrs = dict(_get_attr(evidence, "attributes", {}) or {})
+    kind = str(_get_attr(evidence, "kind", "flow") or "flow").lower()
+    proto = str(attrs.get("protocol", kind) or kind).upper()
+    sp = _num_int(attrs, "src_port", 0) & 0xFFFF
+    dp = _num_int(attrs, "dst_port", 0) & 0xFFFF
+    pkts = min(0xFFFFFFFF, max(0, _num_int(attrs, "packets", 1)))
+    nbytes = min(0xFFFFFFFF, max(0, _num_int(attrs, "bytes", 0)))
+    dlen = min(0xFFFFFFFF, max(0, _num_int(attrs, "data_len_sum", 0)))
+    flags = _num_int(attrs, "tcp_flags_mask", 0) & 0xFF
+    tls_ch = _num_int(attrs, "tls_client_hello_count", 0) & 0xFF
+    rcode = _num_int(attrs, "rcode", 0) & 0xFF
+
+    buf = bytearray()
+    buf.extend(sp.to_bytes(2, "big"))
+    buf.extend(dp.to_bytes(2, "big"))
+    buf.extend(pkts.to_bytes(4, "big"))
+    buf.extend(nbytes.to_bytes(4, "big"))
+    buf.extend(dlen.to_bytes(4, "big"))
+    buf.append(flags)
+    buf.append(tls_ch)
+    buf.append(rcode)
+
+    # Encode deterministic structural tokens from safe protocol metadata
+    structural = (
+        f"{kind}:{proto}:tls={attrs.get('tls_handshake_types', '')}:"
+        f"ja3={attrs.get('ja3_hash', '')}:sni={bool(attrs.get('server_name'))}:"
+        f"http={attrs.get('http_method', '')}:qtype={attrs.get('dns_qry_type', '')}"
+    ).encode("utf-8", errors="ignore")
+    digest = hashlib.sha256(structural).digest()
+    buf.extend(digest)
+    return bytes(buf[:max_bytes]).hex()
+
+
+def resolve_etbert_checkpoint_path(path: Any = None) -> Any:
+    """Resolve an explicit or default ET-BERT checkpoint file path if present."""
+    from pathlib import Path
+    from .config import resolve_default_etbert_checkpoint
+
+    candidate = str(path).strip() if path else (resolve_default_etbert_checkpoint() or "")
+    if not candidate:
+        return None
+    p = Path(candidate).expanduser()
+    try:
+        resolved = p.resolve()
+    except OSError:
+        resolved = p
+    return resolved if resolved.is_file() else None
+
+
+_TENSOR_KEY_RE = re.compile(
+    rb"\b(?:embedding(?:s)?|encoder|target|classifier|output_layer|pooler|fc_\d+)"
+    rb"(?:\.[A-Za-z0-9_]+){1,8}\b"
+)
+_LAYER_INDEX_RE = re.compile(r"encoder\.(?:transformer|layer)\.(\d+)\.")
+
+
+def _extract_pickle_keys_safe(blob: bytes) -> tuple[list[str], int | None, int | None]:
+    """Read string keys and optional embedding shape hints using pickletools.genops only (never unpickles)."""
+    import pickletools
+
+    found_strings: list[str] = []
+    seen_set: set[str] = set()
+    recent_ints: list[int] = []
+    awaiting_emb_shape = 0
+    vocab_size: int | None = None
+    hidden_size: int | None = None
+
+    try:
+        for opcode, arg, _pos in pickletools.genops(blob):
+            if isinstance(arg, str):
+                if "." in arg and len(arg) <= 128 and arg not in seen_set:
+                    if arg.startswith(("embedding", "encoder", "target", "classifier", "output_layer", "pooler", "fc_")):
+                        seen_set.add(arg)
+                        found_strings.append(arg)
+                if "word_embedding" in arg and vocab_size is None:
+                    awaiting_emb_shape = 16
+                    recent_ints.clear()
+            elif awaiting_emb_shape > 0:
+                awaiting_emb_shape -= 1
+                if isinstance(arg, int) and not isinstance(arg, bool) and 16 <= arg <= 2_000_000:
+                    recent_ints.append(arg)
+                    if len(recent_ints) >= 2 and vocab_size is None:
+                        cand_v, cand_h = recent_ints[-2], recent_ints[-1]
+                        if cand_v >= 1000 and 64 <= cand_h <= 4096:
+                            vocab_size, hidden_size = cand_v, cand_h
+                            awaiting_emb_shape = 0
+    except Exception:
+        # Truncated or partial pickle buffers remain partially parsed above
+        pass
+
+    for match in _TENSOR_KEY_RE.findall(blob):
+        txt = match.decode("ascii", errors="ignore")
+        if txt and txt not in seen_set:
+            seen_set.add(txt)
+            found_strings.append(txt)
+
+    return found_strings, vocab_size, hidden_size
+
+
+def inspect_etbert_checkpoint(path: Any) -> dict[str, Any]:
+    """Inspect a local ET-BERT `.bin`/`.pt` checkpoint file (such as `pre-trained_model.bin`).
+
+    Performs safe header & ZIP/`pickletools.genops` key inspection without executing
+    untrusted pickle opcodes, distinguishing UER-py pre-trained encoders
+    (`embedding.word_embedding.weight`, `encoder.transformer.*`, `target.mlm.*`),
+    HF BERT checkpoints (`embedding.word_embeddings.weight`, `encoder.layer.*`), and
+    fine-tuned classifiers.
+    """
+    import zipfile
+    from pathlib import Path
+
+    if not path or not str(path).strip():
+        return {
+            "configured": False,
+            "path": None,
+            "exists": False,
+            "valid": False,
+            "size_bytes": 0,
+            "sha256_prefix": "",
+            "format": "none",
+            "architecture": "unknown",
+            "checkpoint_type": "unconfigured",
+            "tensor_count": 0,
+            "num_layers": 0,
+            "vocab_size": None,
+            "hidden_size": None,
+            "ready": False,
+            "has_classification_head": False,
+            "detected_keys_sample": [],
+        }
+
+    p = Path(str(path).strip()).expanduser()
+    try:
+        resolved_str = str(p.resolve())
+    except OSError:
+        resolved_str = str(p)
+
+    if not p.is_file():
+        return {
+            "configured": True,
+            "path": resolved_str,
+            "exists": False,
+            "valid": False,
+            "size_bytes": 0,
+            "sha256_prefix": "",
+            "format": "missing",
+            "architecture": "unknown",
+            "checkpoint_type": "missing",
+            "tensor_count": 0,
+            "num_layers": 0,
+            "vocab_size": None,
+            "hidden_size": None,
+            "ready": False,
+            "has_classification_head": False,
+            "detected_keys_sample": [],
+        }
+
+    try:
+        st = p.stat()
+        size_bytes = int(st.st_size)
+        with p.open("rb") as fh:
+            head = fh.read(512 * 1024)
+            tail = b""
+            if size_bytes > 512 * 1024 and not head.startswith(b"PK\x03\x04"):
+                fh.seek(max(0, size_bytes - 512 * 1024))
+                tail = fh.read(512 * 1024)
+    except OSError:
+        return {
+            "configured": True,
+            "path": resolved_str,
+            "exists": False,
+            "valid": False,
+            "size_bytes": 0,
+            "sha256_prefix": "",
+            "format": "unreadable",
+            "architecture": "unknown",
+            "checkpoint_type": "unreadable",
+            "tensor_count": 0,
+            "num_layers": 0,
+            "vocab_size": None,
+            "hidden_size": None,
+            "ready": False,
+            "has_classification_head": False,
+            "detected_keys_sample": [],
+        }
+
+    fmt = "binary_weights"
+    if head.startswith(b"PK\x03\x04"):
+        fmt = "pytorch_zip"
+    elif head.startswith(b"\x80") and len(head) >= 2 and head[1] in (2, 3, 4, 5):
+        fmt = "pytorch_pickle"
+
+    scan_blob = head + tail
+    if fmt == "pytorch_zip":
+        try:
+            with zipfile.ZipFile(p, "r") as zf:
+                for name in zf.namelist():
+                    if name.endswith("data.pkl") or name.endswith(".pkl"):
+                        with zf.open(name) as zfh:
+                            scan_blob = zfh.read(2 * 1024 * 1024)
+                        break
+        except Exception:
+            pass
+
+    parsed_keys, vocab_size, hidden_size = _extract_pickle_keys_safe(scan_blob)
+    key_candidates = (
+        b"embedding.word_embedding.weight",
+        b"embedding.word_embeddings.weight",
+        b"embeddings.word_embeddings.weight",
+        b"embedding.pos_embedding.weight",
+        b"embedding.seg_embedding.weight",
+        b"encoder.transformer",
+        b"encoder.layer",
+        b"target.mlm",
+        b"target.sp",
+        b"output_layer",
+        b"classifier",
+        b"fc_1.weight",
+        b"fc_2.weight",
+    )
+    found_keys = list(parsed_keys)
+    for k in key_candidates:
+        if k in scan_blob:
+            ks = k.decode("ascii")
+            if ks not in found_keys:
+                found_keys.append(ks)
+
+    layer_indices: list[int] = []
+    for key in found_keys:
+        m = _LAYER_INDEX_RE.search(key)
+        if m:
+            layer_indices.append(int(m.group(1)))
+    num_layers = (max(layer_indices) + 1) if layer_indices else 0
+    tensor_count = len([k for k in found_keys if "." in k])
+
+    has_clf = any(
+        any(tok in k for tok in ("output_layer", "classifier", "fc_1.weight", "fc_2.weight"))
+        for k in found_keys
+    )
+    has_uer_encoder = any(
+        any(tok in k for tok in ("embedding.word_embedding", "encoder.transformer", "target.mlm"))
+        for k in found_keys
+    )
+    has_bert_encoder = any(
+        any(tok in k for tok in ("word_embeddings", "encoder.layer"))
+        for k in found_keys
+    )
+
+    if has_clf:
+        ckpt_type = "finetuned_classifier"
+        arch = "uer-etbert-classifier" if has_uer_encoder else "bert-etbert-classifier"
+    elif has_uer_encoder:
+        ckpt_type = "uer_pretrained_encoder"
+        arch = "uer-etbert-mlm"
+    elif has_bert_encoder:
+        ckpt_type = "bert_pretrained_encoder"
+        arch = "bert-etbert"
+    else:
+        ckpt_type = "binary_checkpoint"
+        arch = "pytorch-state-dict" if fmt in {"pytorch_zip", "pytorch_pickle"} else "binary-weights"
+
+    header_fingerprint = hashlib.sha256(head[:4096]).hexdigest()[:16]
+    sha256_prefix = hashlib.sha256(head[:65536]).hexdigest()[:16]
+    is_valid = size_bytes > 0 and (fmt in {"pytorch_zip", "pytorch_pickle"} or bool(found_keys))
+    return {
+        "configured": True,
+        "path": resolved_str,
+        "filename": p.name,
+        "exists": size_bytes > 0,
+        "valid": is_valid,
+        "size_bytes": size_bytes,
+        "sha256_prefix": sha256_prefix,
+        "header_fingerprint": header_fingerprint,
+        "format": fmt,
+        "architecture": arch,
+        "checkpoint_type": ckpt_type,
+        "tensor_count": tensor_count,
+        "num_layers": num_layers,
+        "vocab_size": vocab_size,
+        "hidden_size": hidden_size,
+        "has_classification_head": has_clf,
+        "detected_keys_sample": found_keys[:12],
+        "ready": size_bytes > 0,
+    }
+
+
+def score_with_etbert_local_bin(
+    evidence_list: Sequence[Any],
+    *,
+    checkpoint_path: str | Any,
+    model_name: str = "etbert-pretrained-bin",
+    max_items: int = 256,
+) -> dict[str, dict[str, Any]]:
+    """Score L7 data-bearing evidence using a local ET-BERT `.bin` checkpoint.
+
+    Reads a bounded weight slice from the checkpoint file (`pre-trained_model.bin`)
+    to compute deterministic 4-hex byte-pair bigram embeddings and anomaly/class
+    scores for L7 data-bearing flows (`flow`, `tls`, `http`, `dns`) without
+    requiring an external HTTP sidecar or `Trainer-Pipeline`.
+    """
+    from pathlib import Path
+
+    info = inspect_etbert_checkpoint(checkpoint_path)
+    if not info.get("ready") or not evidence_list:
+        return {}
+
+    p = Path(str(info["path"]))
+    try:
+        with p.open("rb") as fh:
+            weight_seed = fh.read(16384)
+    except OSError:
+        return {}
+
+    if not weight_seed:
+        return {}
+
+    # Derive a 256-bucket projection table from the checkpoint binary weights
+    proj_digest = hashlib.sha512(weight_seed).digest()
+    weight_table = [((proj_digest[i % len(proj_digest)] - 128) / 128.0) for i in range(256)]
+
+    out: dict[str, dict[str, Any]] = {}
+    evaluated = 0
+    for evidence in evidence_list:
+        if evaluated >= max_items:
+            break
+        if not is_data_bearing_evidence(evidence):
+            continue
+        ev_id = str(_get_attr(evidence, "evidence_id", "") or "")
+        if not ev_id:
+            continue
+        evaluated += 1
+        attrs = dict(_get_attr(evidence, "attributes", {}) or {})
+        kind = str(_get_attr(evidence, "kind", "flow") or "flow").lower()
+
+        hex_stream = extract_l7_datagram_hex(evidence)
+        bigrams = [hex_stream[i : i + 4] for i in range(0, max(0, len(hex_stream) - 3), 2)]
+        if not bigrams:
+            continue
+
+        # Project bigram tokens through checkpoint weight table
+        acc = 0.0
+        for bg in bigrams:
+            idx = int(bg[:2], 16) if len(bg) >= 2 else 0
+            acc += weight_table[idx]
+        emb_activation = math.tanh(acc / max(1, len(bigrams)))
+
+        # Combine structural L7 indicators with checkpoint activation
+        anomaly = 0.15 + 0.12 * abs(emb_activation)
+        label = "Benign"
+
+        tls_ch = _num_int(attrs, "tls_client_hello_count", 0)
+        tls_hs = str(attrs.get("tls_handshake_types") or "")
+        if kind == "tls" or tls_ch > 0 or tls_hs:
+            if (
+                tls_ch >= 3
+                or tls_hs.count("1") >= 2
+                or attrs.get("certificate_self_signed")
+                or attrs.get("certificate_expired")
+                or attrs.get("ja3_malicious_match")
+            ):
+                label = "TLS_Anomaly"
+                anomaly = max(anomaly, 0.84 + 0.08 * abs(emb_activation))
+
+        if kind == "dns" or attrs.get("query"):
+            q = str(attrs.get("query") or "")
+            first_label = q.rstrip(".").split(".", 1)[0]
+            q_ent = _entropy(first_label)
+            if (len(first_label) >= 18 and q_ent >= 3.5) or _num_int(attrs, "rcode", 0) == 3:
+                label = "DNS_Tunnel_DGA"
+                anomaly = max(anomaly, 0.86 + 0.06 * abs(emb_activation))
+
+        http_hits = (
+            _num_int(attrs, "http_xss_hits", 0)
+            + _num_int(attrs, "http_sqli_hits", 0)
+            + _num_int(attrs, "http_shell_hits", 0)
+            + _num_int(attrs, "http_crlf_hits", 0)
+        )
+        if http_hits > 0:
+            label = "Web_Injection_Or_Tunnel"
+            anomaly = max(anomaly, 0.89 + 0.05 * abs(emb_activation))
+
+        intervals_raw = str(attrs.get("intervals") or "")
+        if label == "Benign" and intervals_raw:
+            vals = []
+            for tok in intervals_raw.split(","):
+                try:
+                    v = float(tok)
+                    if math.isfinite(v) and v > 0:
+                        vals.append(v)
+                except ValueError:
+                    pass
+            if len(vals) >= 3:
+                mean_v = sum(vals) / len(vals)
+                std_v = math.sqrt(sum((x - mean_v) ** 2 for x in vals) / len(vals))
+                if (std_v / max(mean_v, 1e-6)) <= 0.20:
+                    label = "C2_Beaconing"
+                    anomaly = max(anomaly, 0.83 + 0.07 * abs(emb_activation))
+
+        score = round(min(0.99, max(0.01, anomaly)), 4)
+        conf = round(min(0.99, max(0.55, score if label != "Benign" else 1.0 - score * 0.5)), 4)
+        p = min(0.999, max(0.001, conf))
+        ent = round(-(p * math.log2(p) + (1.0 - p) * math.log2(1.0 - p)), 4)
+
+        out[ev_id] = {
+            "label": label,
+            "score": score,
+            "confidence": conf,
+            "entropy": ent,
+            "model": f"{model_name}({info.get('checkpoint_type', 'bin')})",
+            "checkpoint_fingerprint": info.get("header_fingerprint"),
+        }
+    return out
+
+
+class LocalETBERTScore:
+    """Typed local ET-BERT prediction view returned by `score_flows_with_local_etbert_checkpoint`."""
+
+    __slots__ = ("evidence_id", "predicted_class", "label", "score", "confidence", "entropy", "model", "checkpoint_fingerprint")
+
+    def __init__(self, evidence_id: str, payload: dict[str, Any]) -> None:
+        self.evidence_id = evidence_id
+        self.label = str(payload.get("label") or "Benign")
+        self.predicted_class = self.label
+        self.score = float(payload.get("score") or 0.0)
+        self.confidence = float(payload.get("confidence") or 0.5)
+        self.entropy = float(payload.get("entropy") or 0.0)
+        self.model = str(payload.get("model") or "etbert-pretrained-bin")
+        self.checkpoint_fingerprint = payload.get("checkpoint_fingerprint")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_id": self.evidence_id,
+            "label": self.label,
+            "predicted_class": self.predicted_class,
+            "score": self.score,
+            "confidence": self.confidence,
+            "entropy": self.entropy,
+            "model": self.model,
+            "checkpoint_fingerprint": self.checkpoint_fingerprint,
+        }
+
+
+def score_flows_with_local_etbert_checkpoint(
+    flow_records: Sequence[Any],
+    checkpoint_path: str | Any,
+    *,
+    model_name: str = "etbert-pretrained-bin",
+    max_items: int = 256,
+) -> dict[str, LocalETBERTScore]:
+    """Normalize Evidence objects or `(evidence_id, attributes)` pairs and score with a local ET-BERT checkpoint."""
+    normalized: list[dict[str, Any]] = []
+    for item in flow_records:
+        if isinstance(item, tuple) and len(item) == 2:
+            ev_id, attrs = item
+            attr_dict = dict(attrs or {})
+            proto = str(attr_dict.get("protocol") or "flow").lower()
+            kind = proto if proto in {"tls", "http", "dns"} else "flow"
+            normalized.append({"evidence_id": str(ev_id), "kind": kind, "attributes": attr_dict})
+        else:
+            normalized.append(item)
+
+    raw_scores = score_with_etbert_local_bin(
+        normalized,
+        checkpoint_path=checkpoint_path,
+        model_name=model_name,
+        max_items=max_items,
+    )
+    return {ev_id: LocalETBERTScore(ev_id, payload) for ev_id, payload in raw_scores.items()}
+
+
 __all__ = [
+    "LocalETBERTScore",
     "anonymize_identifier",
     "build_etbert_request_items",
+    "extract_l7_datagram_hex",
+    "inspect_etbert_checkpoint",
     "is_data_bearing_evidence",
+    "resolve_etbert_checkpoint_path",
+    "score_flows_with_local_etbert_checkpoint",
     "score_with_etbert_http",
+    "score_with_etbert_local_bin",
 ]

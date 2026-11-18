@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 
@@ -114,6 +114,19 @@ class CaptureMetrics(Contract):
     sample_packets: list[SamplePacket] = Field(default_factory=list, max_length=250)
 
 
+class ArtifactRecord(Contract):
+    artifact_id: str = Field(pattern=r"^ART-[a-f0-9]{16}$")
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int = Field(ge=0)
+    content_type: str = Field(default="application/octet-stream", max_length=120)
+    protocol: str = Field(default="HTTP", max_length=32)
+    object_index: int = Field(default=0, ge=0)
+    matched_rules: list[str] = Field(default_factory=list, max_length=50)
+    evidence_id: EvidenceId | None = None
+    header_hex: str = Field(default="", max_length=64)
+    review_available: bool = False
+
+
 class EvidenceBundle(Contract):
     schema_version: Literal["1.0"] = "1.0"
     capture_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -123,6 +136,12 @@ class EvidenceBundle(Contract):
     findings: list[Finding] = Field(max_length=1000)
     triage: Tier1Summary | None = None
     telemetry: CaptureMetrics | None = None
+    mitre_attack: dict[str, Any] | None = None
+    correlations: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    artifacts: list[ArtifactRecord] = Field(default_factory=list, max_length=200)
+    flow_analytics: dict[str, Any] | None = None
+    geoip: dict[str, Any] | None = None
+    iocs: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
 
     @model_validator(mode="after")
     def cross_references(self):
@@ -203,7 +222,7 @@ class GroundedChatRequest(Contract):
 class OSINTLookupRequest(Contract):
     operation_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     candidate_ids: list[Annotated[str, Field(pattern=r"^IOC-[a-f0-9]{16}$")]] = Field(min_length=1, max_length=12)
-    providers: list[Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx"]] = Field(min_length=1, max_length=5)
+    providers: list[Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx", "rdns", "rdap"]] = Field(min_length=1, max_length=7)
     consent: StrictBool
     accept_uncertain_retry_risk: StrictBool = False
 
@@ -239,10 +258,12 @@ class WorkspaceUpdateRequest(Contract):
     add_local_ingest_root: str | None = Field(default=None, min_length=1, max_length=1024)
     remove_local_ingest_root: str | None = Field(default=None, min_length=1, max_length=1024)
     resource_mode: Literal["auto", "fast", "deep", "unlimited"] | None = None
+    etbert_checkpoint_path: str | None = Field(default=None, min_length=1, max_length=1024)
+    etbert_enabled: bool | None = None
 
 
 class NativePickRequest(Contract):
-    purpose: Literal["data_dir", "capture_root", "capture_file"]
+    purpose: Literal["data_dir", "capture_root", "capture_file", "model_file"]
 
 
 class BatchItemResponse(Contract):
@@ -383,3 +404,59 @@ class CaseDetail(CaseSummary):
 class CaseListResponse(Contract):
     items: list[CaseSummary] = Field(max_length=100)
     total: int = Field(ge=0)
+
+
+ScopedKeyScope = Literal[
+    "read:status",
+    "read:manifest",
+    "read:evidence",
+    "read:report",
+    "read:analyses",
+    "write:analyses",
+    "read:cases",
+    "write:cases",
+    "read:osint",
+    "write:osint",
+    "export:reports",
+    "admin:keys",
+]
+
+
+class ScopedKeyCreateRequest(Contract):
+    name: str = Field(min_length=1, max_length=120)
+    scopes: list[ScopedKeyScope] = Field(min_length=1, max_length=12)
+    expires_in_days: int | None = Field(default=30, ge=1, le=365)
+    quota_limit: int = Field(default=1000, ge=1, le=1_000_000)
+    rate_limit_rpm: int = Field(default=60, ge=1, le=6000)
+
+    @model_validator(mode="after")
+    def clean_key_fields(self):
+        self.name = self.name.strip()
+        if not self.name:
+            raise ValueError("name must not be blank")
+        if len(set(self.scopes)) != len(self.scopes):
+            raise ValueError("scopes must be unique")
+        return self
+
+
+class OSINTKeyRotateRequest(Contract):
+    provider: Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx"]
+    api_key: str = Field(min_length=4, max_length=256)
+    invalidate_cache: bool = True
+
+
+class CaseIOCCreateRequest(Contract):
+    ioc_type: Literal["ip", "ipv4", "ipv6", "domain", "md5", "sha1", "sha256", "ja3"]
+    value: str = Field(min_length=1, max_length=255)
+    severity: CaseSeverity = "medium"
+    tags: list[CaseTag] = Field(default_factory=list, max_length=20)
+    note: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def clean_ioc_fields(self):
+        self.value = self.value.strip()
+        if not self.value:
+            raise ValueError("value must not be blank")
+        self.tags = [tag.strip() for tag in self.tags if tag.strip()]
+        self.note = self.note.strip()
+        return self

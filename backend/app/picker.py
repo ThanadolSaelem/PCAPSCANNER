@@ -17,20 +17,24 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
-PickerPurpose = Literal["data_dir", "capture_root", "capture_file"]
+PickerPurpose = Literal["data_dir", "capture_root", "capture_file", "model_file"]
 
 ALLOWED_RESOURCE_MODES = {"auto", "fast", "deep", "unlimited"}
+ALLOWED_MODEL_EXTENSIONS = {".bin", ".pt", ".pth", ".safetensors", ".onnx"}
 ALLOWED_WORKSPACE_KEYS = {
     "schema_version",
     "data_dir",
     "local_ingest_roots",
     "resource_mode",
     "prefer_workspace",
+    "etbert_checkpoint_path",
+    "etbert_enabled",
 }
 _PURPOSE_PROMPTS: dict[PickerPurpose, str] = {
     "data_dir": "Select PCAPSCANNER Data Directory",
     "capture_root": "Select Local Capture Folder for Zero-Copy Scanning",
     "capture_file": "Select PCAP, PCAPNG, CAP, CSV, or TSV Capture File",
+    "model_file": "Select ET-BERT / Model Checkpoint (.bin, .pt, .safetensors)",
 }
 
 _OSASCRIPT_CHOOSE_DIR = (
@@ -74,6 +78,9 @@ _TKINTER_PICK_SCRIPT = (
     "    kw['initialdir'] = init_dir\n"
     "if mode == 'directory':\n"
     "    picked = filedialog.askdirectory(**kw)\n"
+    "elif mode == 'model_file':\n"
+    "    kw['filetypes'] = [('Model checkpoints', '*.bin *.pt *.pth *.safetensors *.onnx'), ('All files', '*.*')]\n"
+    "    picked = filedialog.askopenfilename(**kw)\n"
     "else:\n"
     "    kw['filetypes'] = [('Capture files', '*.pcap *.pcapng *.cap *.csv *.tsv'), ('All files', '*.*')]\n"
     "    picked = filedialog.askopenfilename(**kw)\n"
@@ -220,6 +227,11 @@ def sanitize_workspace_data(raw: Any) -> dict[str, Any]:
         out["resource_mode"] = rmode
     if isinstance(raw.get("prefer_workspace"), bool):
         out["prefer_workspace"] = raw["prefer_workspace"]
+    etbert_ckpt = raw.get("etbert_checkpoint_path")
+    if isinstance(etbert_ckpt, str) and etbert_ckpt.strip() and "\x00" not in etbert_ckpt:
+        out["etbert_checkpoint_path"] = str(Path(etbert_ckpt.strip()).expanduser().resolve())
+    if isinstance(raw.get("etbert_enabled"), bool):
+        out["etbert_enabled"] = raw["etbert_enabled"]
     return out
 
 
@@ -265,6 +277,8 @@ def update_workspace_config(
     local_ingest_roots: list[str] | None = None,
     resource_mode: str | None = None,
     prefer_workspace: bool | None = None,
+    etbert_checkpoint_path: str | None = None,
+    etbert_enabled: bool | None = None,
 ) -> dict[str, Any]:
     target = path or resolve_default_workspace_config_path()
     current = load_workspace_config(target)
@@ -276,6 +290,13 @@ def update_workspace_config(
         current["resource_mode"] = resource_mode
     if prefer_workspace is not None:
         current["prefer_workspace"] = bool(prefer_workspace)
+    if etbert_checkpoint_path is not None:
+        if etbert_checkpoint_path.strip():
+            current["etbert_checkpoint_path"] = str(Path(etbert_checkpoint_path.strip()).expanduser().resolve())
+        else:
+            current.pop("etbert_checkpoint_path", None)
+    if etbert_enabled is not None:
+        current["etbert_enabled"] = bool(etbert_enabled)
     save_workspace_config(current, target)
     return current
 
@@ -315,6 +336,13 @@ def pick_native_path(
         cmd = ["zenity", "--file-selection", f"--title={prompt}"]
         if is_dir:
             cmd.append("--directory")
+        elif purpose == "model_file":
+            cmd.extend(
+                [
+                    "--file-filter=Model checkpoints | *.bin *.pt *.pth *.safetensors *.onnx",
+                    "--file-filter=All files | *",
+                ]
+            )
         else:
             cmd.extend(
                 [
@@ -328,6 +356,15 @@ def pick_native_path(
         start = default_dir or str(Path.home())
         if is_dir:
             cmd = ["kdialog", "--title", prompt, "--getexistingdirectory", start]
+        elif purpose == "model_file":
+            cmd = [
+                "kdialog",
+                "--title",
+                prompt,
+                "--getopenfilename",
+                start,
+                "*.bin *.pt *.pth *.safetensors *.onnx|Model checkpoints",
+            ]
         else:
             cmd = [
                 "kdialog",
@@ -339,7 +376,7 @@ def pick_native_path(
             ]
     else:
         # Isolated subprocess avoids macOS AppKit / GUI main-thread violations in worker threads.
-        mode_arg = "directory" if is_dir else "capture_file"
+        mode_arg = "directory" if is_dir else ("model_file" if purpose == "model_file" else "capture_file")
         cmd = [sys.executable, "-c", _TKINTER_PICK_SCRIPT, mode_arg, prompt, default_dir]
 
     try:
@@ -372,6 +409,7 @@ def pick_native_path(
 
 
 __all__ = [
+    "ALLOWED_MODEL_EXTENSIONS",
     "ALLOWED_RESOURCE_MODES",
     "ALLOWED_WORKSPACE_KEYS",
     "PickerDisabledError",

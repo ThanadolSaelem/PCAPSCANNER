@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
 from urllib.request import Request
 
-from .etbert_bridge import score_with_etbert_http
+from .etbert_bridge import score_with_etbert_http, score_with_etbert_local_bin
 from .http_transport import post_json_bounded
 
 
@@ -837,6 +837,7 @@ def classify_bundle(
     timeout_s = float(getattr(triage_cfg, "timeout_seconds", 10.0)) if triage_cfg is not None else 10.0
     etbert_enabled = bool(getattr(triage_cfg, "etbert_enabled", False)) if triage_cfg is not None else False
     etbert_url = getattr(triage_cfg, "etbert_endpoint_url", None) if triage_cfg is not None else None
+    etbert_ckpt = getattr(triage_cfg, "etbert_checkpoint_path", None) if triage_cfg is not None else None
     etbert_model = str(getattr(triage_cfg, "etbert_model_name", "etbert-l7-datagram")) if triage_cfg is not None else "etbert-l7-datagram"
     etbert_timeout = float(getattr(triage_cfg, "etbert_timeout_seconds", 8.0)) if triage_cfg is not None else 8.0
     network_requested = bool(
@@ -883,6 +884,13 @@ def classify_bundle(
             allow_network=allow_network,
             deadline_monotonic=network_deadline,
             cancellation_check=cancellation_check,
+        )
+    elif enabled and etbert_ckpt and evidence_list and (etbert_enabled or mode == "etbert_openjev"):
+        # Local offline ET-BERT .bin checkpoint does not transmit data over the network
+        etbert_scores = score_with_etbert_local_bin(
+            evidence_list,
+            checkpoint_path=etbert_ckpt,
+            model_name=etbert_model,
         )
 
     decisions: list[TriageDecision] = []

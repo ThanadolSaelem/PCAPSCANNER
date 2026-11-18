@@ -49,6 +49,8 @@ class DNSObservation:
     source: str | None = None
     response_code: int | None = None
     qtype: int | None = None
+    answers: tuple[str, ...] = ()
+    min_ttl: int | None = None
 
 
 @dataclass(frozen=True)
@@ -172,7 +174,7 @@ def _retain_bounded_evidence_id(ids: list[str], evidence_id: str) -> None:
 
 
 def analyze_dns_candidates(observations: Iterable[DNSObservation]) -> DNSAnalysisResult:
-    """Analyze only bounded request metadata and return sanitized, cited candidates."""
+    """Analyze only bounded request/response metadata and return sanitized, cited candidates."""
     rows: list[DNSObservation] = []
     truncated = False
     for observation in observations:
@@ -182,10 +184,48 @@ def analyze_dns_candidates(observations: Iterable[DNSObservation]) -> DNSAnalysi
         rows.append(observation)
 
     request_rows: list[tuple[DNSObservation, str, str, str]] = []
+    # Track fast-flux (answer IP diversity + short TTL) and per-origin NXDOMAIN ratio
+    flux_groups: dict[str, dict[str, object]] = {}
+    origin_stats: dict[str, dict[str, object]] = {}
+
     for observation in rows:
+        domain = normalize_domain(observation.query)
+        if observation.source and len(observation.source) <= 64:
+            st = origin_stats.get(observation.source)
+            if st is None and len(origin_stats) < MAX_DNS_GROUPS:
+                st = {"total": 0, "nx": 0, "nx_domains": set(), "evidence_ids": []}
+                origin_stats[observation.source] = st
+            if st is not None:
+                st["total"] = int(st["total"]) + 1  # type: ignore[arg-type]
+                if observation.response_code == 3:
+                    st["nx"] = int(st["nx"]) + 1  # type: ignore[arg-type]
+                    if domain and len(st["nx_domains"]) < 64:  # type: ignore[arg-type]
+                        st["nx_domains"].add(domain)  # type: ignore[union-attr]
+                    _retain_bounded_evidence_id(st["evidence_ids"], observation.evidence_id)  # type: ignore[arg-type]
+
+        if domain and observation.answers:
+            if not any(domain == sfx or domain.endswith(f".{sfx}") for sfx in _ENTROPY_WHITELIST_SUFFIXES):
+                fg = flux_groups.get(domain)
+                if fg is None and len(flux_groups) < MAX_DNS_GROUPS:
+                    fg = {"ips": set(), "prefixes": set(), "min_ttl": None, "evidence_ids": []}
+                    flux_groups[domain] = fg
+                if fg is not None:
+                    ips_set = fg["ips"]  # type: ignore[assignment]
+                    pfx_set = fg["prefixes"]  # type: ignore[assignment]
+                    for ans in observation.answers[:16]:
+                        if isinstance(ans, str) and ans and len(ips_set) < 64:  # type: ignore[arg-type]
+                            ips_set.add(ans)  # type: ignore[union-attr]
+                            if "." in ans:
+                                pfx_set.add(".".join(ans.split(".")[:3]))  # type: ignore[union-attr]
+                            elif ":" in ans:
+                                pfx_set.add(":".join(ans.split(":")[:3]))  # type: ignore[union-attr]
+                    if observation.min_ttl is not None and observation.min_ttl >= 0:
+                        cur_ttl = fg["min_ttl"]
+                        fg["min_ttl"] = observation.min_ttl if cur_ttl is None else min(int(cur_ttl), observation.min_ttl)  # type: ignore[arg-type]
+                    _retain_bounded_evidence_id(fg["evidence_ids"], observation.evidence_id)  # type: ignore[arg-type]
+
         if observation.response_code is not None:
             continue
-        domain = normalize_domain(observation.query)
         if domain is None:
             continue
         parts = _registrable_parts(domain)
@@ -244,6 +284,14 @@ def analyze_dns_candidates(observations: Iterable[DNSObservation]) -> DNSAnalysi
         "DNS tunneling indicators are low-confidence heuristics, not proof of exfiltration or compromise.",
         "The public-suffix grouping uses a small fixed list and may group some multi-label domains imperfectly.",
         "Only retained query names and query types were evaluated; answer IPs and TTLs are not inferred.",
+    )
+    flux_limits = (
+        "Fast-flux indicators can also be triggered by legitimate round-robin CDNs or geo-load balancers.",
+        "Only retained DNS answer IPs and TTL metadata were evaluated; no active DNS queries were sent.",
+    )
+    nx_ratio_limits = (
+        "Elevated per-origin NXDOMAIN ratios can occur during benign service discovery or misconfigured resolvers.",
+        "Only retained DNS records within configured bounds were evaluated.",
     )
 
     for domain in sorted(dga_rows):
@@ -309,6 +357,51 @@ def analyze_dns_candidates(observations: Iterable[DNSObservation]) -> DNSAnalysi
                     limitations=tunnel_limits,
                 )
             )
+
+    for domain in sorted(flux_groups):
+        fg = flux_groups[domain]
+        ip_count = len(fg["ips"])  # type: ignore[arg-type]
+        pfx_count = len(fg["prefixes"])  # type: ignore[arg-type]
+        min_ttl = fg["min_ttl"]
+        low_ttl_flux = ip_count >= 5 and min_ttl is not None and int(min_ttl) <= 300  # type: ignore[arg-type]
+        subnet_flux = ip_count >= 6 and pfx_count >= 3
+        if low_ttl_flux or subnet_flux:
+            ids = _candidate_evidence(fg["evidence_ids"])  # type: ignore[arg-type]
+            if ids:
+                ttl_note = f", min TTL {int(min_ttl)}s" if min_ttl is not None else ""  # type: ignore[arg-type]
+                candidates.append(
+                    DNSCandidate(
+                        detector="dns_fast_flux_heuristic",
+                        title="Fast-flux DNS answer rotation candidate",
+                        summary=(
+                            f"A queried domain resolved to {ip_count} distinct IP addresses across "
+                            f"{pfx_count} network prefixes{ttl_note}; domain and answer IPs are in cited local evidence."
+                        ),
+                        evidence_ids=ids,
+                        limitations=flux_limits,
+                    )
+                )
+
+    for source in sorted(origin_stats):
+        st = origin_stats[source]
+        total_q = int(st["total"])  # type: ignore[arg-type]
+        nx_q = int(st["nx"])  # type: ignore[arg-type]
+        nx_doms = len(st["nx_domains"])  # type: ignore[arg-type]
+        if total_q >= 8 and nx_q >= 6 and (nx_q / total_q) >= 0.50:
+            ids = _candidate_evidence(st["evidence_ids"])  # type: ignore[arg-type]
+            if ids:
+                candidates.append(
+                    DNSCandidate(
+                        detector="dns_origin_nxdomain_ratio",
+                        title="Elevated per-origin NXDOMAIN response ratio",
+                        summary=(
+                            f"A single DNS client received {nx_q} NXDOMAIN responses out of {total_q} "
+                            f"retained DNS records ({(nx_q / total_q) * 100.0:.1f}%, {nx_doms} distinct domains)."
+                        ),
+                        evidence_ids=ids,
+                        limitations=nx_ratio_limits,
+                    )
+                )
 
     if len(candidates) > MAX_DNS_CANDIDATES:
         candidates = candidates[:MAX_DNS_CANDIDATES]

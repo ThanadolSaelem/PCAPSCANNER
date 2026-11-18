@@ -94,7 +94,13 @@ _DETECTOR_TEXT = {
         "Weak certificate public-key parameters",
         "Retained Zeek X.509 key metadata is below the local RSA or EC size threshold.",
     ),
+    "tls_certificate_long_validity": (
+        "Long-lived certificate validity window",
+        "Retained Zeek X.509 validity metadata exceeds the 398-day CA/Browser Forum baseline lifetime.",
+    ),
 }
+
+MAX_CERT_VALIDITY_SECONDS = 398 * 86_400
 
 
 def _bounded_text(value: object, limit: int) -> str | None:
@@ -151,18 +157,40 @@ def _weak_key_indicator(attributes: Mapping[str, object]) -> bool:
     return False
 
 
+def _epoch_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = int(value)
+        return v if 0 < v <= 10_000_000_000 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        v = int(value.strip(), 10)
+        return v if 0 < v <= 10_000_000_000 else None
+    return None
+
+
+def _x509_indicators(attributes: Mapping[str, object]) -> tuple[str, ...]:
+    found: list[str] = []
+    if _weak_key_indicator(attributes):
+        found.append("tls_certificate_weak_key")
+    not_before = _epoch_int(attributes.get("certificate_not_valid_before"))
+    not_after = _epoch_int(attributes.get("certificate_not_valid_after"))
+    ref_ts = _epoch_int(attributes.get("timestamp_epoch"))
+    if not_before is not None and not_after is not None:
+        if (not_after - not_before) > MAX_CERT_VALIDITY_SECONDS:
+            found.append("tls_certificate_long_validity")
+        if ref_ts is not None:
+            if ref_ts > not_after:
+                found.append("tls_certificate_expired")
+            elif ref_ts < not_before:
+                found.append("tls_certificate_not_yet_valid")
+    return tuple(found)
+
+
 def analyze_tls_certificate_metadata(
     observations: Iterable[TLSCertificateObservation],
 ) -> TLSCertificateAnalysisResult:
-    """Return bounded candidates from normalized ``ssl.log``/``x509.log`` rows.
-
-    Required normalized attributes are ``tls_validation_status`` from
-    ``ssl.log`` and ``certificate_key_type`` plus ``certificate_key_length``
-    from ``x509.log``. The current normalizer does not retain certificate
-    validity dates, so this function does not calculate date-based expiry or
-    long-lived-certificate findings; it uses only explicit validation status.
-    Evidence identifiers are validated locally before any candidate is emitted.
-    """
+    """Return bounded candidates from normalized ``ssl.log``/``x509.log`` rows."""
     rows: list[TLSCertificateObservation] = []
     truncated = False
     for observation in observations:
@@ -188,8 +216,8 @@ def analyze_tls_certificate_metadata(
             indicators = _validation_indicators(
                 observation.attributes.get("tls_validation_status")
             )
-        elif observation.source_log == "x509.log" and _weak_key_indicator(observation.attributes):
-            indicators = ("tls_certificate_weak_key",)
+        elif observation.source_log == "x509.log":
+            indicators = _x509_indicators(observation.attributes)
         else:
             continue
 
