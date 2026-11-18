@@ -1,0 +1,8 @@
+# Full Neural inference runtime for OpenJev LoRA/HF + ET-BERT HF models
+# Works across Apple Silicon (mps), NVIDIA (cuda), and CPU (excludes CUDA-only bitsandbytes/fla-core).
+-r requirements.txt
+torch>=2.3.0
+transformers>=4.44.0
+peft>=0.12.0
+accelerate>=0.33.0
+safetensors>=0.4.3

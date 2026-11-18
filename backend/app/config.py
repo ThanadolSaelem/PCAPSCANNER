@@ -510,6 +510,8 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
                 raise ValueError(f"invalid_triage_{field_name}") from exc
         elif kind == "bool":
             triage[field_name] = _parse_bool(raw, f"triage_{field_name}")
+        elif kind == "list":
+            triage[field_name] = _parse_list(raw, f"triage_{field_name}")
         else:
             triage[field_name] = raw
     if triage:

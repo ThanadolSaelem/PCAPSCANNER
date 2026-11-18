@@ -240,6 +240,91 @@ class LauncherUnitTests(unittest.TestCase):
         # Closed loopback port returns None cleanly
         self.assertIsNone(launcher.discover_local_ollama_model(f"http://127.0.0.1:{port}", timeout=0.2))
 
+    def test_standalone_tier1_discovery_without_trainer_and_allowed_origins(self) -> None:
+        self.assertIsNotNone(launcher.discover_tier1_inference_root(ROOT))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_repo = Path(tmp) / "repo"
+            fake_home = Path(tmp) / "home"
+            (fake_repo / "tier1-inference" / "tier1_inference").mkdir(parents=True)
+            (fake_repo / "tier1-inference" / "tier1_inference" / "server.py").write_text("# stub\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                # Without checkpoints, Trainer-Pipeline, or --with-tier1, do not spawn unnecessary daemon
+                self.assertIsNone(
+                    launcher.resolve_tier1_launch_plan(
+                        repo_root=fake_repo,
+                        home_dir=fake_home,
+                        port=9123,
+                    )
+                )
+
+                # Explicit --with-tier1 selects standalone tier1_inference even without Trainer-Pipeline
+                plan_fallback = launcher.resolve_tier1_launch_plan(
+                    repo_root=fake_repo,
+                    home_dir=fake_home,
+                    port=9123,
+                    with_tier1=True,
+                )
+                self.assertIsNotNone(plan_fallback)
+                assert plan_fallback is not None
+                cmd_fb, cwd_fb = plan_fallback
+                self.assertEqual(cwd_fb, (fake_repo / "tier1-inference").resolve())
+                self.assertIn("tier1_inference", cmd_fb)
+                self.assertNotIn("traffic_tier1.serve_tier1", cmd_fb)
+
+                # Placing trained checkpoints in standalone models/ auto-enables sidecar without --with-tier1
+                oj_ckpt = fake_repo / "tier1-inference" / "models" / "openjev-tier1"
+                et_ckpt = fake_home / "models" / "etbert-l7"
+                oj_ckpt.mkdir(parents=True)
+                et_ckpt.mkdir(parents=True)
+                plan_weights = launcher.resolve_tier1_launch_plan(
+                    repo_root=fake_repo,
+                    home_dir=fake_home,
+                    port=9123,
+                )
+                self.assertIsNotNone(plan_weights)
+                assert plan_weights is not None
+                cmd_w, _ = plan_weights
+                self.assertIn("--openjev-checkpoint", cmd_w)
+                self.assertIn(str(oj_ckpt.resolve()), cmd_w)
+                self.assertIn("--etbert-checkpoint", cmd_w)
+                self.assertIn(str(et_ckpt.resolve()), cmd_w)
+
+                # --no-tier1 always suppresses auto-start
+                self.assertIsNone(
+                    launcher.resolve_tier1_launch_plan(
+                        repo_root=fake_repo,
+                        home_dir=fake_home,
+                        port=9123,
+                        no_tier1=True,
+                        with_tier1=True,
+                    )
+                )
+
+        if HAS_PYDANTIC_V2:
+            from backend.app import config
+
+            origin = "http://127.0.0.1:9123"
+            origins = launcher._append_allowed_origin("", origin)
+            origins = launcher._append_allowed_origin(origins, origin)
+            self.assertEqual(origins, origin)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PCAP_TRIAGE_ENABLED": "1",
+                    "PCAP_TRIAGE_MODE": "etbert_openjev",
+                    "PCAP_TRIAGE_ALLOWED_ORIGINS": origins,
+                    "PCAP_TRIAGE_ENDPOINT_URL": f"{origin}/v1/systemone",
+                    "PCAP_TRIAGE_ETBERT_ENABLED": "1",
+                    "PCAP_TRIAGE_ETBERT_ENDPOINT_URL": f"{origin}/etbert/score",
+                },
+                clear=True,
+            ):
+                loaded = config.load_settings()
+                self.assertEqual(loaded.triage.endpoint_url, f"{origin}/v1/systemone")
+                self.assertEqual(loaded.triage.allowed_origins, [origin])
+
 
 @unittest.skipUnless(HAS_PYDANTIC_V2, "requires pydantic>=2 + fastapi TestClient")
 class WorkspaceApiAndSpaTests(unittest.TestCase):

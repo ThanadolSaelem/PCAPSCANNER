@@ -186,6 +186,17 @@ def build_launch_url(port: int, token: str, *, backend_url: str = "") -> str:
     return f"http://127.0.0.1:{port}/#token={quote(token, safe='')}&url={quote(backend_url, safe='/:')}"
 
 
+def discover_tier1_inference_root(repo_root: Path = REPO_ROOT) -> Path | None:
+    explicit = os.environ.get("PCAP_TIER1_MODULE_DIR", "").strip()
+    candidates = [Path(explicit).expanduser()] if explicit else []
+    candidates.extend([repo_root / "tier1-inference", repo_root.parent / "tier1-inference"])
+    for cand in candidates:
+        resolved = cand.resolve()
+        if (resolved / "tier1_inference" / "server.py").is_file():
+            return resolved
+    return None
+
+
 def discover_trainer_pipeline_root(repo_root: Path = REPO_ROOT) -> Path | None:
     explicit = os.environ.get("PCAP_TRAINER_PIPELINE_DIR", "").strip()
     candidates = [Path(explicit).expanduser()] if explicit else []
@@ -208,21 +219,39 @@ def _python_has_modules(py_exe: Path, modules: tuple[str, ...]) -> bool:
         return False
 
 
-def find_tier1_python(trainer_root: Path) -> Path | None:
+def find_tier1_python(
+    service_root: Path,
+    *,
+    fallback_roots: Sequence[Path] = (),
+    prefer_neural: bool = False,
+    require_numpy: bool = False,
+) -> Path | None:
     candidates: list[Path] = []
     explicit = os.environ.get("PCAP_TIER1_PYTHON", "").strip()
     if explicit:
         candidates.append(Path(explicit).expanduser())
+    for root in (service_root, *fallback_roots):
+        candidates.extend(
+            [
+                root / ".venv" / "bin" / "python",
+                root / ".venv" / "Scripts" / "python.exe",
+            ]
+        )
     candidates.extend(
         [
+            Path.home() / "venvs" / "tier1-inference" / "bin" / "python",
             Path.home() / "venvs" / "traffic-tier1" / "bin" / "python",
-            trainer_root / ".venv" / "bin" / "python",
-            trainer_root / ".venv" / "Scripts" / "python.exe",
+            REPO_ROOT / ".venv-backend" / "bin" / "python",
             Path(sys.executable),
         ]
     )
+    if prefer_neural:
+        for cand in candidates:
+            if _python_has_modules(cand, ("fastapi", "uvicorn", "torch", "transformers")):
+                return cand
+    required = ("fastapi", "uvicorn", "numpy") if require_numpy else ("fastapi", "uvicorn")
     for cand in candidates:
-        if _python_has_modules(cand, ("fastapi", "uvicorn", "numpy")):
+        if _python_has_modules(cand, required):
             return cand
     return None
 
@@ -232,6 +261,13 @@ def _first_existing_dir(candidates: Sequence[Path]) -> Path | None:
         if cand.is_dir():
             return cand.resolve()
     return None
+
+
+def _append_allowed_origin(raw: str | None, origin: str) -> str:
+    items = [part.strip() for part in (raw or "").split(",") if part.strip()]
+    if origin not in items:
+        items.append(origin)
+    return ",".join(items)
 
 
 def open_browser_url(url: str) -> bool:
@@ -288,13 +324,104 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="One-click launcher for PCAPSCANNER Workbench")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PCAP_PORT", "8000")), help="Backend API / single-port Web UI port")
     parser.add_argument("--ui-port", type=int, default=3000, help="Vite dev server port when using --dev")
-    parser.add_argument("--tier1-port", type=int, default=9000, help="Sibling Trainer-Pipeline Tier-1 server port")
+    parser.add_argument("--tier1-port", type=int, default=9000, help="Standalone Tier-1 inference server port")
     parser.add_argument("--dev", action="store_true", help="Launch Vite dev server alongside FastAPI backend")
     parser.add_argument("--no-browser", action="store_true", help="Do not automatically open the browser tab")
-    parser.add_argument("--no-tier1", action="store_true", help="Skip auto-starting sibling Trainer-Pipeline Tier-1 server")
+    parser.add_argument("--with-tier1", action="store_true", help="Force-start standalone Tier-1 HTTP server even without checkpoints")
+    parser.add_argument("--no-tier1", action="store_true", help="Skip auto-starting Tier-1 inference HTTP server")
     parser.add_argument("--data-dir", default=None, help="Optional Data Directory override persisted into workspace config")
     parser.add_argument("--workspace-config", default=None, help="Optional workspace.json path (default: ~/.pcapscanner/workspace.json)")
     return parser
+
+
+def resolve_tier1_launch_plan(
+    *,
+    repo_root: Path = REPO_ROOT,
+    home_dir: Path | None = None,
+    port: int = 9000,
+    no_tier1: bool = False,
+    with_tier1: bool = False,
+) -> tuple[list[str], Path] | None:
+    """Resolve standalone `tier1-inference` (or fallback `Trainer-Pipeline`) launch command."""
+    if no_tier1:
+        return None
+    resolved_home = home_dir or default_pcapscanner_home()
+    standalone_root = discover_tier1_inference_root(repo_root)
+    trainer_root = discover_trainer_pipeline_root(repo_root)
+    if standalone_root is None and trainer_root is None:
+        return None
+
+    openjev_candidates: list[Path] = []
+    if os.environ.get("PCAP_OPENJEV_CHECKPOINT"):
+        openjev_candidates.append(Path(os.environ["PCAP_OPENJEV_CHECKPOINT"]).expanduser())
+    if standalone_root is not None:
+        openjev_candidates.append(standalone_root / "models" / "openjev-tier1")
+    openjev_candidates.extend(
+        [
+            repo_root / "models" / "openjev-tier1",
+            resolved_home / "models" / "openjev-tier1",
+        ]
+    )
+    if trainer_root is not None:
+        openjev_candidates.append(trainer_root / "runs" / "tier1_rlcd")
+
+    etbert_candidates: list[Path] = []
+    if os.environ.get("PCAP_ETBERT_CHECKPOINT"):
+        etbert_candidates.append(Path(os.environ["PCAP_ETBERT_CHECKPOINT"]).expanduser())
+    if standalone_root is not None:
+        etbert_candidates.append(standalone_root / "models" / "etbert-l7")
+    etbert_candidates.extend(
+        [
+            repo_root / "models" / "etbert-l7",
+            resolved_home / "models" / "etbert-l7",
+        ]
+    )
+    if trainer_root is not None:
+        etbert_candidates.append(trainer_root / "runs" / "etbert_l7")
+
+    openjev_ckpt = _first_existing_dir(openjev_candidates)
+    etbert_ckpt = _first_existing_dir(etbert_candidates)
+    has_checkpoints = openjev_ckpt is not None or etbert_ckpt is not None
+    autoserve = with_tier1 or truthy_env(os.environ.get("PCAP_TIER1_AUTOSERVE")) or trainer_root is not None
+
+    if standalone_root is not None and (has_checkpoints or autoserve):
+        service_root = standalone_root
+        module_name = "tier1_inference"
+        fallback_roots = (trainer_root,) if trainer_root is not None else ()
+        require_numpy = False
+    elif trainer_root is not None:
+        service_root = trainer_root
+        module_name = "traffic_tier1.serve_tier1"
+        fallback_roots = ()
+        require_numpy = True
+    else:
+        return None
+
+    tier1_py = find_tier1_python(
+        service_root,
+        fallback_roots=fallback_roots,
+        prefer_neural=has_checkpoints,
+        require_numpy=require_numpy,
+    )
+    if tier1_py is None:
+        return None
+
+    cmd = [
+        str(tier1_py),
+        "-m",
+        module_name,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--device",
+        "auto",
+    ]
+    if openjev_ckpt is not None:
+        cmd.extend(["--openjev-checkpoint", str(openjev_ckpt)])
+    if etbert_ckpt is not None:
+        cmd.extend(["--etbert-checkpoint", str(etbert_ckpt)])
+    return cmd, service_root
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -342,53 +469,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        # 1. Optional sibling Trainer-Pipeline Tier-1 server (ET-BERT + OpenJev)
-        trainer_root = discover_trainer_pipeline_root(REPO_ROOT) if not args.no_tier1 else None
-        if trainer_root is not None and not child_env.get("PCAP_TRIAGE_ENDPOINT_URL"):
-            tier1_py = find_tier1_python(trainer_root)
-            if tier1_py is not None:
-                tier1_port = find_available_port(args.tier1_port)
+        # 1. Standalone tier1-inference sidecar (or optional Trainer-Pipeline fallback)
+        if not args.no_tier1 and not child_env.get("PCAP_TRIAGE_ENDPOINT_URL"):
+            tier1_port = find_available_port(args.tier1_port)
+            plan = resolve_tier1_launch_plan(
+                repo_root=REPO_ROOT,
+                home_dir=home_dir,
+                port=tier1_port,
+                no_tier1=args.no_tier1,
+                with_tier1=args.with_tier1,
+            )
+            if plan is not None:
+                tier1_cmd, tier1_cwd = plan
                 tier1_env = os.environ.copy()
                 tier1_env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-                tier1_cmd = [
-                    str(tier1_py),
-                    "-m",
-                    "traffic_tier1.serve_tier1",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(tier1_port),
-                    "--device",
-                    "auto",
-                ]
-                openjev_ckpt = _first_existing_dir(
-                    [
-                        *( [Path(os.environ["PCAP_OPENJEV_CHECKPOINT"]).expanduser()] if os.environ.get("PCAP_OPENJEV_CHECKPOINT") else [] ),
-                        trainer_root / "runs" / "tier1_rlcd",
-                        home_dir / "models" / "openjev-tier1",
-                    ]
-                )
-                etbert_ckpt = _first_existing_dir(
-                    [
-                        *( [Path(os.environ["PCAP_ETBERT_CHECKPOINT"]).expanduser()] if os.environ.get("PCAP_ETBERT_CHECKPOINT") else [] ),
-                        trainer_root / "runs" / "etbert_l7",
-                        home_dir / "models" / "etbert-l7",
-                    ]
-                )
-                if openjev_ckpt is not None:
-                    tier1_cmd.extend(["--openjev-checkpoint", str(openjev_ckpt)])
-                if etbert_ckpt is not None:
-                    tier1_cmd.extend(["--etbert-checkpoint", str(etbert_ckpt)])
-
                 print(f"[PCAPSCANNER] Starting Tier-1 classifier service on http://127.0.0.1:{tier1_port} ...")
-                tier1_proc = subprocess.Popen(tier1_cmd, cwd=str(trainer_root), env=tier1_env)
+                tier1_proc = subprocess.Popen(tier1_cmd, cwd=str(tier1_cwd), env=tier1_env)
                 children.append(("tier1", tier1_proc))
                 if _wait_for_http_ok(f"http://127.0.0.1:{tier1_port}/health", timeout_seconds=15.0, proc=tier1_proc):
+                    origin = f"http://127.0.0.1:{tier1_port}"
                     child_env["PCAP_TRIAGE_ENABLED"] = "1"
                     child_env["PCAP_TRIAGE_MODE"] = "etbert_openjev"
-                    child_env["PCAP_TRIAGE_ENDPOINT_URL"] = f"http://127.0.0.1:{tier1_port}/v1/systemone"
+                    child_env["PCAP_TRIAGE_ALLOWED_ORIGINS"] = _append_allowed_origin(
+                        child_env.get("PCAP_TRIAGE_ALLOWED_ORIGINS"), origin
+                    )
+                    child_env["PCAP_TRIAGE_ENDPOINT_URL"] = f"{origin}/v1/systemone"
                     child_env["PCAP_TRIAGE_ETBERT_ENABLED"] = "1"
-                    child_env["PCAP_TRIAGE_ETBERT_ENDPOINT_URL"] = f"http://127.0.0.1:{tier1_port}/etbert/score"
+                    child_env["PCAP_TRIAGE_ETBERT_ENDPOINT_URL"] = f"{origin}/etbert/score"
                     print("[PCAPSCANNER] Tier-1 ET-BERT + OpenJev service ready.")
                 else:
                     print("[PCAPSCANNER] Tier-1 service did not become ready in time; using built-in calibrated Tier-1 scorer.")
