@@ -557,7 +557,7 @@ async def test_m8_grounded_chat_consent_and_citations():
     assert ok.claims[0].evidence_ids == ["EV-000001"]
 
 
-def test_etbert_bin_checkpoint_inspection_scoring_and_workspace_endpoints(tmp_path: Path):
+def test_etbert_bin_checkpoint_inspection_scoring_and_workspace_endpoints(tmp_path: Path, monkeypatch):
     ckpt_path = tmp_path / "pre-trained_model.bin"
     fake_state = {
         "embedding.word_embedding.weight": b"\x00" * 1024,
@@ -628,3 +628,36 @@ def test_etbert_bin_checkpoint_inspection_scoring_and_workspace_endpoints(tmp_pa
     assert et_res.status_code == 200
     assert et_res.json()["etbert_enabled"] is True
     assert et_res.json()["ready"] is True
+
+    ws_clear = client.put(
+        "/api/v1/system/workspace",
+        headers=headers,
+        json={"clear_etbert_checkpoint": True},
+    )
+    assert ws_clear.status_code == 200
+    cleared = ws_clear.json()
+    assert cleared["etbert_checkpoint_configured"] is False
+    assert cleared["etbert_checkpoint_path"] is None
+    assert cleared["etbert_enabled"] is False
+    assert cleared["etbert_checkpoint_info"]["ready"] is False
+
+    # Verify explicit unbind persists across server restarts even if a default .bin exists on disk
+    from backend.app import config as app_config
+
+    ws_file = tmp_path / "workspace.json"
+    monkeypatch.setenv("PCAP_WORKSPACE_CONFIG", str(ws_file))
+    monkeypatch.setenv("PCAP_USE_WORKSPACE_CONFIG", "1")
+    settings_re = AppSettings(data_dir=tmp_path / "data", api_token=SecretStr("operator-master-token"))
+    app_re = create_app(settings_re)
+    client_re = TestClient(app_re)
+    assert client_re.put(
+        "/api/v1/system/workspace", headers=headers, json={"etbert_checkpoint_path": str(ckpt_path)}
+    ).status_code == 200
+    assert client_re.put(
+        "/api/v1/system/workspace", headers=headers, json={"clear_etbert_checkpoint": True}
+    ).status_code == 200
+
+    monkeypatch.setattr(app_config, "DEFAULT_ETBERT_MODEL_CANDIDATES", (str(ckpt_path),))
+    reloaded = app_config.load_settings()
+    assert reloaded.triage.etbert_checkpoint_path is None
+    assert reloaded.triage.etbert_enabled is False

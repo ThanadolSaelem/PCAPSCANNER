@@ -260,6 +260,7 @@ class WorkspaceUpdateRequest(Contract):
     resource_mode: Literal["auto", "fast", "deep", "unlimited"] | None = None
     etbert_checkpoint_path: str | None = Field(default=None, min_length=1, max_length=1024)
     etbert_enabled: bool | None = None
+    clear_etbert_checkpoint: bool = False
 
 
 class NativePickRequest(Contract):

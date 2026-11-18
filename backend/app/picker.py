@@ -303,9 +303,12 @@ def sanitize_workspace_data(raw: Any) -> dict[str, Any]:
         out["resource_mode"] = rmode
     if isinstance(raw.get("prefer_workspace"), bool):
         out["prefer_workspace"] = raw["prefer_workspace"]
-    etbert_ckpt = raw.get("etbert_checkpoint_path")
-    if isinstance(etbert_ckpt, str) and etbert_ckpt.strip() and "\x00" not in etbert_ckpt:
-        out["etbert_checkpoint_path"] = str(Path(etbert_ckpt.strip()).expanduser().resolve())
+    if "etbert_checkpoint_path" in raw:
+        etbert_ckpt = raw.get("etbert_checkpoint_path")
+        if etbert_ckpt is None or (isinstance(etbert_ckpt, str) and not etbert_ckpt.strip()):
+            out["etbert_checkpoint_path"] = ""
+        elif isinstance(etbert_ckpt, str) and "\x00" not in etbert_ckpt:
+            out["etbert_checkpoint_path"] = str(Path(etbert_ckpt.strip()).expanduser().resolve())
     if isinstance(raw.get("etbert_enabled"), bool):
         out["etbert_enabled"] = raw["etbert_enabled"]
     clean_ai = _sanitize_ai_dict(raw.get("ai"))
@@ -374,7 +377,7 @@ def update_workspace_config(
         if etbert_checkpoint_path.strip():
             current["etbert_checkpoint_path"] = str(Path(etbert_checkpoint_path.strip()).expanduser().resolve())
         else:
-            current.pop("etbert_checkpoint_path", None)
+            current["etbert_checkpoint_path"] = ""
     if etbert_enabled is not None:
         current["etbert_enabled"] = bool(etbert_enabled)
     if ai is not None:

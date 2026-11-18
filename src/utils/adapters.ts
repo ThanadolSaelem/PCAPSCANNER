@@ -1,10 +1,14 @@
 import type {
+  AIConfigResponse,
+  AIProviderName,
   AIResult,
   BackendEvidence,
   BackendReport,
   OSINTLookupResponse,
   EvidenceBundle,
+  SystemCapabilities,
   Tier1Summary,
+  WorkspaceConfigState,
 } from "../api/client.ts";
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -558,3 +562,341 @@ export function extractLaunchHashCredentials(hash: string): LaunchHashCredential
     hasLaunchParams,
   };
 }
+
+export type Layer1Kind =
+  | "sidecar_ready"
+  | "bin_classifier_ready"
+  | "bin_encoder_only"
+  | "bin_missing"
+  | "heuristic_only";
+
+export type PillTone = "ok" | "info" | "warn" | "neutral";
+
+export interface Layer1StatusSummary {
+  kind: Layer1Kind;
+  pillTone: PillTone;
+  neuralReady: boolean;
+  sidecarConfigured: boolean;
+  sidecarEtbertConfigured: boolean;
+  sidecarOpenjevConfigured: boolean;
+  boundBinPath: string;
+  binBound: boolean;
+  binReady: boolean;
+  binMissing: boolean;
+  binHasClassifierHead: boolean;
+  badgeLabel: string;
+  hardwareBadgeLabel: string;
+  hardwareBadgeOk: boolean;
+  hardwareBadgeWarn: boolean;
+  analyzeCardDetail: string;
+  sidecarBadgeLabel: string;
+  sidecarHint: string;
+  binBadgeLabel: string;
+  binHint: string;
+  deviceHint: string | null;
+  triageMode: string;
+}
+
+export function resolveLayer1Status({
+  capabilities,
+  workspaceConfig,
+  aiConfig,
+}: {
+  capabilities?: SystemCapabilities | null;
+  workspaceConfig?: WorkspaceConfigState | null;
+  aiConfig?: AIConfigResponse | null;
+}): Layer1StatusSummary {
+  const capTriage = capabilities?.triage ?? null;
+  const aiTriage = aiConfig?.triage ?? null;
+  const sidecarEtbertConfigured = Boolean(
+    aiTriage?.etbert_endpoint_configured || capTriage?.etbert_endpoint_configured,
+  );
+  const sidecarOpenjevConfigured = Boolean(
+    aiTriage?.endpoint_configured || capTriage?.endpoint_configured,
+  );
+  const sidecarConfigured = sidecarEtbertConfigured || sidecarOpenjevConfigured;
+
+  const ckptInfo = workspaceConfig?.etbert_checkpoint_info ?? capTriage?.etbert_checkpoint_info ?? null;
+  const boundBinPath = (
+    workspaceConfig != null
+      ? (workspaceConfig.etbert_checkpoint_path ?? "")
+      : (capTriage?.etbert_checkpoint_path ?? "")
+  ).trim();
+  const binBound = Boolean(boundBinPath);
+  const binMissing = Boolean(binBound && ckptInfo && ckptInfo.exists === false);
+  const binReady = Boolean(binBound && ckptInfo?.valid && ckptInfo?.ready);
+  const binHasClassifierHead = Boolean(ckptInfo?.has_classification_head);
+  const deviceHint = capabilities?.runtime?.device_hint ?? null;
+  const triageMode = String(aiTriage?.mode ?? capTriage?.mode ?? "heuristic_calibrated");
+
+  let kind: Layer1Kind = "heuristic_only";
+  if (sidecarConfigured) {
+    kind = "sidecar_ready";
+  } else if (binReady && binHasClassifierHead) {
+    kind = "bin_classifier_ready";
+  } else if (binReady) {
+    kind = "bin_encoder_only";
+  } else if (binMissing) {
+    kind = "bin_missing";
+  }
+
+  let pillTone: PillTone = "neutral";
+  if (kind === "sidecar_ready" || kind === "bin_classifier_ready") pillTone = "ok";
+  else if (kind === "bin_encoder_only") pillTone = "info";
+  else if (kind === "bin_missing") pillTone = "warn";
+
+  const neuralReady = kind === "sidecar_ready" || kind === "bin_classifier_ready" || kind === "bin_encoder_only";
+  const hardwareBadgeOk = kind === "sidecar_ready" || kind === "bin_classifier_ready";
+  const hardwareBadgeWarn = kind === "bin_missing";
+
+  const sidecarModelTag = sidecarEtbertConfigured && sidecarOpenjevConfigured
+    ? "ET-BERT + OpenJev"
+    : sidecarEtbertConfigured
+      ? "ET-BERT"
+      : "OpenJev";
+
+  const badgeLabel =
+    kind === "sidecar_ready"
+      ? `Sidecar Ready (${sidecarModelTag})`
+      : kind === "bin_classifier_ready"
+        ? `.bin Classifier Ready (${ckptInfo?.architecture ?? "ET-BERT"})`
+        : kind === "bin_encoder_only"
+          ? ".bin Encoder Fallback"
+          : kind === "bin_missing"
+            ? "ไม่พบไฟล์ .bin"
+            : "Heuristic Tier-1";
+
+  const hardwareBadgeLabel =
+    kind === "sidecar_ready"
+      ? `Tier-1 Sidecar Ready (${sidecarModelTag}${deviceHint ? ` · ${deviceHint}` : ""})`
+      : kind === "bin_classifier_ready"
+        ? `ET-BERT .bin Ready (${ckptInfo?.architecture ?? "classifier"})`
+        : kind === "bin_encoder_only"
+          ? "ET-BERT .bin Encoder (Telemetry Fallback)"
+          : kind === "bin_missing"
+            ? "ET-BERT .bin Missing (Heuristic Fallback)"
+            : "Heuristic Tier-1 Active";
+
+  const analyzeCardDetail =
+    kind === "sidecar_ready"
+      ? "Tier-1 Python sidecar พร้อมใช้งาน — ติ๊กยินยอมเรียก Tier-1 endpoint ด้านล่างเมื่อส่งวิเคราะห์ (ส่งเฉพาะ anonymized flow features)"
+      : kind === "bin_classifier_ready"
+        ? "ทำงานอัตโนมัติแบบ offline โดยไม่ต้องใช้ API key (หากเป็น capture ระดับ L2/WLAN/ARP จะขึ้น L7 datagrams = 0 ซึ่งเป็นพฤติกรรมปกติ)"
+        : kind === "bin_encoder_only"
+          ? "ผูกไฟล์ Pre-trained Encoder (.bin ไม่มี classification head) — รัน L7 telemetry fallback อัตโนมัติ (แนะนำวาง models/etbert-l7 ใน tier1-inference เพื่อรัน Transformer จริง)"
+          : kind === "bin_missing"
+            ? "ไม่พบไฟล์ .bin ตาม path ที่ผูกไว้ — ระบบสลับใช้ Heuristic Tier-1 ชั่วคราว (แก้ไขหรือกด Unbind ได้ใน Workspace & Settings)"
+            : "ทำงานอัตโนมัติแบบ offline ด้วย Heuristic Tier-1 (หากต้องการโมเดล Transformer ให้วางโฟลเดอร์ models/etbert-l7 ใน tier1-inference/ แล้วรีสตาร์ท)";
+
+  const sidecarBadgeLabel = sidecarConfigured
+    ? `Sidecar Active (${triageMode}${deviceHint ? ` · ${deviceHint}` : ""})`
+    : "Sidecar Offline (Optional)";
+
+  const sidecarHint = sidecarConfigured
+    ? "รันโมเดล Transformer (เช่น models/etbert-l7) ผ่าน tier1-inference อัตโนมัติ ไม่ต้องกรอกช่องไฟล์ .bin ด้านล่าง"
+    : `หากมีโฟลเดอร์ HuggingFace (models/etbert-l7) ให้วางไว้ที่ tier1-inference/models/etbert-l7 แล้วเปิดโปรแกรมใหม่ผ่าน Start PCAPSCANNER.command (${deviceHint ?? "cpu"})`;
+
+  const binBadgeLabel = !binBound
+    ? "Not bound (Optional)"
+    : binMissing
+      ? "File not found"
+      : binReady && binHasClassifierHead
+        ? `Bound Classifier (${ckptInfo?.architecture ?? "BERT"} · ${ckptInfo?.tensor_count ?? 0} tensors)`
+        : binReady
+          ? `Bound Encoder Only (${ckptInfo?.tensor_count ?? 0} tensors)`
+          : "Invalid .bin";
+
+  const binHint = !binBound
+    ? "ตัวเลือกเสริมสำหรับผูกไฟล์ .bin เดี่ยวแบบ offline เมื่อไม่ได้รัน tier1-inference sidecar (ปล่อยว่างได้)"
+    : binMissing
+      ? "ไม่พบไฟล์ตาม path นี้บนเครื่อง — เลือกไฟล์ใหม่หรือกด Unbind"
+      : binReady && binHasClassifierHead
+        ? "พร้อมใช้เป็น local classifier แบบ offline"
+        : binReady
+          ? "ไฟล์นี้เป็น Pre-trained Encoder (ไม่มี classification head) จึงใช้เป็น L7 telemetry fallback — ถ้าต้องการโมเดลที่ fine-tune แล้ว ให้ใช้โฟลเดอร์ models/etbert-l7 กับ tier1-inference"
+          : "ตรวจสอบไฟล์ .bin/.pt อีกครั้ง หรือกด Unbind";
+
+  return {
+    kind,
+    pillTone,
+    neuralReady,
+    sidecarConfigured,
+    sidecarEtbertConfigured,
+    sidecarOpenjevConfigured,
+    boundBinPath,
+    binBound,
+    binReady,
+    binMissing,
+    binHasClassifierHead,
+    badgeLabel,
+    hardwareBadgeLabel,
+    hardwareBadgeOk,
+    hardwareBadgeWarn,
+    analyzeCardDetail,
+    sidecarBadgeLabel,
+    sidecarHint,
+    binBadgeLabel,
+    binHint,
+    deviceHint,
+    triageMode,
+  };
+}
+
+export interface Layer2DraftInput {
+  enabled: boolean;
+  provider: AIProviderName;
+  data_boundary: "local" | "remote";
+  base_url: string;
+  allowed_origins: string;
+  model: string;
+  api_key_env: string;
+}
+
+export interface Layer2StatusSummary {
+  pillTone: PillTone;
+  badgeLabel: string;
+  helperText: string;
+  hasUnsavedChanges: boolean;
+  savedActive: boolean;
+  missingModel: boolean;
+}
+
+function normalizeUrlForCompare(value?: string | null): string {
+  return (value ?? "").trim().replace(/\/+$/, "");
+}
+
+function normalizeOriginsForCompare(raw: string): string {
+  return raw
+    .split(",")
+    .map((part) => normalizeUrlForCompare(part))
+    .filter(Boolean)
+    .join(", ");
+}
+
+export function resolveLayer2DraftStatus({
+  aiConfig,
+  draft,
+}: {
+  aiConfig?: AIConfigResponse | null;
+  draft: Layer2DraftInput;
+}): Layer2StatusSummary {
+  const cfg = aiConfig?.configuration;
+  if (!cfg) {
+    if (!draft.enabled) {
+      return {
+        pillTone: "neutral",
+        badgeLabel: "Disabled (ไม่ใช้ LLM)",
+        helperText: "ปิด Layer-2 LLM — การตรวจจับ Layer-1 ทำงานอัตโนมัติ",
+        hasUnsavedChanges: false,
+        savedActive: false,
+        missingModel: false,
+      };
+    }
+    if (!draft.model.trim()) {
+      return {
+        pillTone: "warn",
+        badgeLabel: "ยังไม่เลือก Model Name",
+        helperText: "กด Probe / Discover Models หรือพิมพ์ชื่อโมเดลจริง แล้วกด Save AI Config ด้านล่าง",
+        hasUnsavedChanges: false,
+        savedActive: false,
+        missingModel: true,
+      };
+    }
+    return {
+      pillTone: "warn",
+      badgeLabel: "ยังไม่บันทึก — กด Save AI Config",
+      helperText: "กด Save AI Config ด้านล่างเพื่อให้ Backend เริ่มใช้งาน Layer-2 LLM",
+      hasUnsavedChanges: true,
+      savedActive: false,
+      missingModel: false,
+    };
+  }
+
+  const savedModel = (cfg.model ?? "").trim();
+  const savedActive = Boolean(cfg.enabled && savedModel);
+  const draftModel = draft.model.trim();
+  const hasUnsavedChanges =
+    draft.enabled !== Boolean(cfg.enabled) ||
+    draft.provider !== (cfg.provider || "openai_compatible") ||
+    draft.data_boundary !== (cfg.data_boundary || "local") ||
+    normalizeUrlForCompare(draft.base_url) !== normalizeUrlForCompare(cfg.base_url) ||
+    draftModel !== savedModel ||
+    draft.api_key_env.trim() !== (cfg.api_key_env ?? "").trim() ||
+    normalizeOriginsForCompare(draft.allowed_origins) !==
+      normalizeOriginsForCompare((cfg.allowed_origins ?? []).join(", "));
+
+  if (!draft.enabled) {
+    if (hasUnsavedChanges && savedActive) {
+      return {
+        pillTone: "warn",
+        badgeLabel: "ปิดสวิตช์ (ยังไม่บันทึก)",
+        helperText: "กด Save AI Config ด้านล่างเพื่อบันทึกการปิด Layer-2 LLM",
+        hasUnsavedChanges: true,
+        savedActive,
+        missingModel: false,
+      };
+    }
+    if (hasUnsavedChanges) {
+      return {
+        pillTone: "info",
+        badgeLabel: "มีการแก้ไข (ยังไม่บันทึก)",
+        helperText: "กด Save AI Config ด้านล่างเพื่อยืนยันสถานะปิดใช้งาน",
+        hasUnsavedChanges: true,
+        savedActive,
+        missingModel: false,
+      };
+    }
+    return {
+      pillTone: "neutral",
+      badgeLabel: "Disabled (ไม่ใช้ LLM)",
+      helperText: "ระบบตรวจจับด้วย Layer-1 อัตโนมัติโดยไม่ต้องเปิด LLM สรุปรายงาน",
+      hasUnsavedChanges: false,
+      savedActive,
+      missingModel: false,
+    };
+  }
+
+  if (!draftModel) {
+    return {
+      pillTone: "warn",
+      badgeLabel: "Standby · ยังไม่เลือก Model",
+      helperText:
+        "สวิตช์เปิดรอไว้แต่ยังไม่มีชื่อโมเดล (ข้อความจางในช่อง Model Name เป็นเพียงตัวอย่าง) — กด Probe / Discover Models หรือพิมพ์ชื่อโมเดลแล้วกด Save AI Config",
+      hasUnsavedChanges,
+      savedActive,
+      missingModel: true,
+    };
+  }
+
+  if (hasUnsavedChanges) {
+    return {
+      pillTone: "warn",
+      badgeLabel: "ยังไม่บันทึก — กด Save AI Config",
+      helperText: "กรอกค่าครบแล้ว กด Save AI Config ด้านล่างเพื่อให้ Backend เริ่มใช้งานจริง",
+      hasUnsavedChanges: true,
+      savedActive,
+      missingModel: false,
+    };
+  }
+
+  if (savedActive) {
+    return {
+      pillTone: "ok",
+      badgeLabel: `Active: ${cfg.provider}/${savedModel}`,
+      helperText: "บันทึกค่าบน Backend แล้ว — พร้อมสร้างสรุปรายงาน Layer-2",
+      hasUnsavedChanges: false,
+      savedActive: true,
+      missingModel: false,
+    };
+  }
+
+  return {
+    pillTone: "neutral",
+    badgeLabel: "Standby (Optional)",
+    helperText: "กด Save AI Config ด้านล่างเพื่อยืนยันการตั้งค่า",
+    hasUnsavedChanges,
+    savedActive: false,
+    missingModel: false,
+  };
+}
+

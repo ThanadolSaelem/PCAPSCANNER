@@ -420,6 +420,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         new_resource_mode: str | None = None,
         new_etbert_checkpoint_path: str | None = None,
         new_etbert_enabled: bool | None = None,
+        clear_etbert_checkpoint: bool = False,
     ) -> dict[str, object]:
         cfg_now = _cfg()
         store_now = _store()
@@ -459,7 +460,13 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             update_fields["resource_mode"] = new_resource_mode
 
         triage_updates: dict[str, object] = {}
-        if new_etbert_checkpoint_path is not None:
+        clearing_etbert = False
+        if clear_etbert_checkpoint:
+            clearing_etbert = True
+            triage_updates["etbert_checkpoint_path"] = None
+            if new_etbert_enabled is None:
+                triage_updates["etbert_enabled"] = False
+        elif new_etbert_checkpoint_path is not None:
             cleaned_ckpt = new_etbert_checkpoint_path.strip()
             if cleaned_ckpt:
                 if "\x00" in cleaned_ckpt:
@@ -471,7 +478,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 if new_etbert_enabled is None:
                     triage_updates["etbert_enabled"] = True
             else:
+                clearing_etbert = True
                 triage_updates["etbert_checkpoint_path"] = None
+                if new_etbert_enabled is None:
+                    triage_updates["etbert_enabled"] = False
         if new_etbert_enabled is not None:
             triage_updates["etbert_enabled"] = bool(new_etbert_enabled)
         if triage_updates:
@@ -488,12 +498,13 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     if "etbert_enabled" in updated_cfg.triage.model_fields_set
                     else None
                 )
+                persisted_ckpt = "" if clearing_etbert else updated_cfg.triage.etbert_checkpoint_path
                 update_workspace_config(
                     path=ws_path,
                     data_dir=str(updated_cfg.data_dir),
                     local_ingest_roots=list(updated_cfg.local_ingest_roots),
                     resource_mode=str(updated_cfg.resource_mode),
-                    etbert_checkpoint_path=updated_cfg.triage.etbert_checkpoint_path,
+                    etbert_checkpoint_path=persisted_ckpt,
                     etbert_enabled=explicit_etbert,
                     prefer_workspace=True,
                 )
@@ -574,6 +585,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             new_resource_mode=body.resource_mode,
             new_etbert_checkpoint_path=body.etbert_checkpoint_path,
             new_etbert_enabled=body.etbert_enabled,
+            clear_etbert_checkpoint=body.clear_etbert_checkpoint,
         )
 
     @app.post("/api/v1/system/pick-path", tags=["System"])

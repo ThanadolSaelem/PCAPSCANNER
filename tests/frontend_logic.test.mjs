@@ -10,6 +10,8 @@ import {
   extractLaunchHashCredentials,
   formatBytes,
   packetCoverageSummary,
+  resolveLayer1Status,
+  resolveLayer2DraftStatus,
 } from "../src/utils/adapters.ts";
 import {
   WiresharkCsvStreamAnalyzer,
@@ -397,4 +399,226 @@ test("adaptBackendReport distinguishes Layer-1 ET-BERT L2 fallback from Layer-2 
   const aiFallback = fallbackError.stages.find((s) => s.name === "AI NARRATIVE");
   assert.equal(aiFallback?.status, "partial");
   assert.match(aiFallback?.detail ?? "", /Layer-2 Fallback \(ai_provider_unreachable\)/);
+});
+
+test("resolveLayer1Status prioritizes running tier1-inference sidecar and avoids false missing-.bin badge", () => {
+  const capBase = {
+    host: {
+      cpu_count: 16,
+      host_memory_total_mb: 131072,
+      host_memory_available_mb: 65536,
+      cgroup_memory_limit_mb: null,
+      effective_memory_mb: 131072,
+      disk_total_bytes: 1e12,
+      disk_free_bytes: 5e11,
+      tshark_available: true,
+      tshark_version: "4.2",
+      zeek_available: false,
+      zeek_version: null,
+    },
+    runtime: { platform: "darwin", machine: "arm64", device_hint: "mps" },
+    limits: {
+      resource_mode: "auto",
+      upload_max_bytes: 0,
+      storage_max_bytes: 0,
+      disk_reserve_bytes: 0,
+      effective_upload_max_bytes: 0,
+      effective_storage_max_bytes: 0,
+      unlimited_upload_enabled: true,
+      chunk_size_bytes: 1024,
+      supported_formats: ["pcap"],
+      local_ingest_enabled: false,
+      local_ingest_roots: [],
+      batch_max_files: 8,
+      batch_max_total_bytes: 1024,
+      batch_admission_concurrency: 2,
+      zeek_enabled: false,
+      zeek_max_rows: 100,
+      zeek_max_output_bytes: 1024,
+      zeek_timeout_seconds: 30,
+      zeek_memory_mb: 128,
+    },
+    profiles: {},
+    triage: {
+      enabled: true,
+      mode: "etbert_openjev",
+      model_name: "openjev-cal-tier1",
+      endpoint_configured: true,
+      etbert_endpoint_configured: true,
+      etbert_enabled: true,
+      etbert_checkpoint_path: null,
+      etbert_checkpoint_info: { configured: false, exists: false, valid: false, ready: false },
+      high_confidence_threshold: 0.9,
+      low_confidence_threshold: 0.35,
+      compact_for_ai: true,
+    },
+  };
+
+  const sidecarStatus = resolveLayer1Status({ capabilities: capBase });
+  assert.equal(sidecarStatus.kind, "sidecar_ready");
+  assert.equal(sidecarStatus.pillTone, "ok");
+  assert.equal(sidecarStatus.hardwareBadgeOk, true);
+  assert.match(sidecarStatus.hardwareBadgeLabel, /Tier-1 Sidecar Ready \(ET-BERT \+ OpenJev · mps\)/);
+  assert.equal(sidecarStatus.binBound, false);
+  assert.equal(sidecarStatus.binBadgeLabel, "Not bound (Optional)");
+
+  const encoderOnlyStatus = resolveLayer1Status({
+    capabilities: {
+      ...capBase,
+      triage: {
+        ...capBase.triage,
+        mode: "heuristic_calibrated",
+        endpoint_configured: false,
+        etbert_endpoint_configured: false,
+        etbert_checkpoint_path: "/tmp/pre-trained_model.bin",
+        etbert_checkpoint_info: {
+          configured: true,
+          exists: true,
+          valid: true,
+          ready: true,
+          architecture: "uer-etbert-mlm",
+          has_classification_head: false,
+          tensor_count: 197,
+        },
+      },
+    },
+  });
+  assert.equal(encoderOnlyStatus.kind, "bin_encoder_only");
+  assert.equal(encoderOnlyStatus.pillTone, "info");
+  assert.match(encoderOnlyStatus.binBadgeLabel, /Bound Encoder Only/);
+
+  const heuristicStatus = resolveLayer1Status({
+    capabilities: {
+      ...capBase,
+      triage: {
+        ...capBase.triage,
+        mode: "heuristic_calibrated",
+        endpoint_configured: false,
+        etbert_endpoint_configured: false,
+        etbert_checkpoint_path: null,
+        etbert_checkpoint_info: { configured: false, exists: false, valid: false, ready: false },
+      },
+    },
+  });
+  assert.equal(heuristicStatus.kind, "heuristic_only");
+  assert.equal(heuristicStatus.pillTone, "neutral");
+  assert.equal(heuristicStatus.boundBinPath, "");
+
+  const unboundImmediatelyStatus = resolveLayer1Status({
+    capabilities: {
+      ...capBase,
+      triage: {
+        ...capBase.triage,
+        mode: "heuristic_calibrated",
+        endpoint_configured: false,
+        etbert_endpoint_configured: false,
+        etbert_checkpoint_path: "/tmp/pre-trained_model.bin",
+        etbert_checkpoint_info: { configured: true, exists: true, valid: true, ready: true },
+      },
+    },
+    workspaceConfig: {
+      data_dir: "/tmp/data",
+      local_ingest_roots: [],
+      resource_mode: "auto",
+      etbert_checkpoint_path: null,
+      etbert_checkpoint_configured: false,
+      etbert_enabled: false,
+      etbert_checkpoint_info: { configured: false, exists: false, valid: false, ready: false },
+      native_picker_available: false,
+      persisted: true,
+    },
+  });
+  assert.equal(unboundImmediatelyStatus.boundBinPath, "");
+  assert.equal(unboundImmediatelyStatus.binBound, false);
+  assert.equal(unboundImmediatelyStatus.binBadgeLabel, "Not bound (Optional)");
+});
+
+test("resolveLayer2DraftStatus highlights missing model, unsaved edits, and active state cleanly", () => {
+  const baseAiConfig = {
+    configuration: {
+      schema_version: "1.0",
+      enabled: true,
+      provider: "openai_compatible",
+      base_url: null,
+      allowed_origins: ["http://127.0.0.1:11434"],
+      model: null,
+      api_key_env: null,
+      data_boundary: "local",
+      timeout_seconds: 30,
+      input_max_bytes: 100000,
+      max_output_tokens: 2048,
+      context_window_tokens: 16384,
+    },
+    policy_hash: "p1",
+    editable: "loopback_nonsecret_runtime_and_env",
+  };
+
+  const missingModel = resolveLayer2DraftStatus({
+    aiConfig: baseAiConfig,
+    draft: {
+      enabled: true,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "",
+      api_key_env: "",
+    },
+  });
+  assert.equal(missingModel.pillTone, "warn");
+  assert.equal(missingModel.missingModel, true);
+  assert.match(missingModel.badgeLabel, /ยังไม่เลือก Model/);
+
+  const unsavedSelected = resolveLayer2DraftStatus({
+    aiConfig: baseAiConfig,
+    draft: {
+      enabled: true,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "qwen2.5:7b",
+      api_key_env: "",
+    },
+  });
+  assert.equal(unsavedSelected.hasUnsavedChanges, true);
+  assert.equal(unsavedSelected.pillTone, "warn");
+  assert.match(unsavedSelected.badgeLabel, /ยังไม่บันทึก/);
+
+  const savedActive = resolveLayer2DraftStatus({
+    aiConfig: {
+      ...baseAiConfig,
+      configuration: { ...baseAiConfig.configuration, model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434" },
+    },
+    draft: {
+      enabled: true,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "qwen2.5:7b",
+      api_key_env: "",
+    },
+  });
+  assert.equal(savedActive.pillTone, "ok");
+  assert.equal(savedActive.savedActive, true);
+  assert.equal(savedActive.badgeLabel, "Active: openai_compatible/qwen2.5:7b");
+
+  const disabledSaved = resolveLayer2DraftStatus({
+    aiConfig: {
+      ...baseAiConfig,
+      configuration: { ...baseAiConfig.configuration, enabled: false, model: null },
+    },
+    draft: {
+      enabled: false,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "",
+      api_key_env: "",
+    },
+  });
+  assert.equal(disabledSaved.pillTone, "neutral");
+  assert.match(disabledSaved.badgeLabel, /Disabled/);
 });

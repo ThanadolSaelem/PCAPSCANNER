@@ -606,8 +606,9 @@ def load_settings() -> AppSettings:
         if ws_raw.get("resource_mode"):
             ws_overlay["resource_mode"] = ws_raw["resource_mode"]
         ws_triage: dict[str, Any] = {}
-        if ws_raw.get("etbert_checkpoint_path"):
-            ws_triage["etbert_checkpoint_path"] = ws_raw["etbert_checkpoint_path"]
+        if "etbert_checkpoint_path" in ws_raw:
+            raw_ckpt = ws_raw.get("etbert_checkpoint_path")
+            ws_triage["etbert_checkpoint_path"] = raw_ckpt if isinstance(raw_ckpt, str) and raw_ckpt.strip() else None
         if isinstance(ws_raw.get("etbert_enabled"), bool):
             ws_triage["etbert_enabled"] = ws_raw["etbert_enabled"]
         if ws_triage:

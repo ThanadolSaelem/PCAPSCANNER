@@ -24,6 +24,7 @@ import OSINTPanel from "./components/OSINTPanel";
 import { WorldFlowMap } from "./components/WorldFlowMap";
 import { PrivacyRedactor } from "./utils/privacy";
 import type {
+  PillTone,
   WorkspaceFinding,
   WorkspaceFlow,
   WorkspacePacket,
@@ -42,6 +43,8 @@ import {
   formatCompactCount,
   formatDuration,
   packetCoverageSummary,
+  resolveLayer1Status,
+  resolveLayer2DraftStatus,
 } from "./utils/adapters";
 import type { CaptureHeaderInspection } from "./utils/localAnalyzer";
 import { analyzeLocalCsvFile, inspectCaptureFile } from "./utils/localAnalyzer";
@@ -940,10 +943,27 @@ function App() {
     try {
       const ws = await api.updateWorkspaceConfig({ etbert_checkpoint_path: clean, etbert_enabled: true });
       setWorkspaceConfig(ws);
-      pushToast("เชื่อมไฟล์โมเดล ET-BERT สำเร็จ", "success", ws.etbert_checkpoint_path ?? clean);
+      const hasHead = Boolean(ws.etbert_checkpoint_info?.has_classification_head);
+      pushToast(
+        hasHead ? "ผูกไฟล์โมเดล ET-BERT Classifier สำเร็จ" : "ผูกไฟล์ UER Encoder (.bin) แล้ว (Telemetry Fallback)",
+        hasHead ? "success" : "info",
+        ws.etbert_checkpoint_path ?? clean,
+      );
       await refreshWorkspace(true);
     } catch (err) {
       pushToast("ตั้งค่าโมเดล ET-BERT ไม่สำเร็จ", "error", safeFormatError(err));
+    }
+  };
+
+  const handleClearModelPath = async () => {
+    if (connectionStatus !== "connected") return;
+    try {
+      const ws = await api.updateWorkspaceConfig({ clear_etbert_checkpoint: true });
+      setWorkspaceConfig(ws);
+      pushToast("ยกเลิกการผูกไฟล์ .bin แล้ว", "info");
+      await refreshWorkspace(true);
+    } catch (err) {
+      pushToast("ยกเลิกการผูกไฟล์ .bin ไม่สำเร็จ", "error", safeFormatError(err));
     }
   };
 
@@ -1154,7 +1174,7 @@ function App() {
             </span>
             <button
               className="icon-button tiny"
-              aria-label="ตั้งค่า Workspace & โฟลเดอร์"
+              aria-label="เปิด Workspace & Settings"
               onClick={() => setConnectionModalOpen(true)}
             >
               <Icon name="bell" size={16} />
@@ -1190,7 +1210,7 @@ function App() {
               className="secondary-button top-connect"
               onClick={() => setConnectionModalOpen(true)}
             >
-              Workspace &amp; Folders
+              Workspace &amp; Settings
             </button>
             <button className="primary-button top-new" onClick={() => navigate("analyze")}>
               <Icon name="upload" size={16} /> วิเคราะห์ใหม่
@@ -1413,6 +1433,7 @@ function App() {
           onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
           onUpdateDataDir={(dir) => void handleUpdateDataDir(dir)}
           onUpdateModelPath={(path) => void handleUpdateModelPath(path)}
+          onClearModelPath={() => void handleClearModelPath()}
           onRemoveRoot={(root) => void handleRemoveLocalRoot(root)}
           onSaveAiConfig={handleSaveAiConfig}
           onProbeAiModels={handleProbeAiModels}
@@ -1547,6 +1568,13 @@ function buildQuickAiProbePayload(aiConfig: AIConfigResponse | null): AIModelPro
   };
 }
 
+function pillClassFromTone(tone: PillTone): string {
+  if (tone === "ok") return "ai-env-pill env-ok";
+  if (tone === "warn") return "ai-env-pill env-missing";
+  if (tone === "info") return "ai-env-pill env-info";
+  return "ai-env-pill env-neutral";
+}
+
 function ConnectionModal({
   initialUrl,
   initialToken,
@@ -1560,6 +1588,7 @@ function ConnectionModal({
   onPickNativePath,
   onUpdateDataDir,
   onUpdateModelPath,
+  onClearModelPath,
   onRemoveRoot,
   onSaveAiConfig,
   onProbeAiModels,
@@ -1580,6 +1609,7 @@ function ConnectionModal({
   onPickNativePath: (purpose: NativePickPurpose) => void;
   onUpdateDataDir: (dir: string) => void;
   onUpdateModelPath: (path: string) => void;
+  onClearModelPath: () => void;
   onRemoveRoot: (root: string) => void;
   onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
   onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
@@ -1591,14 +1621,15 @@ function ConnectionModal({
   const [urlInput, setUrlInput] = useState(initialUrl);
   const [tokenInput, setTokenInput] = useState(initialToken);
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
-  const resolvedModelPath =
-    workspaceConfig?.etbert_checkpoint_path ??
-    capabilities?.triage.etbert_checkpoint_path ??
-    "/Users/thanadol/Downloads/pre-trained_model.bin";
+  const resolvedModelPath = (
+    workspaceConfig != null
+      ? (workspaceConfig.etbert_checkpoint_path ?? "")
+      : (capabilities?.triage.etbert_checkpoint_path ?? "")
+  ).trim();
   const [dataDirDraft, setDataDirDraft] = useState(resolvedDataDir);
   const [modelPathDraft, setModelPathDraft] = useState(resolvedModelPath);
 
-  const [aiDraftEnabled, setAiDraftEnabled] = useState<boolean>(aiConfig?.configuration.enabled ?? true);
+  const [aiDraftEnabled, setAiDraftEnabled] = useState<boolean>(aiConfig?.configuration.enabled ?? false);
   const [aiDraftProvider, setAiDraftProvider] = useState<AIProviderName>(asAIProviderName(aiConfig?.configuration.provider));
   const [aiDraftBoundary, setAiDraftBoundary] = useState<"local" | "remote">(aiConfig?.configuration.data_boundary ?? "local");
   const [aiDraftBaseUrl, setAiDraftBaseUrl] = useState<string>(aiConfig?.configuration.base_url ?? "");
@@ -1614,12 +1645,8 @@ function ConnectionModal({
   }, [workspaceConfig?.data_dir, capabilities?.limits.data_dir]);
 
   useEffect(() => {
-    setModelPathDraft(
-      workspaceConfig?.etbert_checkpoint_path ??
-        capabilities?.triage.etbert_checkpoint_path ??
-        "/Users/thanadol/Downloads/pre-trained_model.bin",
-    );
-  }, [workspaceConfig?.etbert_checkpoint_path, capabilities?.triage.etbert_checkpoint_path]);
+    setModelPathDraft(resolvedModelPath);
+  }, [resolvedModelPath]);
 
   useEffect(() => {
     if (!aiConfig) return;
@@ -1634,8 +1661,22 @@ function ConnectionModal({
 
   const roots = workspaceConfig?.local_ingest_roots ?? capabilities?.limits.local_ingest_roots ?? [];
   const pickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? true;
-  const ckptInfo = workspaceConfig?.etbert_checkpoint_info ?? capabilities?.triage.etbert_checkpoint_info ?? null;
   const discoveredModels = aiModels?.items ?? [];
+  const layer1Status = resolveLayer1Status({ capabilities, workspaceConfig, aiConfig });
+  const layer2Status = resolveLayer2DraftStatus({
+    aiConfig,
+    draft: {
+      enabled: aiDraftEnabled,
+      provider: aiDraftProvider,
+      data_boundary: aiDraftBoundary,
+      base_url: aiDraftBaseUrl,
+      allowed_origins: aiDraftAllowedOrigins,
+      model: aiDraftModel,
+      api_key_env: aiDraftApiKeyEnv,
+    },
+  });
+  const dataDirDirty = Boolean(dataDirDraft.trim()) && dataDirDraft.trim() !== resolvedDataDir;
+  const modelPathDirty = Boolean(modelPathDraft.trim()) && modelPathDraft.trim() !== resolvedModelPath;
 
   const applyLocalOllamaPreset = () => {
     setAiDraftEnabled(true);
@@ -1646,7 +1687,7 @@ function ConnectionModal({
     setAiDraftApiKeyEnv("");
     setAiFeedback({
       tone: "info",
-      message: "เติมค่า Local Ollama (http://127.0.0.1:11434) แล้ว — กด Probe Models เพื่อเลือกโมเดลหรือพิมพ์ชื่อโมเดลแล้วกด Save AI Config",
+      message: "เติมค่า Local Ollama (http://127.0.0.1:11434) แล้ว — กด Probe / Discover Models เพื่อเลือกโมเดล แล้วกด Save AI Config",
     });
   };
 
@@ -1695,7 +1736,7 @@ function ConnectionModal({
         return null;
       }
       if (!aiDraftModel.trim()) {
-        setAiFeedback({ tone: "warn", message: "กรุณากด Probe Models หรือระบุชื่อ Model ก่อนเปิดใช้งาน Layer-2 AI" });
+        setAiFeedback({ tone: "warn", message: "กรุณากด Probe / Discover Models หรือระบุชื่อ Model ก่อนเปิดใช้งาน Layer-2 AI" });
         return null;
       }
     }
@@ -1726,7 +1767,7 @@ function ConnectionModal({
         if (!aiDraftModel.trim()) setAiDraftModel(res.items[0].id);
         setAiFeedback({
           tone: "ok",
-          message: `เชื่อมต่อสำเร็จ: พบ ${res.items.length} โมเดล (${res.items.slice(0, 4).map((m) => m.id).join(", ")})`,
+          message: `เชื่อมต่อสำเร็จ: พบ ${res.items.length} โมเดล (${res.items.slice(0, 4).map((m) => m.id).join(", ")}) — กด Save AI Config เพื่อบันทึก`,
         });
       } else {
         setAiFeedback({
@@ -1759,10 +1800,10 @@ function ConnectionModal({
       });
       setAiDraftAllowedOrigins((updated.configuration.allowed_origins ?? []).join(", "));
       setAiFeedback({
-        tone: updated.configuration.enabled ? "ok" : "info",
-        message: updated.configuration.enabled
+        tone: updated.configuration.enabled && updated.configuration.model ? "ok" : "info",
+        message: updated.configuration.enabled && updated.configuration.model
           ? `บันทึกเรียบร้อย · Layer-2 LLM พร้อมใช้งาน (${updated.configuration.provider}: ${updated.configuration.model})`
-          : "บันทึกสถานะ Standby แล้ว — Layer-1 Tier-1 & ET-BERT ยังทำงานอัตโนมัติ",
+          : "บันทึกสถานะ Disabled / Standby แล้ว — Layer-1 ยังทำงานอัตโนมัติ",
       });
     } catch (err) {
       setAiFeedback({ tone: "crit", message: safeFormatError(err) });
@@ -1779,8 +1820,8 @@ function ConnectionModal({
       <div className="panel connection-modal">
         <div className="modal-head">
           <div>
-            <div className="section-kicker">WORKSPACE, FOLDERS &amp; BACKEND</div>
-            <h2 id="conn-modal-title">จัดการ Data Directory, โฟลเดอร์, AI &amp; การเชื่อมต่อ</h2>
+            <div className="section-kicker">WORKSPACE, LAYER-1/LAYER-2 &amp; BACKEND</div>
+            <h2 id="conn-modal-title">จัดการพื้นที่จัดเก็บ, Layer-1/ET-BERT, Layer-2 LLM &amp; การเชื่อมต่อ</h2>
           </div>
           <button type="button" className="icon-button" aria-label="ปิดหน้าต่าง" onClick={onClose}>
             <Icon name="close" size={18} />
@@ -1815,18 +1856,25 @@ function ConnectionModal({
             <div className="workspace-picker-card">
               <div className="workspace-picker-head">
                 <div>
-                  <strong>Data Directory (`PCAP_DATA_DIR`)</strong>
-                  <small>โฟลเดอร์เก็บ SQLite metadata และไฟล์ที่อัปโหลด — สลับได้จาก Finder / File Manager โดยไม่ต้องรีสตาร์ท</small>
+                  <strong>
+                    Data Directory <code className="env-chip">PCAP_DATA_DIR</code>
+                  </strong>
+                  <small>โฟลเดอร์เก็บ SQLite metadata และไฟล์ที่อัปโหลด — สลับได้โดยไม่ต้องรีสตาร์ท</small>
                 </div>
-                <button
-                  type="button"
-                  className="primary-button tiny-btn"
-                  disabled={isPickingPath || !pickerAvailable}
-                  onClick={() => onPickNativePath("data_dir")}
-                >
-                  <Icon name="file" size={13} />{" "}
-                  {isPickingPath ? "รอเลือกใน File Manager..." : "เลือกผ่าน Popup..."}
-                </button>
+                <div className="layer-head-actions">
+                  <span className={dataDirDirty ? "ai-env-pill env-missing" : "ai-env-pill env-ok"}>
+                    {dataDirDirty ? "ยังไม่บันทึก — กด Apply Path" : "Active"}
+                  </span>
+                  <button
+                    type="button"
+                    className="primary-button tiny-btn"
+                    disabled={isPickingPath || !pickerAvailable}
+                    onClick={() => onPickNativePath("data_dir")}
+                  >
+                    <Icon name="file" size={13} />{" "}
+                    {isPickingPath ? "รอเลือก..." : "เลือกผ่าน Popup..."}
+                  </button>
+                </div>
               </div>
               <div className="local-path-row">
                 <input
@@ -1837,8 +1885,8 @@ function ConnectionModal({
                 />
                 <button
                   type="button"
-                  className="secondary-button tiny-btn"
-                  disabled={!dataDirDraft.trim() || dataDirDraft.trim() === resolvedDataDir}
+                  className={dataDirDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
+                  disabled={!dataDirDirty}
                   onClick={() => onUpdateDataDir(dataDirDraft)}
                 >
                   Apply Path
@@ -1847,45 +1895,12 @@ function ConnectionModal({
 
               <div className="workspace-picker-head workspace-roots-head">
                 <div>
-                  <strong>Layer-1 · ET-BERT Local Checkpoint (`PCAP_ETBERT_MODEL_BIN`)</strong>
+                  <strong>
+                    Authorized Local Capture Folders <code className="env-chip">PCAP_LOCAL_INGEST_ROOTS</code>
+                  </strong>
                   <small>
-                    เชื่อมไฟล์โมเดล <code>pre-trained_model.bin</code> โดยตรงแบบ offline ไม่ต้องพึ่งพา Trainer-Pipeline
-                    {ckptInfo?.valid || ckptInfo?.ready
-                      ? ` · Ready (${ckptInfo.architecture ?? "ET-BERT"} · ${ckptInfo.tensor_count ?? 0} tensors)`
-                      : ""}
+                    ทางเลือกเสริมสำหรับสแกนไฟล์ขนาดใหญ่บนเครื่องตรง ๆ — ถ้าอัปโหลด PCAP ผ่านหน้าเว็บตามปกติปล่อยว่างได้
                   </small>
-                </div>
-                <button
-                  type="button"
-                  className="secondary-button tiny-btn"
-                  disabled={isPickingPath || !pickerAvailable}
-                  onClick={() => onPickNativePath("model_file")}
-                >
-                  <Icon name="spark" size={13} />{" "}
-                  {isPickingPath ? "รอเลือก..." : "เลือกไฟล์ .bin (Popup)"}
-                </button>
-              </div>
-              <div className="local-path-row">
-                <input
-                  type="text"
-                  value={modelPathDraft}
-                  onChange={(e) => setModelPathDraft(e.target.value)}
-                  placeholder="/Users/thanadol/Downloads/pre-trained_model.bin"
-                />
-                <button
-                  type="button"
-                  className="secondary-button tiny-btn"
-                  disabled={!modelPathDraft.trim()}
-                  onClick={() => onUpdateModelPath(modelPathDraft)}
-                >
-                  Bind .bin Model
-                </button>
-              </div>
-
-              <div className="workspace-picker-head workspace-roots-head">
-                <div>
-                  <strong>Authorized Local Capture Folders (`PCAP_LOCAL_INGEST_ROOTS`)</strong>
-                  <small>โฟลเดอร์ที่อนุญาตให้ backend ลงทะเบียน capture; worker จะสร้าง private verified snapshot ก่อน parse</small>
                 </div>
                 <button
                   type="button"
@@ -1898,7 +1913,7 @@ function ConnectionModal({
                 </button>
               </div>
               {roots.length === 0 ? (
-                <small className="muted">ยังไม่มีโฟลเดอร์ PCAP ที่เพิ่มไว้ — กดปุ่ม &quot;+ เพิ่มโฟลเดอร์ (Popup)&quot; เพื่อเลือกจาก Finder</small>
+                <small className="muted">ยังไม่มีโฟลเดอร์ PCAP ที่อนุญาต (ปล่อยว่างได้หากใช้อัปโหลดผ่านหน้าเว็บ)</small>
               ) : (
                 <div className="local-roots-bar mono">
                   {roots.map((r) => (
@@ -1925,20 +1940,100 @@ function ConnectionModal({
           )}
 
           {status === "connected" && (
+            <div className="layer1-runtime-card">
+              <div className="workspace-picker-head">
+                <div>
+                  <strong>Layer-1 · Tier-1 Triage &amp; ET-BERT (Offline / Local)</strong>
+                  <small>ทำงานตรวจจับและคัดกรองแพ็กเก็ตในเครื่องโดยอัตโนมัติ แม้ปิด Layer-2 LLM</small>
+                </div>
+                <span className={pillClassFromTone(layer1Status.pillTone)}>{layer1Status.badgeLabel}</span>
+              </div>
+
+              <div className="layer1-subblock">
+                <div className="layer1-subhead">
+                  <strong>1) Neural Sidecar (tier1-inference · models/etbert-l7)</strong>
+                  <span className={layer1Status.sidecarConfigured ? "ai-env-pill env-ok" : "ai-env-pill env-neutral"}>
+                    {layer1Status.sidecarBadgeLabel}
+                  </span>
+                </div>
+                <small>{layer1Status.sidecarHint}</small>
+              </div>
+
+              <div className="layer1-subblock">
+                <div className="layer1-subhead">
+                  <strong>
+                    2) Local .bin Checkpoint Fallback <code className="env-chip">PCAP_ETBERT_MODEL_BIN</code>
+                  </strong>
+                  <div className="layer-head-actions">
+                    <span
+                      className={pillClassFromTone(
+                        layer1Status.binMissing
+                          ? "warn"
+                          : layer1Status.binReady
+                            ? layer1Status.binHasClassifierHead
+                              ? "ok"
+                              : "info"
+                            : "neutral",
+                      )}
+                    >
+                      {layer1Status.binBadgeLabel}
+                    </span>
+                    <button
+                      type="button"
+                      className="secondary-button tiny-btn"
+                      disabled={isPickingPath || !pickerAvailable}
+                      onClick={() => onPickNativePath("model_file")}
+                    >
+                      <Icon name="spark" size={13} />{" "}
+                      {isPickingPath ? "รอเลือก..." : "เลือกไฟล์ .bin (Popup)"}
+                    </button>
+                  </div>
+                </div>
+                <small>{layer1Status.binHint}</small>
+                <div className="local-path-row">
+                  <input
+                    type="text"
+                    value={modelPathDraft}
+                    onChange={(e) => setModelPathDraft(e.target.value)}
+                    placeholder="ปล่อยว่าง (Optional) หรือใส่ path ไปยังไฟล์ .bin / .pt"
+                  />
+                  <button
+                    type="button"
+                    className={modelPathDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
+                    disabled={!modelPathDirty}
+                    onClick={() => onUpdateModelPath(modelPathDraft)}
+                  >
+                    Bind .bin Model
+                  </button>
+                  {layer1Status.binBound && (
+                    <button
+                      type="button"
+                      className="secondary-button tiny-btn"
+                      onClick={onClearModelPath}
+                    >
+                      Unbind
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {status === "connected" && (
             <div className="ai-runtime-card">
               <div className="workspace-picker-head">
                 <div>
                   <strong>Layer-2 · Optional LLM Narrator (Runtime Configuration)</strong>
                   <small>
-                    ตั้งค่า LLM สำหรับสรุปรายงานแบบ opt-in เท่านั้น — รับเฉพาะ minimized &amp; redacted evidence (Layer-1 + ET-BERT ทำงานแยกต่างหากโดยอัตโนมัติ)
+                    ตั้งค่า LLM สำหรับสรุปรายงานแบบ opt-in เท่านั้น — รับเฉพาะ minimized &amp; redacted evidence (ไม่ปิดกั้น Layer-1)
                   </small>
                 </div>
-                <span className={`ai-env-pill ${aiConfig?.configuration.enabled && aiConfig.configuration.model ? "env-ok" : ""}`}>
-                  {aiConfig?.configuration.enabled && aiConfig.configuration.model
-                    ? `Active: ${aiConfig.configuration.provider}/${aiConfig.configuration.model}`
-                    : "Standby (Optional)"}
-                </span>
+                <span className={pillClassFromTone(layer2Status.pillTone)}>{layer2Status.badgeLabel}</span>
               </div>
+
+              {(!layer2Status.savedActive || layer2Status.hasUnsavedChanges) && (
+                <div className={`ai-status-note note-${layer2Status.pillTone}`}>{layer2Status.helperText}</div>
+              )}
 
               <div className="ai-preset-row">
                 <label className="ai-toggle-line">
@@ -1997,12 +2092,12 @@ function ConnectionModal({
                 </label>
 
                 <label className="modal-field">
-                  <span>Base URL ({aiDraftBoundary === "local" ? "http://127.0.0.1:11434" : "https://..."})</span>
+                  <span>Base URL ({aiDraftBoundary === "local" ? "loopback" : "https://..."})</span>
                   <input
                     type="url"
                     value={aiDraftBaseUrl}
                     onChange={(e) => setAiDraftBaseUrl(e.target.value)}
-                    placeholder={aiDraftBoundary === "local" ? "http://127.0.0.1:11434" : "https://api.openai.com"}
+                    placeholder={aiDraftBoundary === "local" ? "เช่น http://127.0.0.1:11434 (ว่าง = ค่า Ollama เริ่มต้น)" : "เช่น https://api.openai.com"}
                   />
                 </label>
 
@@ -2012,7 +2107,7 @@ function ConnectionModal({
                     type="text"
                     value={aiDraftAllowedOrigins}
                     onChange={(e) => setAiDraftAllowedOrigins(e.target.value)}
-                    placeholder="http://127.0.0.1:11434"
+                    placeholder="เช่น http://127.0.0.1:11434"
                   />
                 </label>
               </div>
@@ -2043,17 +2138,17 @@ function ConnectionModal({
                     : `กด Save AI Config เพื่อตรวจ ENV $${cleanEnvTrimmed}`}
                 </span>
               ) : (
-                <span className="ai-env-pill">ไม่ระบุ API Key ENV (เหมาะสำหรับ Local Ollama ที่ไม่ต้องใช้ token)</span>
+                <span className="ai-env-pill env-neutral">ไม่ระบุ API Key ENV (เหมาะสำหรับ Local Ollama ที่ไม่ต้องใช้ token)</span>
               )}
 
               <div className="model-probe-row">
                 <label className="modal-field">
-                  <span>Model Name (เลือกจากผล Probe หรือพิมพ์ชื่อโมเดล เช่น qwen2.5:7b)</span>
+                  <span>Model Name (เลือกจากผล Probe หรือพิมพ์ชื่อโมเดลจริง)</span>
                   <input
                     type="text"
                     value={aiDraftModel}
                     onChange={(e) => setAiDraftModel(e.target.value)}
-                    placeholder="qwen2.5:7b / llama3.2 / gpt-4o-mini / claude-3-7-sonnet-latest"
+                    placeholder="ยังไม่ได้ตั้ง — พิมพ์ เช่น qwen2.5:7b หรือกด Probe →"
                   />
                 </label>
                 {discoveredModels.length > 0 && (
@@ -2092,9 +2187,11 @@ function ConnectionModal({
                 </div>
               )}
 
-              <div className="ai-runtime-actions">
+              <div className={`ai-runtime-actions ${layer2Status.hasUnsavedChanges ? "actions-dirty" : ""}`}>
                 <small className="muted">
-                  การตั้งค่าบันทึกเฉพาะ metadata ที่ไม่เป็นความลับลง Workspace Config
+                  {layer2Status.hasUnsavedChanges
+                    ? "มีการตั้งค่าที่ยังไม่บันทึก — กด Save AI Config เพื่อให้ Backend เริ่มใช้งาน"
+                    : "การตั้งค่าบันทึกเฉพาะ metadata ที่ไม่เป็นความลับลง Workspace Config"}
                 </small>
                 <button
                   type="button"
@@ -2120,7 +2217,9 @@ function ConnectionModal({
           </label>
 
           <label className="modal-field">
-            <span>Operator Bearer Token (`PCAP_API_TOKEN`, auto-filled เมื่อเปิดผ่าน 1-click launcher)</span>
+            <span>
+              Operator Bearer Token <code className="env-chip">PCAP_API_TOKEN</code> (auto-filled เมื่อเปิดผ่าน 1-click launcher)
+            </span>
             <input
               type="password"
               value={tokenInput}
@@ -2700,10 +2799,12 @@ function AnalyzePage({
   const isCsvSelected = fileInspection?.detectedFormat === "csv" || fileInspection?.detectedFormat === "tsv";
   const effectiveChunkSize = activeProfile?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes ?? null;
   const canStartBackendAi = Boolean(aiConfig?.configuration.enabled && aiConfig?.configuration.model);
-  const etbertInfo = workspaceConfig?.etbert_checkpoint_info ?? capabilities?.triage.etbert_checkpoint_info ?? null;
-  const etbertReady = Boolean(etbertInfo ? (etbertInfo.valid || etbertInfo.ready) : capabilities?.triage.etbert_enabled);
+  const layer1Status = resolveLayer1Status({ capabilities, workspaceConfig, aiConfig });
   const triageEndpointConfigured = Boolean(
-    aiConfig?.triage?.endpoint_configured || aiConfig?.triage?.etbert_endpoint_configured,
+    aiConfig?.triage?.endpoint_configured ||
+      aiConfig?.triage?.etbert_endpoint_configured ||
+      capabilities?.triage.endpoint_configured ||
+      capabilities?.triage.etbert_endpoint_configured,
   );
   const triageEndpointTargets = [
     aiConfig?.triage?.endpoint_url ? `OpenJev ${safeEndpointOrigin(aiConfig.triage.endpoint_url) ?? "configured endpoint"}` : null,
@@ -2732,7 +2833,7 @@ function AnalyzePage({
         detail="รองรับ bounded resumable upload, private local-capture snapshots และการวิเคราะห์ Wireshark CSV/TSV ในเบราว์เซอร์"
         actions={
           <button type="button" className="secondary-button" onClick={onOpenConnectionModal}>
-            <Icon name="activity" size={15} /> {connectionStatus === "connected" ? "Workspace & Folders" : "Connect Backend"}
+            <Icon name="activity" size={15} /> {connectionStatus === "connected" ? "Workspace & Settings" : "Connect Backend"}
           </button>
         }
       />
@@ -2786,10 +2887,8 @@ function AnalyzePage({
               : "CSV Engine Ready · TShark via API"}
           </strong>
           <small className="hw-subline">
-            <span className={etbertReady ? "hw-badge-ok" : "hw-badge-warn"}>
-              {etbertReady
-                ? `ET-BERT .bin Ready (${etbertInfo?.architecture ?? "checkpoint"})`
-                : "ET-BERT .bin Missing (Heuristic Tier-1)"}
+            <span className={layer1Status.hardwareBadgeOk ? "hw-badge-ok" : layer1Status.hardwareBadgeWarn ? "hw-badge-warn" : "muted"}>
+              {layer1Status.hardwareBadgeLabel}
             </span>
             <span className={canStartBackendAi ? "hw-badge-ok" : "muted"}>
               {canStartBackendAi
@@ -3001,7 +3100,7 @@ function AnalyzePage({
                         <span>
                           {nativePickerAvailable
                             ? "การเลือกไฟล์ให้สิทธิ์อ่านเฉพาะไฟล์นั้นครั้งเดียว นาน 5 นาที; จะไม่เพิ่มโฟลเดอร์แม่ใน allowlist"
-                            : "Environment ปัจจุบันไม่มีหน้าต่าง GUI Picker — กรอก path ใน Workspace & Folders หรือตั้ง env ก่อนสตาร์ทเซิร์ฟเวอร์"}
+                            : "Environment ปัจจุบันไม่มีหน้าต่าง GUI Picker — กรอก path ใน Workspace & Settings หรือตั้ง env ก่อนสตาร์ทเซิร์ฟเวอร์"}
                         </span>
                         <div className="local-path-row">
                           <input
@@ -3156,13 +3255,11 @@ function AnalyzePage({
               <div className="ai-layer-card">
                 <div className="ai-layer-card-head">
                   <strong>Layer 1 · Offline Tier-1 + ET-BERT</strong>
-                  <span className={`ai-env-pill ${etbertReady ? "env-ok" : "env-missing"}`}>
-                    {etbertReady ? "ET-BERT .bin Ready" : "Heuristics Only"}
+                  <span className={pillClassFromTone(layer1Status.pillTone)}>
+                    {layer1Status.badgeLabel}
                   </span>
                 </div>
-                <small>
-                  ทำงานอัตโนมัติแบบ offline โดยไม่ต้องใช้ API key (หากเป็น capture ระดับ L2/WLAN/ARP จะขึ้น L7 datagrams = 0 ซึ่งเป็นพฤติกรรมปกติ)
-                </small>
+                <small>{layer1Status.analyzeCardDetail}</small>
               </div>
               <div className="ai-layer-card">
                 <div className="ai-layer-card-head">
@@ -3179,7 +3276,7 @@ function AnalyzePage({
                   {canStartBackendAi
                     ? `พร้อมใช้งาน: ${aiConfig?.configuration.provider} (${aiConfig?.configuration.model})`
                     : connectionStatus === "connected" && aiConfig && !aiConfig.configuration.enabled
-                      ? "Layer-2 AI ถูกปิดโดยผู้ดูแล (ai.enabled = false) — คลิกเปิดใช้งานด้านล่างหรือใน AI Settings"
+                      ? "Layer-2 AI ถูกปิดโดยผู้ดูแล (ai.enabled = false) — คลิกเปิดใช้งานด้านล่างหรือใน Workspace & Settings"
                       : connectionStatus === "connected" && aiConfig?.configuration.enabled
                         ? `เปิดใช้งานโดยค่าเริ่มต้น (${aiConfig.configuration.provider}) — เลือก Model หรือกด Detect Models เพื่อเริ่มใช้งาน`
                         : "Standby — เชื่อมต่อ Backend แล้วเลือกโมเดล Local Ollama หรือ API Endpoint เมื่อต้องการสรุปรายงาน"}
@@ -3295,7 +3392,7 @@ function AnalyzePage({
                       <>
                         <strong>Layer-2 AI ถูกปิดอยู่บน Backend (ai.enabled = false)</strong>
                         <span>
-                          ผู้ดูแลตั้งค่า <code>ai.enabled = false</code> — กดเปิดใช้งานทันทีหรือตั้งค่า Provider ใน AI Settings (Layer-1 deterministic detectors และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ)
+                          ผู้ดูแลตั้งค่า <code>ai.enabled = false</code> — กดเปิดใช้งานทันทีหรือตั้งค่า Provider ใน Workspace &amp; Settings (Layer-1 deterministic detectors และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ)
                         </span>
                         <div className="consent-cta">
                           <button
@@ -4853,7 +4950,7 @@ function ReportsPage({
                       <div>
                         <strong>Layer-2 AI ถูกปิดอยู่ (ai.enabled = false)</strong>
                         <p style={{ margin: "3px 0 0" }}>
-                          ผู้ดูแลปิด Layer-2 AI ไว้ — กดเปิดใช้งานทันทีด้านล่างหรือปรับแต่งใน AI Settings
+                          ผู้ดูแลปิด Layer-2 AI ไว้ — กดเปิดใช้งานทันทีด้านล่างหรือปรับแต่งใน Workspace &amp; Settings
                         </p>
                       </div>
                     </div>

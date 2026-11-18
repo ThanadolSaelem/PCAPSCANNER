@@ -57,6 +57,8 @@ export interface TriageConfigInfo {
     hidden_size?: number;
     num_layers?: number;
     architecture?: string;
+    checkpoint_type?: string;
+    has_classification_head?: boolean;
   } | null;
   etbert_model_name?: string;
   high_confidence_threshold: number;
@@ -115,6 +117,8 @@ export interface WorkspaceConfigState {
   local_ingest_roots: string[];
   resource_mode: ResourceMode;
   etbert_checkpoint_path?: string | null;
+  etbert_checkpoint_configured?: boolean;
+  etbert_enabled?: boolean;
   etbert_checkpoint_info?: TriageConfigInfo["etbert_checkpoint_info"];
   native_picker_available: boolean;
   picker_backend: string | null;
@@ -130,6 +134,7 @@ export interface WorkspaceUpdatePayload {
   resource_mode?: ResourceMode;
   etbert_checkpoint_path?: string;
   etbert_enabled?: boolean;
+  clear_etbert_checkpoint?: boolean;
 }
 
 export type NativePickPurpose = "data_dir" | "capture_root" | "capture_file" | "model_file";
