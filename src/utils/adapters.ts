@@ -310,7 +310,10 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
 
   if (bundle.triage?.enabled) {
     const etbertCount = bundle.triage.etbert_scored_count ?? 0;
-    const etbertNote = etbertCount > 0 ? ` · ET-BERT ${etbertCount} L7` : "";
+    const etbertNote =
+      etbertCount > 0
+        ? ` · ET-BERT ${etbertCount} L7 scored`
+        : " · ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)";
     stages.push({
       name: "TIER-1 CLASSIFIER",
       engine: "triage",
@@ -332,10 +335,12 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
             : "partial",
     detail:
       report.ai?.state === "completed"
-        ? `Model ${report.ai.model ?? "configured"} generated evidence-grounded summary`
-        : report.ai?.error_code
-          ? `Fallback (${report.ai.error_code}) — deterministic findings retained`
-          : "Disabled for this analysis; configure and enable a provider/model, then grant per-analysis consent to run the advisory narrator",
+        ? `Layer-2 LLM (${report.ai.model ?? "configured"}) generated evidence-grounded summary`
+        : report.ai?.state === "pending"
+          ? `Layer-2 LLM (${report.ai.model ?? "configured"}) generating narrative...`
+          : report.ai?.error_code
+            ? `Layer-2 Fallback (${report.ai.error_code}) — Layer-1 & deterministic findings retained`
+            : "Layer-2 LLM disabled for this run (optional; configure provider & grant consent to enable)",
   });
 
   const sha = bundle.capture_sha256;
@@ -417,16 +422,17 @@ export function exportReportMarkdown(report: WorkspaceReport): string {
   ];
 
   if (report.triage) {
+    const etbertCount = report.triage.etbert_scored_count ?? 0;
     const etbertLine =
-      (report.triage.etbert_scored_count ?? 0) > 0
-        ? `- ET-BERT L7 Scored Flows: **${report.triage.etbert_scored_count}**`
-        : null;
+      etbertCount > 0
+        ? `- ET-BERT L7 Scored Flows: **${etbertCount}**`
+        : `- ET-BERT L7 Scored Flows: **0** (L2/control/WLAN records evaluated via Layer-1 heuristics)`;
     lines.push(
       `## Tier-1 Calibrated Triage (${report.triage.model})`,
       `- Evaluated: **${report.triage.total_evaluated}** records`,
       `- High-Confidence Benign Filtered: **${report.triage.benign_filtered}** (${(report.triage.reduction_ratio * 100).toFixed(1)}% noise reduction)`,
       `- Escalated / Uncertain: **${report.triage.escalated_count}** (${report.triage.uncertain_count} uncertain, mean PPL=${report.triage.mean_ppl.toFixed(2)})`,
-      ...(etbertLine ? [etbertLine] : []),
+      etbertLine,
       ``,
     );
   }

@@ -2097,6 +2097,25 @@ def _detect_findings(
                     ],
                 )
 
+    # 7. 802.11 WLAN Deauthentication / Disassociation Flood
+    for flow in accumulator.flows.values():
+        if flow.proto == "WLAN" and flow.wlan_deauth_count >= 10:
+            eid = flow_evidence.get(flow.key)
+            if eid:
+                _finding(
+                    findings,
+                    detector="wlan_deauth_flood",
+                    title="802.11 WLAN deauthentication / disassociation flood",
+                    severity="medium",
+                    confidence="low",
+                    summary=f"WLAN flow {flow.src}->{flow.dst} logged {flow.wlan_deauth_count} deauth/disassoc frames ({flow.packets} total frames).",
+                    evidence_ids=[eid],
+                    limitations=[
+                        "IEEE 802.11 management frame flood heuristics are observational and can overlap roaming or AP resets.",
+                        "Verify BSSID authorization and signal proximity before attributing interference.",
+                    ],
+                )
+
     if len(findings) >= 1000:
         accumulator.stream_limited = True
         accumulator.warn("Finding cap reached; additional candidates may not be retained.")
@@ -2748,8 +2767,29 @@ def _build_bundle(
             )
     artifacts_list = list(artifacts_by_sha.values())[:200]
 
+    pkt_lengths = [int(ln) for _, ln, _ in accumulator._time_samples if ln and ln > 0]
+    iat_samples: list[float] = []
+    for flow in accumulator.flows.values():
+        for iv in flow.intervals:
+            if math.isfinite(iv) and iv >= 0:
+                iat_samples.append(float(iv))
+                if len(iat_samples) >= 5000:
+                    break
+        if len(iat_samples) >= 5000:
+            break
+    if not iat_samples and accumulator.first_epoch is not None and len(accumulator._time_samples) >= 2:
+        sorted_ts = sorted(ts for ts, _, _ in accumulator._time_samples if math.isfinite(ts))
+        for prev_ts, cur_ts in zip(sorted_ts, sorted_ts[1:]):
+            dt = cur_ts - prev_ts
+            if math.isfinite(dt) and dt >= 0:
+                iat_samples.append(dt)
+                if len(iat_samples) >= 5000:
+                    break
+
     flow_analytics = build_flow_analytics(
         evidence,
+        packet_lengths=pkt_lengths or None,
+        inter_arrival_seconds=iat_samples or None,
         findings=findings,
         duration_seconds=duration_s,
         total_packets=packets_analyzed,

@@ -460,3 +460,42 @@ class CaseIOCCreateRequest(Contract):
         self.tags = [tag.strip() for tag in self.tags if tag.strip()]
         self.note = self.note.strip()
         return self
+
+
+class AIConfigUpdateRequest(Contract):
+    """Loopback-only runtime update of non-secret AI narrator configuration."""
+
+    enabled: StrictBool | None = None
+    provider: Literal["openai_compatible", "anthropic", "manus"] | None = None
+    base_url: str | None = Field(default=None, max_length=500)
+    allowed_origins: list[str] | None = Field(default=None, max_length=20)
+    model: str | None = Field(default=None, max_length=200)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    data_boundary: Literal["local", "remote"] | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=120)
+    retries: int | None = Field(default=None, ge=0, le=2)
+    input_max_bytes: int | None = Field(default=None, ge=1, le=100_000)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=8192)
+    context_window_tokens: int | None = Field(default=None, ge=1, le=2_000_000)
+    token_parameter: Literal["max_tokens", "max_completion_tokens"] | None = None
+    response_mode: Literal["json_schema", "json_object", "text"] | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    anthropic_version: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one AI configuration field is required")
+        return self
+
+
+class AIModelProbeRequest(Contract):
+    """Non-secret endpoint parameters for probing available provider models."""
+
+    provider: Literal["openai_compatible", "anthropic", "manus"] | None = None
+    base_url: str | None = Field(default=None, max_length=500)
+    allowed_origins: list[str] | None = Field(default=None, max_length=20)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    data_boundary: Literal["local", "remote"] | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=120)
+    anthropic_version: str | None = Field(default=None, min_length=1, max_length=64)

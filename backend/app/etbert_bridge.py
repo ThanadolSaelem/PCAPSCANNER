@@ -796,6 +796,31 @@ def score_flows_with_local_etbert_checkpoint(
     return {ev_id: LocalETBERTScore(ev_id, payload) for ev_id, payload in raw_scores.items()}
 
 
+def is_etbert_explicitly_disabled(triage_cfg: Any) -> bool:
+    """Return True only when the operator explicitly set `etbert_enabled=False`."""
+    if triage_cfg is None:
+        return False
+    etbert_enabled = bool(getattr(triage_cfg, "etbert_enabled", False))
+    fields_set = getattr(triage_cfg, "model_fields_set", None)
+    if fields_set is not None:
+        return "etbert_enabled" in fields_set and not etbert_enabled
+    return hasattr(triage_cfg, "etbert_enabled") and not etbert_enabled
+
+
+def is_etbert_effectively_enabled(triage_cfg: Any, *, ckpt_ready: bool | None = None) -> bool:
+    """Resolve effective offline ET-BERT status: auto-enabled when a valid checkpoint exists unless explicitly disabled."""
+    if triage_cfg is None:
+        return bool(ckpt_ready)
+    if is_etbert_explicitly_disabled(triage_cfg):
+        return False
+    if bool(getattr(triage_cfg, "etbert_enabled", False)):
+        return True
+    if ckpt_ready is None:
+        ckpt_path = getattr(triage_cfg, "etbert_checkpoint_path", None)
+        ckpt_ready = bool(inspect_etbert_checkpoint(ckpt_path).get("ready")) if ckpt_path else False
+    return bool(ckpt_ready)
+
+
 __all__ = [
     "LocalETBERTScore",
     "anonymize_identifier",
@@ -803,6 +828,8 @@ __all__ = [
     "extract_l7_datagram_hex",
     "inspect_etbert_checkpoint",
     "is_data_bearing_evidence",
+    "is_etbert_effectively_enabled",
+    "is_etbert_explicitly_disabled",
     "resolve_etbert_checkpoint_path",
     "score_flows_with_local_etbert_checkpoint",
     "score_with_etbert_http",

@@ -591,6 +591,8 @@ def load_settings() -> AppSettings:
             ws_triage["etbert_enabled"] = ws_raw["etbert_enabled"]
         if ws_triage:
             ws_overlay["triage"] = ws_triage
+        if isinstance(ws_raw.get("ai"), dict) and ws_raw["ai"]:
+            ws_overlay["ai"] = ws_raw["ai"]
         _assert_nonsecret(ws_overlay)
         if ws_raw.get("prefer_workspace"):
             # Desktop UI-picked paths take precedence over ambient shell defaults.

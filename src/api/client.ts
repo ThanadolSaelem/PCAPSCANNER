@@ -49,6 +49,7 @@ export interface TriageConfigInfo {
     path?: string;
     exists?: boolean;
     valid?: boolean;
+    ready?: boolean;
     size_bytes?: number;
     sha256_prefix?: string;
     tensor_count?: number;
@@ -146,6 +147,8 @@ export interface NativePickResponse {
   workspace: WorkspaceConfigState;
 }
 
+export type AIProviderName = "openai_compatible" | "anthropic" | "manus";
+
 export interface AIConfigResponse {
   configuration: {
     schema_version: string;
@@ -157,13 +160,49 @@ export interface AIConfigResponse {
     api_key_env: string | null;
     data_boundary: "local" | "remote";
     timeout_seconds: number;
+    retries?: number;
     input_max_bytes: number;
     max_output_tokens: number;
     context_window_tokens: number;
+    token_parameter?: "max_tokens" | "max_completion_tokens";
+    response_mode?: "json_schema" | "json_object" | "text";
+    temperature?: number | null;
+    anthropic_version?: string;
   };
   triage?: TriageConfigInfo;
   policy_hash: string;
   editable: string;
+  api_key_env_set?: boolean;
+  manus_env_set?: boolean;
+}
+
+export interface AIConfigUpdatePayload {
+  enabled?: boolean;
+  provider?: AIProviderName;
+  base_url?: string | null;
+  allowed_origins?: string[];
+  model?: string | null;
+  api_key_env?: string | null;
+  data_boundary?: "local" | "remote";
+  timeout_seconds?: number;
+  retries?: number;
+  input_max_bytes?: number;
+  max_output_tokens?: number;
+  context_window_tokens?: number;
+  token_parameter?: "max_tokens" | "max_completion_tokens";
+  response_mode?: "json_schema" | "json_object" | "text";
+  temperature?: number | null;
+  anthropic_version?: string;
+}
+
+export interface AIModelProbePayload {
+  provider?: AIProviderName;
+  base_url?: string | null;
+  allowed_origins?: string[];
+  api_key_env?: string | null;
+  data_boundary?: "local" | "remote";
+  timeout_seconds?: number;
+  anthropic_version?: string;
 }
 
 export interface AIModelsResponse {
@@ -339,7 +378,7 @@ export interface FlowAnalyticsBundle {
   top_src_ips: { ip: string; packets: number }[];
   top_dst_ips: { ip: string; packets: number }[];
   top_public_dst_ips?: { ip: string; packets: number }[];
-  top_dst_ports: { port: number; packets: number }[];
+  top_dst_ports: { port: number | string; packets: number }[];
   top_protos: { protocol: string; packets: number }[];
   top_domains: { domain: string; count: number }[];
   sankey_links: { source: string; target: string; service: string; bytes: number; packets: number }[];
@@ -745,6 +784,22 @@ export class PcapApiClient {
 
   getAiModels(): Promise<AIModelsResponse> {
     return this.requestJson<AIModelsResponse>("/api/v1/ai/models");
+  }
+
+  updateAiConfig(payload: AIConfigUpdatePayload): Promise<AIConfigResponse> {
+    return this.requestJson<AIConfigResponse>("/api/v1/ai/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  probeAiModels(payload: AIModelProbePayload = {}): Promise<AIModelsResponse> {
+    return this.requestJson<AIModelsResponse>("/api/v1/ai/models/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
   }
 
   browseLocalCaptures(): Promise<LocalBrowseResponse> {

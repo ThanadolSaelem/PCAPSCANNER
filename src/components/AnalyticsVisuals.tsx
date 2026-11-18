@@ -22,6 +22,7 @@ export function AnalyticsVisuals({
   const redactIp = (ip: string) => (privacyRedactor ? privacyRedactor.redactIp(ip) : ip);
   const topSrc = (analytics.top_src_ips ?? []).slice(0, 8);
   const topDst = (analytics.top_dst_ips ?? []).slice(0, 8);
+  const topPorts = (analytics.top_dst_ports ?? []).slice(0, 6);
   const sizeHist = analytics.packet_size_histogram ?? [];
   const iatHist = analytics.iat_histogram ?? [];
   const sankeyLinks = (analytics.sankey_links ?? []).slice(0, 10);
@@ -41,23 +42,23 @@ export function AnalyticsVisuals({
   const maxProtoPkts = Math.max(1, ...protoList.map((x) => x.packets));
   const maxSizeCount = Math.max(1, ...sizeHist.map((x) => x.count));
   const maxIatCount = Math.max(1, ...iatHist.map((x) => x.count));
-  const maxSankeyBytes = Math.max(1, ...sankeyLinks.map((x) => x.bytes));
+  const maxSankeyBytes = Math.max(0, ...sankeyLinks.map((x) => x.bytes));
+  const maxSankeyPackets = Math.max(1, ...sankeyLinks.map((x) => x.packets));
+  const usePacketsFallback = maxSankeyBytes === 0;
 
   return (
-    <div className="space-y-4">
-      <div className="grid gap-4 lg:grid-cols-3">
+    <div className="av-stack">
+      <div className="av-grid-3">
         {/* Top Source Talkers */}
-        <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
-              Top Source Talkers (Capped)
-            </span>
-            <span className="font-mono text-[10px] text-zinc-500">Top {topSrc.length}</span>
+        <div className="av-card">
+          <div className="av-card-head">
+            <span className="av-card-title">Top Source Talkers (Capped)</span>
+            <span className="av-card-meta">Top {topSrc.length}</span>
           </div>
           {topSrc.length === 0 ? (
-            <div className="py-4 text-xs text-zinc-500">No source flow aggregates recorded.</div>
+            <div className="av-empty">No source flow aggregates recorded.</div>
           ) : (
-            <div className="space-y-2">
+            <div className="av-bar-list">
               {topSrc.map((item) => {
                 const pct = Math.max(4, Math.round((item.packets / maxSrcPkts) * 100));
                 return (
@@ -65,15 +66,15 @@ export function AnalyticsVisuals({
                     key={item.ip}
                     type="button"
                     onClick={() => onSelectIpFilter?.(item.ip)}
-                    className="group w-full text-left"
+                    className="av-bar-item"
                     title="Click to filter findings & traffic by this IP"
                   >
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-mono text-zinc-200 group-hover:text-indigo-300">{redactIp(item.ip)}</span>
-                      <span className="font-mono text-[11px] text-zinc-400">{item.packets.toLocaleString()} pkts</span>
+                    <div className="av-bar-row">
+                      <span className="av-bar-name">{redactIp(item.ip)}</span>
+                      <span className="av-bar-val">{item.packets.toLocaleString()} pkts</span>
                     </div>
-                    <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-900">
-                      <div className="h-full rounded-full bg-indigo-500/80" style={{ width: `${pct}%` }} />
+                    <div className="av-bar-track">
+                      <div className="av-bar-fill indigo" style={{ width: `${pct}%` }} />
                     </div>
                   </button>
                 );
@@ -83,17 +84,15 @@ export function AnalyticsVisuals({
         </div>
 
         {/* Top Destination Talkers */}
-        <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
-              Top Destination Talkers
-            </span>
-            <span className="font-mono text-[10px] text-zinc-500">Top {topDst.length}</span>
+        <div className="av-card">
+          <div className="av-card-head">
+            <span className="av-card-title">Top Destination Talkers</span>
+            <span className="av-card-meta">Top {topDst.length}</span>
           </div>
           {topDst.length === 0 ? (
-            <div className="py-4 text-xs text-zinc-500">No destination flow aggregates recorded.</div>
+            <div className="av-empty">No destination flow aggregates recorded.</div>
           ) : (
-            <div className="space-y-2">
+            <div className="av-bar-list">
               {topDst.map((item) => {
                 const pct = Math.max(4, Math.round((item.packets / maxDstPkts) * 100));
                 return (
@@ -101,15 +100,15 @@ export function AnalyticsVisuals({
                     key={item.ip}
                     type="button"
                     onClick={() => onSelectIpFilter?.(item.ip)}
-                    className="group w-full text-left"
+                    className="av-bar-item"
                     title="Click to filter findings & traffic by this IP"
                   >
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-mono text-zinc-200 group-hover:text-cyan-300">{redactIp(item.ip)}</span>
-                      <span className="font-mono text-[11px] text-zinc-400">{item.packets.toLocaleString()} pkts</span>
+                    <div className="av-bar-row">
+                      <span className="av-bar-name">{redactIp(item.ip)}</span>
+                      <span className="av-bar-val">{item.packets.toLocaleString()} pkts</span>
                     </div>
-                    <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-900">
-                      <div className="h-full rounded-full bg-cyan-500/80" style={{ width: `${pct}%` }} />
+                    <div className="av-bar-track">
+                      <div className="av-bar-fill cyan" style={{ width: `${pct}%` }} />
                     </div>
                   </button>
                 );
@@ -118,18 +117,16 @@ export function AnalyticsVisuals({
           )}
         </div>
 
-        {/* Protocol Breakdown */}
-        <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
-              Protocol Breakdown
-            </span>
-            <span className="font-mono text-[10px] text-zinc-500">{protoList.length} protocols</span>
+        {/* Protocol Breakdown & Top Dst Ports */}
+        <div className="av-card">
+          <div className="av-card-head">
+            <span className="av-card-title">Protocol Breakdown</span>
+            <span className="av-card-meta">{protoList.length} protocols</span>
           </div>
           {protoList.length === 0 ? (
-            <div className="py-4 text-xs text-zinc-500">No protocol distribution available.</div>
+            <div className="av-empty">No protocol distribution available.</div>
           ) : (
-            <div className="space-y-2">
+            <div className="av-bar-list">
               {protoList.map((item) => {
                 const pct = Math.max(4, Math.round((item.packets / maxProtoPkts) * 100));
                 return (
@@ -137,74 +134,72 @@ export function AnalyticsVisuals({
                     key={item.protocol}
                     type="button"
                     onClick={() => onSelectProtocolFilter?.(item.protocol)}
-                    className="group w-full text-left"
+                    className="av-bar-item"
                     title="Click to filter traffic by this protocol"
                   >
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-mono font-medium text-zinc-200 group-hover:text-emerald-300">
-                        {item.protocol}
-                      </span>
-                      <span className="font-mono text-[11px] text-zinc-400">{item.packets.toLocaleString()} pkts</span>
+                    <div className="av-bar-row">
+                      <span className="av-bar-name">{item.protocol}</span>
+                      <span className="av-bar-val">{item.packets.toLocaleString()} pkts</span>
                     </div>
-                    <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-900">
-                      <div className="h-full rounded-full bg-emerald-500/80" style={{ width: `${pct}%` }} />
+                    <div className="av-bar-track">
+                      <div className="av-bar-fill emerald" style={{ width: `${pct}%` }} />
                     </div>
                   </button>
                 );
               })}
             </div>
           )}
+          {topPorts.length > 0 && (
+            <div className="av-ports-row">
+              <span className="av-ports-label">Top Dst Ports</span>
+              {topPorts.map((item) => (
+                <span key={String(item.port)} className="av-port-chip">
+                  :{String(item.port)} <small>({item.packets.toLocaleString()})</small>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
       {/* Packet Size & Inter-Arrival Histograms */}
-      <div className="grid gap-4 lg:grid-cols-2">
-        <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
-              Packet Size Distribution (Bytes)
-            </span>
-            <span className="font-mono text-[10px] text-zinc-500">Fixed 7-bin histogram</span>
+      <div className="av-grid-2">
+        <div className="av-card">
+          <div className="av-card-head">
+            <span className="av-card-title">Packet Size Distribution (Bytes)</span>
+            <span className="av-card-meta">Fixed 7-bin histogram</span>
           </div>
-          <div className="grid grid-cols-7 items-end gap-2 pt-2" style={{ height: "110px" }}>
+          <div className="av-hist-grid cols-7">
             {sizeHist.map((bin) => {
               const heightPct = bin.count > 0 ? Math.max(8, Math.round((bin.count / maxSizeCount) * 100)) : 2;
               return (
-                <div key={bin.bucket} className="flex h-full flex-col items-center justify-end gap-1">
-                  <span className="font-mono text-[9px] text-zinc-400">{bin.count}</span>
-                  <div className=" flex w-full flex-1 items-end rounded bg-zinc-900/70 p-0.5">
-                    <div
-                      className="w-full rounded bg-indigo-500/75 transition-all"
-                      style={{ height: `${heightPct}%` }}
-                    />
+                <div key={bin.bucket} className="av-hist-col" title={`${bin.bucket}: ${bin.count} packets`}>
+                  <span className="av-hist-count">{bin.count}</span>
+                  <div className="av-hist-track">
+                    <div className="av-hist-bar indigo" style={{ height: `${heightPct}%` }} />
                   </div>
-                  <span className="font-mono text-[9px] text-zinc-500">{bin.bucket}</span>
+                  <span className="av-hist-label">{bin.bucket}</span>
                 </div>
               );
             })}
           </div>
         </div>
 
-        <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
-              Inter-Arrival Time (IAT) Distribution
-            </span>
-            <span className="font-mono text-[10px] text-zinc-500">Beacon / burst timing</span>
+        <div className="av-card">
+          <div className="av-card-head">
+            <span className="av-card-title">Inter-Arrival Time (IAT) Distribution</span>
+            <span className="av-card-meta">Beacon / burst timing</span>
           </div>
-          <div className="grid grid-cols-6 items-end gap-2 pt-2" style={{ height: "110px" }}>
+          <div className="av-hist-grid cols-6">
             {iatHist.map((bin) => {
               const heightPct = bin.count > 0 ? Math.max(8, Math.round((bin.count / maxIatCount) * 100)) : 2;
               return (
-                <div key={bin.bucket} className="flex h-full flex-col items-center justify-end gap-1">
-                  <span className="font-mono text-[9px] text-zinc-400">{bin.count}</span>
-                  <div className="flex w-full flex-1 items-end rounded bg-zinc-900/70 p-0.5">
-                    <div
-                      className="w-full rounded bg-amber-500/75 transition-all"
-                      style={{ height: `${heightPct}%` }}
-                    />
+                <div key={bin.bucket} className="av-hist-col" title={`${bin.bucket}: ${bin.count} intervals`}>
+                  <span className="av-hist-count">{bin.count}</span>
+                  <div className="av-hist-track">
+                    <div className="av-hist-bar amber" style={{ height: `${heightPct}%` }} />
                   </div>
-                  <span className="font-mono text-[9px] text-zinc-500">{bin.bucket}</span>
+                  <span className="av-hist-label">{bin.bucket}</span>
                 </div>
               );
             })}
@@ -213,49 +208,60 @@ export function AnalyticsVisuals({
       </div>
 
       {/* Sankey Top Flows & Bounded Network Graph */}
-      <div className="grid gap-4 lg:grid-cols-2">
-        <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
-              Sankey Conversation Lanes (Source → Service → Target)
+      <div className="av-grid-2">
+        <div className="av-card">
+          <div className="av-card-head">
+            <span className="av-card-title">Sankey Conversation Lanes (Source → Service → Target)</span>
+            <span className="av-card-meta">
+              {usePacketsFallback
+                ? `Top ${sankeyLinks.length} packet lanes (L2/control)`
+                : `Top ${sankeyLinks.length} byte lanes`}
             </span>
-            <span className="font-mono text-[10px] text-zinc-500">Top {sankeyLinks.length} byte lanes</span>
           </div>
           {sankeyLinks.length === 0 ? (
-            <div className="py-4 text-xs text-zinc-500">No bidirectional conversation lanes available.</div>
+            <div className="av-empty">No bidirectional conversation lanes available.</div>
           ) : (
-            <div className="space-y-2">
+            <div className="av-sankey-list">
               {sankeyLinks.map((lane, idx) => {
-                const widthPct = Math.max(8, Math.round((lane.bytes / maxSankeyBytes) * 100));
+                const widthPct = usePacketsFallback
+                  ? Math.max(8, Math.round((lane.packets / maxSankeyPackets) * 100))
+                  : Math.max(8, Math.round((lane.bytes / Math.max(1, maxSankeyBytes)) * 100));
                 return (
-                  <div key={`${lane.source}-${lane.target}-${idx}`} className="rounded-lg border border-white/5 bg-zinc-950/60 p-2">
-                    <div className="flex items-center justify-between gap-2 text-xs">
-                      <button
-                        type="button"
-                        onClick={() => onSelectIpFilter?.(lane.source)}
-                        className="font-mono text-zinc-200 hover:text-indigo-300"
-                      >
-                        {redactIp(lane.source)}
-                      </button>
-                      <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[10px] text-indigo-300">
-                        {lane.service}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => onSelectIpFilter?.(lane.target)}
-                        className="font-mono text-zinc-200 hover:text-cyan-300"
-                      >
-                        {redactIp(lane.target)}
-                      </button>
-                      <span className="font-mono text-[11px] text-zinc-400">
-                        {formatBytes(lane.bytes)} ({lane.packets} pkts)
+                  <div key={`${lane.source}-${lane.target}-${idx}`} className="av-sankey-row">
+                    <div className="av-sankey-head">
+                      <div className="av-sankey-endpoints">
+                        <button
+                          type="button"
+                          onClick={() => onSelectIpFilter?.(lane.source)}
+                          className="av-sankey-ip"
+                          title="Filter traffic by source"
+                        >
+                          {redactIp(lane.source)}
+                        </button>
+                        <span className="av-sankey-arrow" aria-hidden="true">
+                          →
+                        </span>
+                        <span className="av-sankey-svc">{lane.service}</span>
+                        <span className="av-sankey-arrow" aria-hidden="true">
+                          →
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onSelectIpFilter?.(lane.target)}
+                          className="av-sankey-ip"
+                          title="Filter traffic by target"
+                        >
+                          {redactIp(lane.target)}
+                        </button>
+                      </div>
+                      <span className="av-sankey-stats">
+                        {lane.bytes > 0
+                          ? `${formatBytes(lane.bytes)} (${lane.packets} pkts)`
+                          : `${lane.packets.toLocaleString()} pkts`}
                       </span>
                     </div>
-                    <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-zinc-900">
-                      <div
-                        className="h-full rounded-full bg-gradient-to-r from-indigo-500 via-purple-500 to-cyan-400"
-                        style={{ width: `${widthPct}%` }}
-                      />
+                    <div className="av-sankey-track">
+                      <div className="av-sankey-fill" style={{ width: `${widthPct}%` }} />
                     </div>
                   </div>
                 );
@@ -265,30 +271,28 @@ export function AnalyticsVisuals({
         </div>
 
         {/* Network Topology Summary & Temporal Heatmap */}
-        <div className="space-y-4">
-          <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
+        <div className="av-subcol">
+          <div className="av-card">
+            <div className="av-card-head">
+              <span className="av-card-title">
                 Capped Topology Graph ({graphNodes.length} nodes · {graphEdges.length} edges)
               </span>
-              <span className="font-mono text-[10px] text-zinc-500">Max 25 nodes</span>
+              <span className="av-card-meta">Max 25 nodes</span>
             </div>
             {graphNodes.length === 0 ? (
-              <div className="py-3 text-xs text-zinc-500">No topology nodes extracted.</div>
+              <div className="av-empty">No topology nodes extracted.</div>
             ) : (
-              <div className="flex flex-wrap gap-1.5">
+              <div className="av-topo-chips">
                 {graphNodes.slice(0, 18).map((node) => (
                   <button
                     key={node.id}
                     type="button"
                     onClick={() => onSelectIpFilter?.(node.id)}
-                    className={`rounded-md border px-2 py-1 font-mono text-[11px] transition ${
-                      node.is_public
-                        ? "border-amber-500/30 bg-amber-500/10 text-amber-200 hover:border-amber-400"
-                        : "border-zinc-800 bg-zinc-900/90 text-zinc-300 hover:border-indigo-500/40"
-                    }`}
+                    className={`av-topo-chip ${node.is_public ? "public" : ""}`}
+                    title="Click to filter findings & traffic by node"
                   >
-                    {redactIp(node.id)} · {formatBytes(node.bytes)}
+                    {redactIp(node.id)}
+                    {node.bytes > 0 ? ` · ${formatBytes(node.bytes)}` : ""}
                   </button>
                 ))}
               </div>
@@ -296,32 +300,31 @@ export function AnalyticsVisuals({
           </div>
 
           {heatmapRows.length > 0 && (
-            <div className="rounded-xl border border-[#1E2230] bg-[#0B0D12] p-4">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-400">
-                  Destination Temporal Activity Heatmap (12 Time Slices)
-                </span>
+            <div className="av-card">
+              <div className="av-card-head">
+                <span className="av-card-title">Destination Temporal Activity Heatmap (12 Time Slices)</span>
               </div>
-              <div className="space-y-1.5">
+              <div className="av-heatmap">
                 {heatmapRows.slice(0, 6).map((row) => {
                   const rowMax = Math.max(1, ...row.buckets);
                   return (
-                    <div key={row.ip} className="flex items-center gap-2">
+                    <div key={row.ip} className="av-heatmap-row">
                       <button
                         type="button"
                         onClick={() => onSelectIpFilter?.(row.ip)}
-                        className="w-32 truncate text-left font-mono text-[11px] text-zinc-300 hover:text-indigo-300"
+                        className="av-heatmap-ip"
+                        title={redactIp(row.ip)}
                       >
                         {redactIp(row.ip)}
                       </button>
-                      <div className="grid flex-1 grid-cols-12 gap-1">
+                      <div className="av-heatmap-cells">
                         {row.buckets.map((val, bIdx) => {
                           const intensity = val === 0 ? 0.08 : Math.max(0.25, val / rowMax);
                           return (
                             <div
                               key={bIdx}
                               title={`Slice ${bIdx + 1}: ${val} flows`}
-                              className="h-3.5 rounded-sm bg-indigo-500"
+                              className="av-heatmap-cell"
                               style={{ opacity: intensity }}
                             />
                           );

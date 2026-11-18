@@ -29,6 +29,36 @@ ALLOWED_WORKSPACE_KEYS = {
     "prefer_workspace",
     "etbert_checkpoint_path",
     "etbert_enabled",
+    "ai",
+}
+_ALLOWED_AI_CONFIG_KEYS = {
+    "schema_version",
+    "enabled",
+    "provider",
+    "base_url",
+    "allowed_origins",
+    "model",
+    "api_key_env",
+    "data_boundary",
+    "timeout_seconds",
+    "retries",
+    "input_max_bytes",
+    "max_output_tokens",
+    "context_window_tokens",
+    "token_parameter",
+    "response_mode",
+    "temperature",
+    "anthropic_version",
+}
+_FORBIDDEN_AI_SECRET_KEYS = {
+    "api_key",
+    "api_token",
+    "secret",
+    "password",
+    "authorization",
+    "bearer",
+    "credential",
+    "credentials",
 }
 _PURPOSE_PROMPTS: dict[PickerPurpose, str] = {
     "data_dir": "Select PCAPSCANNER Data Directory",
@@ -213,6 +243,52 @@ def _normalize_roots(raw_roots: Any) -> list[str]:
     return out
 
 
+def _sanitize_ai_dict(raw_ai: Any) -> dict[str, Any]:
+    if not isinstance(raw_ai, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, val in raw_ai.items():
+        key_text = str(key)
+        key_lower = key_text.lower()
+        if (
+            key_lower in _FORBIDDEN_AI_SECRET_KEYS
+            or key_lower.endswith("_secret")
+            or key_lower.endswith("_password")
+            or key_text not in _ALLOWED_AI_CONFIG_KEYS
+        ):
+            continue
+        if key_text == "enabled":
+            if isinstance(val, bool):
+                out[key_text] = val
+        elif key_text == "allowed_origins":
+            if isinstance(val, list):
+                origins = [
+                    item.strip()
+                    for item in val
+                    if isinstance(item, str) and item.strip() and "\x00" not in item
+                ][:20]
+                out[key_text] = origins
+        elif val is None:
+            if key_text in {"base_url", "model", "api_key_env", "temperature"}:
+                out[key_text] = None
+        elif isinstance(val, bool):
+            continue
+        elif isinstance(val, str):
+            if "\x00" not in val:
+                out[key_text] = val.strip() if key_text in {"base_url", "model", "api_key_env"} else val
+        elif isinstance(val, int) and key_text in {
+            "timeout_seconds",
+            "retries",
+            "input_max_bytes",
+            "max_output_tokens",
+            "context_window_tokens",
+        }:
+            out[key_text] = val
+        elif isinstance(val, float) and key_text == "temperature":
+            out[key_text] = val
+    return out
+
+
 def sanitize_workspace_data(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {"schema_version": "1.0", "local_ingest_roots": []}
@@ -232,6 +308,9 @@ def sanitize_workspace_data(raw: Any) -> dict[str, Any]:
         out["etbert_checkpoint_path"] = str(Path(etbert_ckpt.strip()).expanduser().resolve())
     if isinstance(raw.get("etbert_enabled"), bool):
         out["etbert_enabled"] = raw["etbert_enabled"]
+    clean_ai = _sanitize_ai_dict(raw.get("ai"))
+    if clean_ai:
+        out["ai"] = clean_ai
     return out
 
 
@@ -279,6 +358,7 @@ def update_workspace_config(
     prefer_workspace: bool | None = None,
     etbert_checkpoint_path: str | None = None,
     etbert_enabled: bool | None = None,
+    ai: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target = path or resolve_default_workspace_config_path()
     current = load_workspace_config(target)
@@ -297,6 +377,12 @@ def update_workspace_config(
             current.pop("etbert_checkpoint_path", None)
     if etbert_enabled is not None:
         current["etbert_enabled"] = bool(etbert_enabled)
+    if ai is not None:
+        clean_ai = _sanitize_ai_dict(ai)
+        if clean_ai:
+            current["ai"] = clean_ai
+        else:
+            current.pop("ai", None)
     save_workspace_config(current, target)
     return current
 

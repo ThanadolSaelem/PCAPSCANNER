@@ -860,13 +860,13 @@ async def generate_chat_completion(
     return text
 
 
-async def _get_json(
+async def _get_json_with_status(
     runtime: _Runtime,
     config: AIConfig,
     endpoint: str,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str | None]:
     # Model discovery uses the same bounded, no-redirect client policy.  It is
     # intentionally separate from summary POST so no model is selected silently.
     deadline = time.monotonic() + config.timeout_seconds
@@ -881,11 +881,103 @@ async def _get_json(
                 async with client.stream("GET", endpoint, headers=runtime.headers) as response:
                     raw = await _read_response(response, deadline)
                     if response.status_code != 200:
-                        return None
+                        return None, f"provider_http_{response.status_code}"
                     parsed = json.loads(raw)
-                    return parsed if isinstance(parsed, dict) else None
-    except (httpx.HTTPError, _RequestFailure, ValueError, TypeError, TimeoutError, json.JSONDecodeError):
-        return None
+                    if isinstance(parsed, dict):
+                        return parsed, None
+                    return None, "provider_invalid_response"
+    except TimeoutError:
+        return None, "provider_timeout"
+    except _RequestFailure as failure:
+        return None, failure.code
+    except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+        return None, "provider_unreachable"
+
+
+def _parse_models_payload(payload: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not payload:
+        return []
+    result: list[dict[str, str]] = []
+    if isinstance(payload.get("data"), list):
+        for item in payload["data"]:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                continue
+            row = {"id": item["id"]}
+            for key in ("owned_by", "type", "display_name"):
+                if isinstance(item.get(key), str):
+                    row[key] = item[key]
+            result.append(row)
+        if result:
+            return result
+    if isinstance(payload.get("models"), list):
+        for item in payload["models"]:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("name") or item.get("model") or item.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            row = {"id": model_id.strip(), "owned_by": "ollama"}
+            details = item.get("details")
+            if isinstance(details, dict):
+                if isinstance(details.get("family"), str):
+                    row["type"] = details["family"]
+                if isinstance(details.get("parameter_size"), str):
+                    row["display_name"] = f"{model_id.strip()} ({details['parameter_size']})"
+            result.append(row)
+    return result
+
+
+async def probe_models(
+    config: AIConfig,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[list[dict[str, str]], str | None]:
+    """Probe a validated non-secret provider endpoint for models (including Ollama `/api/tags`)."""
+    raw_cfg = config.model_dump(mode="python")
+    raw_cfg["enabled"] = True
+    try:
+        probe_cfg = AIConfig.model_validate(raw_cfg)
+    except ValidationError as exc:
+        err_text = str(exc)
+        for token in (
+            "endpoint_origin_not_allowed",
+            "local_default_requires_local_boundary",
+            "base_url_required",
+            "remote_endpoint_requires_tls",
+            "local_boundary_requires_loopback",
+            "forbidden_origin",
+        ):
+            if token in err_text:
+                return [], token
+        return [], "invalid_ai_configuration"
+
+    probe_settings = AppSettings.model_construct(ai=probe_cfg)
+    try:
+        runtime = _runtime(probe_settings, require_model=False)
+        base = _base_url(probe_cfg)
+    except _RequestFailure as failure:
+        return [], failure.code
+
+    endpoint_v1 = _append_path(base, "/v1/models")
+    payload, err = await _get_json_with_status(runtime, probe_cfg, endpoint_v1, transport=transport)
+    items = _parse_models_payload(payload)
+    if items:
+        return items, None
+
+    if runtime.route == "chat" and _provider_text(probe_cfg) == ProviderName.OPENAI_COMPATIBLE.value:
+        tags_base = base.rstrip("/")
+        if tags_base.endswith("/v1"):
+            tags_base = tags_base[:-3]
+        endpoint_tags = _append_path(tags_base, "/api/tags")
+        tags_payload, tags_err = await _get_json_with_status(
+            runtime, probe_cfg, endpoint_tags, transport=transport
+        )
+        tags_items = _parse_models_payload(tags_payload)
+        if tags_items:
+            return tags_items, None
+        err = err or tags_err
+
+    return [], err or "no_models_returned"
 
 
 async def list_models(
@@ -896,27 +988,8 @@ async def list_models(
     """Discover models when the configured endpoint supports it; never guess one."""
     if not settings.ai.enabled:
         return []
-    try:
-        runtime = _runtime(settings, require_model=False)
-    except _RequestFailure:
-        return []
-    if runtime.route == "anthropic":
-        endpoint = _append_path(_base_url(settings.ai), "/v1/models")
-    else:
-        endpoint = _append_path(_base_url(settings.ai), "/v1/models")
-    payload = await _get_json(runtime, settings.ai, endpoint, transport=transport)
-    if not payload or not isinstance(payload.get("data"), list):
-        return []
-    result: list[dict[str, str]] = []
-    for item in payload["data"]:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
-            continue
-        row = {"id": item["id"]}
-        for key in ("owned_by", "type", "display_name"):
-            if isinstance(item.get(key), str):
-                row[key] = item[key]
-        result.append(row)
-    return result
+    items, _warning = await probe_models(settings.ai, transport=transport)
+    return items
 
 
-__all__ = ["generate_summary", "list_models"]
+__all__ = ["generate_chat_completion", "generate_summary", "list_models", "probe_models"]

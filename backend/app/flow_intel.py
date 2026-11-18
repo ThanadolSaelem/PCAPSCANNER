@@ -459,10 +459,10 @@ def build_flow_analytics(
         attrs = getattr(item, "attributes", item.get("attributes") if isinstance(item, dict) else None) or {}
         if not isinstance(attrs, dict):
             continue
-        if kind == "flow":
+        if kind in {"flow", "wlan", "http", "icmp", "arp"}:
             flows.append(attrs)
             dst_ip = str(attrs.get("dst") or "")
-            t0 = attrs.get("first_seen")
+            t0 = attrs.get("first_seen") if attrs.get("first_seen") is not None else attrs.get("time_epoch")
             if dst_ip and isinstance(t0, (int, float)):
                 inferred_hm.append((float(t0), dst_ip))
         elif kind == "dns":
@@ -537,6 +537,7 @@ def build_flow_analytics(
     pair_pkts: Counter[tuple[str, str]] = Counter()
     pair_proto: dict[tuple[str, str], str] = {}
     node_bytes: Counter[str] = Counter()
+    node_pkts: Counter[str] = Counter()
     for f in flows:
         src = str(f.get("src", "") or "")
         dst = str(f.get("dst", "") or "")
@@ -546,14 +547,20 @@ def build_flow_analytics(
         p = int(f.get("count", f.get("packets", 0)) or 0)
         dp = f.get("dport", f.get("dst_port"))
         pr = str(f.get("proto", f.get("protocol", "IP")))
-        svc = f"{pr}:{dp}" if dp is not None else pr
+        svc = f"{pr}:{dp}" if dp is not None and str(dp) != "N/A" else pr
         pair_bytes[(src, dst)] += b
         pair_pkts[(src, dst)] += p
         pair_proto[(src, dst)] = svc
         node_bytes[src] += b
         node_bytes[dst] += b
+        node_pkts[src] += p
+        node_pkts[dst] += p
 
-    top_edges = pair_bytes.most_common(24)
+    ranked_pairs = sorted(
+        pair_bytes.keys(),
+        key=lambda pair: (-pair_bytes[pair], -pair_pkts[pair], pair),
+    )[:24]
+    top_edges = [(pair, pair_bytes[pair]) for pair in ranked_pairs]
     sankey_links = [
         {
             "source": s,
@@ -565,7 +572,10 @@ def build_flow_analytics(
         for (s, d), b in top_edges
     ]
 
-    graph_node_ids = [ip for ip, _ in node_bytes.most_common(25)]
+    graph_node_ids = sorted(
+        node_bytes.keys(),
+        key=lambda ip: (-node_bytes[ip], -node_pkts[ip], ip),
+    )[:25]
     graph_set = set(graph_node_ids)
     graph_nodes = [
         {
@@ -608,7 +618,7 @@ def build_flow_analytics(
         "top_src_ips": [{"ip": ip, "packets": c} for ip, c in agg["top_src_ips"]],
         "top_dst_ips": [{"ip": ip, "packets": c} for ip, c in agg["top_dst_ips"]],
         "top_public_dst_ips": [{"ip": ip, "packets": c} for ip, c in agg_public["top_dst_ips"]],
-        "top_dst_ports": [{"port": port, "packets": c} for port, c in agg["top_dst_ports"]],
+        "top_dst_ports": [{"port": port, "packets": c} for port, c in agg["top_dst_ports"] if port and port != "N/A"],
         "top_protos": [{"protocol": proto, "packets": c} for proto, c in agg["top_protos"]],
         "top_domains": [{"domain": dom, "count": c} for dom, c in top_domains],
         "sankey_links": sankey_links,

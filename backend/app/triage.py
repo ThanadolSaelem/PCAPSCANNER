@@ -26,7 +26,11 @@ from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
 from urllib.request import Request
 
-from .etbert_bridge import score_with_etbert_http, score_with_etbert_local_bin
+from .etbert_bridge import (
+    is_etbert_explicitly_disabled,
+    score_with_etbert_http,
+    score_with_etbert_local_bin,
+)
 from .http_transport import post_json_bounded
 
 
@@ -513,6 +517,18 @@ def score_evidence_deterministic(
         logits["Benign"] -= 0.7
         signals.append(f"nonstd_port_bulk={dst_port}")
 
+    # 7a. 802.11 WLAN Deauth / Management Flood signals
+    wlan_deauth = _attr_int(attrs, "wlan_deauth_count", 0)
+    wlan_auth = _attr_int(attrs, "wlan_auth_count", 0)
+    if (
+        "wlan_deauth_flood" in detectors
+        or wlan_deauth >= 5
+        or wlan_auth >= 25
+    ):
+        logits["WiFi_Attack"] += 5.4
+        logits["Benign"] -= 2.1
+        signals.append(f"wlan_deauth={wlan_deauth}" if wlan_deauth > 0 else f"wlan_auth={wlan_auth}")
+
     # 8. Optional ET-BERT L7 sidecar prediction fusion (when ET-BERT microservice scored this item)
     etbert_label: str | None = None
     etbert_conf: float | None = None
@@ -885,7 +901,9 @@ def classify_bundle(
             deadline_monotonic=network_deadline,
             cancellation_check=cancellation_check,
         )
-    elif enabled and etbert_ckpt and evidence_list and (etbert_enabled or mode == "etbert_openjev"):
+    elif enabled and etbert_ckpt and evidence_list and (
+        etbert_enabled or mode == "etbert_openjev" or not is_etbert_explicitly_disabled(triage_cfg)
+    ):
         # Local offline ET-BERT .bin checkpoint does not transmit data over the network
         etbert_scores = score_with_etbert_local_bin(
             evidence_list,

@@ -1,8 +1,11 @@
-import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
+import type { CSSProperties, ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AIConfigResponse,
+  AIConfigUpdatePayload,
+  AIModelProbePayload,
   AIModelsResponse,
+  AIProviderName,
   GroundedChatResponse,
   JobSummary,
   LocalBrowseResponse,
@@ -45,6 +48,15 @@ import { analyzeLocalCsvFile, inspectCaptureFile } from "./utils/localAnalyzer";
 import { resolveBatchLimits } from "./utils/batchLimits";
 
 type Screen = "overview" | "analyze" | "jobs" | "findings" | "traffic" | "cases" | "reports" | "architecture";
+type ToastTone = "success" | "info" | "warn" | "error";
+
+interface ToastItem {
+  id: number;
+  title: string;
+  detail?: string;
+  tone: ToastTone;
+  durationMs?: number;
+}
 type IconName =
   | "grid"
   | "upload"
@@ -293,13 +305,15 @@ function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [localCsvProgress, setLocalCsvProgress] = useState<number | null>(null);
 
-  const [toast, setToast] = useState("");
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   const uploadAbortRef = useRef<AbortController | null>(null);
   const pauseRequestedRef = useRef(false);
   const autoLoadedJobRef = useRef<string | null>(null);
   const userSetResourceModeRef = useRef(false);
   const workspaceRefreshGenerationRef = useRef(0);
+  const toastSeqRef = useRef(0);
+  const toastTimersRef = useRef<Map<number, number>>(new Map());
 
   const api = useMemo(() => new PcapApiClient(backendUrl, bearerToken), [backendUrl, bearerToken]);
   const workspaceApiRef = useRef(api);
@@ -330,11 +344,45 @@ function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
+  const dismissToast = useCallback((id: number) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const pushToast = useCallback(
+    (title: string, tone: ToastTone = "info", detail?: string, durationMs = 4500) => {
+      const id = ++toastSeqRef.current;
+      setToasts((prev) => {
+        const overflow = prev.slice(0, Math.max(0, prev.length - 3));
+        for (const dropped of overflow) {
+          const oldTimer = toastTimersRef.current.get(dropped.id);
+          if (oldTimer !== undefined) {
+            window.clearTimeout(oldTimer);
+            toastTimersRef.current.delete(dropped.id);
+          }
+        }
+        return [...prev.slice(-3), { id, title, detail, tone, durationMs }];
+      });
+      const timer = window.setTimeout(() => {
+        toastTimersRef.current.delete(id);
+        setToasts((prev) => prev.filter((item) => item.id !== id));
+      }, durationMs);
+      toastTimersRef.current.set(id, timer);
+    },
+    [],
+  );
+
   useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(""), 3800);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+    const timers = toastTimersRef.current;
+    return () => {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
 
   const navigate = useCallback((next: Screen) => {
     const nextPath = PATHS[next];
@@ -386,7 +434,7 @@ function App() {
             setCapabilities(null);
             setConnectionStatus("auth_required");
             setConnectionError(reason.message);
-            if (!quiet) setToast(reason.message);
+            if (!quiet) pushToast("Backend ต้องการการยืนยันตัวตน", "error", reason.message);
             return;
           }
           throw reason;
@@ -409,16 +457,22 @@ function App() {
         if (modelsRes.status === "fulfilled") setAiModels(modelsRes.value);
         if (browseRes.status === "fulfilled") setLocalBrowse(browseRes.value);
         setJobs(jobsRes.value);
-        if (!quiet) setToast("เชื่อมต่อ FastAPI backend สำเร็จ");
+        if (!quiet) pushToast("เชื่อมต่อ FastAPI backend สำเร็จ", "success");
       } catch (err) {
         if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
         setCapabilities(null);
         setConnectionStatus("offline");
         setConnectionError(safeFormatError(err));
-        if (!quiet) setToast("ไม่สามารถติดต่อ backend API — เชื่อมต่อ Backend เพื่อดูคิวและวิเคราะห์ capture");
+        if (!quiet) {
+          pushToast(
+            "ไม่สามารถติดต่อ backend API",
+            "error",
+            "เชื่อมต่อ Backend เพื่อดูคิวและวิเคราะห์ capture",
+          );
+        }
       }
     },
-    [api, bearerToken],
+    [api, bearerToken, pushToast],
   );
 
   // Probe backend on mount / credentials change
@@ -436,13 +490,13 @@ function App() {
         setSelectedFindingId(adapted.findings[0]?.id ?? "");
         setProtocolFilter("All protocols");
         setPacketSearch("");
-        setToast(`โหลดผลวิเคราะห์ ${adapted.fileName} (${adapted.findings.length} findings)`);
+        pushToast(`โหลดผลวิเคราะห์ ${adapted.fileName}`, "success", `${adapted.findings.length} deterministic findings`);
         if (targetScreen) navigate(targetScreen);
       } catch (err) {
-        setToast(safeFormatError(err));
+        pushToast("โหลดรายงานไม่สำเร็จ", "error", safeFormatError(err));
       }
     },
-    [api, navigate],
+    [api, navigate, pushToast],
   );
 
   // Poll live job queue while any job is running
@@ -502,10 +556,14 @@ function App() {
       setSelectedFindingId(report.findings[0]?.id ?? "");
       setProtocolFilter("All protocols");
       setPacketSearch("");
-      setToast(`วิเคราะห์ CSV ในเครื่องเสร็จสิ้น (${formatCompactCount(report.packetsAnalyzed)} packets · ${report.findings.length} findings)`);
+      pushToast(
+        "วิเคราะห์ CSV ในเครื่องเสร็จสิ้น",
+        "success",
+        `${formatCompactCount(report.packetsAnalyzed)} packets · ${report.findings.length} findings`,
+      );
       navigate(report.findings.length > 0 ? "findings" : "overview");
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("สแกน CSV ไม่สำเร็จ", "error", safeFormatError(err));
     } finally {
       setLocalCsvProgress(null);
     }
@@ -514,16 +572,20 @@ function App() {
   const handleUploadAndAnalyze = async () => {
     if (!selectedFile || isSubmitting) return;
     if (aiEnabled && !aiConsent) {
-      setToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์");
+      pushToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์", "warn");
       return;
     }
     if (aiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
-      setToast("Backend ยังไม่เปิดใช้ AI provider หรือยังไม่ระบุ model");
+      pushToast(
+        "Layer-2 AI ยังไม่พร้อมใช้งาน",
+        "warn",
+        "Backend ยังไม่เปิดใช้ AI provider หรือยังไม่ระบุ model — เปิด Workspace เพื่อตั้งค่า",
+      );
       return;
     }
     if (connectionStatus !== "connected") {
       setConnectionModalOpen(true);
-      setToast("เชื่อมต่อ Backend API ก่อนอัปโหลดไฟล์ไบนารี (หรือใช้โหมด Local CSV)");
+      pushToast("เชื่อมต่อ Backend API ก่อนอัปโหลดไฟล์ไบนารี", "warn", "หรือใช้โหมด Local CSV ในเบราว์เซอร์");
       return;
     }
 
@@ -536,7 +598,7 @@ function App() {
     try {
       const chunkSize = capabilities?.profiles[resourceMode]?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes;
       if (!chunkSize || !Number.isSafeInteger(chunkSize) || chunkSize <= 0) {
-        setToast("ไม่สามารถยืนยันขนาด chunk จาก Backend ได้ — โหลด capabilities ก่อนอัปโหลด");
+        pushToast("ไม่สามารถยืนยันขนาด chunk จาก Backend ได้", "error", "โหลด capabilities ก่อนอัปโหลด");
         return;
       }
       const receipt = await api.uploadCapture(selectedFile, {
@@ -565,17 +627,21 @@ function App() {
       setActiveJobId(job.id);
       const updated = await api.listJobs(50);
       setJobs(updated);
-      setToast(`ส่งงานวิเคราะห์แล้ว (${job.id.slice(0, 8)})`);
+      pushToast(
+        `ส่งงานวิเคราะห์แล้ว (${job.id.slice(0, 8)})`,
+        "success",
+        aiEnabled ? "รัน Layer-1 Tier-1 + Layer-2 AI Narrator" : "รัน Deterministic + Layer-1 Tier-1/ET-BERT",
+      );
       navigate("jobs");
     } catch (err) {
       if (pauseRequestedRef.current) {
         setUploadPaused(true);
         setUploadProgress((prev) => (prev ? { ...prev, phase: "paused" } : prev));
-        setToast("หยุดอัปโหลดชั่วคราวแล้ว — กด Resume เพื่ออัปโหลดต่อจาก offset เดิม");
+        pushToast("หยุดอัปโหลดชั่วคราวแล้ว", "warn", "กด Resume เพื่ออัปโหลดต่อจาก offset เดิม");
       } else if (err instanceof DOMException && err.name === "AbortError") {
-        setToast("ยกเลิกการอัปโหลดแล้ว");
+        pushToast("ยกเลิกการอัปโหลดแล้ว", "info");
       } else {
-        setToast(safeFormatError(err));
+        pushToast("อัปโหลดหรือเริ่มงานวิเคราะห์ไม่สำเร็จ", "error", safeFormatError(err));
       }
     } finally {
       setIsSubmitting(false);
@@ -603,18 +669,27 @@ function App() {
         // Ignore cleanup errors
       }
     }
-    setToast("ล้างไฟล์ชั่วคราวที่อัปโหลดค้างไว้แล้ว");
+    pushToast("ล้างไฟล์ชั่วคราวที่อัปโหลดค้างไว้แล้ว", "info");
   };
 
   const handleRegisterLocalCapture = async () => {
     const clean = localPathInput.trim();
     if ((!clean && !localFileGrantToken) || isSubmitting) return;
     if (aiEnabled && !aiConsent) {
-      setToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์");
+      pushToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์", "warn");
+      return;
+    }
+    if (aiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
+      pushToast(
+        "Layer-2 AI ยังไม่พร้อมใช้งาน",
+        "warn",
+        "Backend ยังไม่เปิดใช้ AI provider หรือยังไม่ระบุ model — เปิด Workspace เพื่อตั้งค่า",
+      );
       return;
     }
     if (connectionStatus !== "connected") {
       setConnectionModalOpen(true);
+      pushToast("เชื่อมต่อ Backend API ก่อนลงทะเบียน Local Capture", "warn");
       return;
     }
     setIsSubmitting(true);
@@ -636,11 +711,11 @@ function App() {
       setActiveJobId(job.id);
       const updated = await api.listJobs(50);
       setJobs(updated);
-      setToast(`ลงทะเบียน local capture (${formatBytes(receipt.size_bytes)}) และเข้าคิวงานแล้ว`);
+      pushToast(`ลงทะเบียน local capture (${formatBytes(receipt.size_bytes)}) และเข้าคิวงานแล้ว`, "success");
       navigate("jobs");
     } catch (err) {
       if (fileGrantToken) setLocalFileGrantToken(null);
-      setToast(safeFormatError(err));
+      pushToast("ลงทะเบียน local capture ไม่สำเร็จ", "error", safeFormatError(err));
     } finally {
       setIsSubmitting(false);
     }
@@ -650,9 +725,9 @@ function App() {
     try {
       const updated = await api.cancelJob(jobId);
       setJobs((prev) => prev.map((j) => (j.id === jobId ? updated : j)));
-      setToast(`ส่งคำขอยกเลิกงาน ${jobId.slice(0, 8)} แล้ว`);
+      pushToast(`ส่งคำขอยกเลิกงาน ${jobId.slice(0, 8)} แล้ว`, "info");
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("ยกเลิกงานไม่สำเร็จ", "error", safeFormatError(err));
     }
   };
 
@@ -672,42 +747,42 @@ function App() {
     kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
   ) => {
     if (activeReport.origin === "empty") {
-      setToast("ยังไม่มีผลวิเคราะห์จริงให้ส่งออก");
+      pushToast("ยังไม่มีผลวิเคราะห์จริงให้ส่งออก", "warn");
       return;
     }
     const slug = activeReport.caseId.toLowerCase();
     if (kind === "json") {
       downloadTextFile(`${slug}-report.json`, exportReportJson(activeReport), "application/json");
-      setToast(`ดาวน์โหลด ${slug}-report.json แล้ว`);
+      pushToast(`ดาวน์โหลด ${slug}-report.json แล้ว`, "success");
       return;
     }
     if (kind === "markdown") {
       downloadTextFile(`${slug}-report.md`, exportReportMarkdown(activeReport), "text/markdown");
-      setToast(`ดาวน์โหลด ${slug}-report.md แล้ว`);
+      pushToast(`ดาวน์โหลด ${slug}-report.md แล้ว`, "success");
       return;
     }
     if (kind === "stix" || kind === "csv" || kind === "cef" || kind === "navigator" || kind === "pdf") {
       if (activeReport.origin !== "live" || connectionStatus !== "connected") {
-        setToast(`${kind.toUpperCase()} export ต้องเชื่อมต่อ backend และใช้ผลวิเคราะห์ live`);
+        pushToast(`${kind.toUpperCase()} export ต้องเชื่อมต่อ backend และใช้ผลวิเคราะห์ live`, "warn");
         return;
       }
       try {
         if (kind === "stix") {
           const stix = await api.getStixJson(activeReport.analysisId);
           downloadTextFile(`${slug}-stix-2.1.json`, stix, "application/stix+json");
-          setToast(`ดาวน์โหลด ${slug}-stix-2.1.json แล้ว`);
+          pushToast(`ดาวน์โหลด ${slug}-stix-2.1.json แล้ว`, "success");
         } else if (kind === "csv") {
           const csv = await api.getExportCsv(activeReport.analysisId);
           downloadTextFile(`${slug}-export.csv`, csv, "text/csv");
-          setToast(`ดาวน์โหลด ${slug}-export.csv แล้ว`);
+          pushToast(`ดาวน์โหลด ${slug}-export.csv แล้ว`, "success");
         } else if (kind === "cef") {
           const cef = await api.getExportCef(activeReport.analysisId);
           downloadTextFile(`${slug}-findings.cef`, cef, "text/plain");
-          setToast(`ดาวน์โหลด ${slug}-findings.cef แล้ว`);
+          pushToast(`ดาวน์โหลด ${slug}-findings.cef แล้ว`, "success");
         } else if (kind === "navigator") {
           const nav = await api.getExportNavigatorJson(activeReport.analysisId);
           downloadTextFile(`${slug}-attack-navigator.json`, nav, "application/json");
-          setToast(`ดาวน์โหลด ${slug}-attack-navigator.json แล้ว`);
+          pushToast(`ดาวน์โหลด ${slug}-attack-navigator.json แล้ว`, "success");
         } else if (kind === "pdf") {
           const blob = await api.getExportPdfBlob(activeReport.analysisId);
           const url = URL.createObjectURL(blob);
@@ -718,10 +793,10 @@ function App() {
           a.click();
           a.remove();
           URL.revokeObjectURL(url);
-          setToast(`ดาวน์โหลด ${slug}-report.pdf แล้ว`);
+          pushToast(`ดาวน์โหลด ${slug}-report.pdf แล้ว`, "success");
         }
       } catch (err) {
-        setToast(safeFormatError(err));
+        pushToast("ส่งออกรายงานไม่สำเร็จ", "error", safeFormatError(err));
       }
       return;
     }
@@ -729,14 +804,14 @@ function App() {
       try {
         const jsonl = await api.getTriageJsonl(activeReport.analysisId);
         downloadTextFile(`${slug}-triage.jsonl`, jsonl, "application/x-ndjson");
-        setToast(`ดาวน์โหลด ${slug}-triage.jsonl (จาก backend) แล้ว`);
+        pushToast(`ดาวน์โหลด ${slug}-triage.jsonl (จาก backend) แล้ว`, "success");
         return;
       } catch (err) {
-        setToast(safeFormatError(err));
+        pushToast("ใช้ JSONL fallback ชั่วคราว", "warn", safeFormatError(err));
       }
     }
     downloadTextFile(`${slug}-triage.jsonl`, exportTriageJsonlFallback(activeReport), "application/x-ndjson");
-    setToast(`ดาวน์โหลด ${slug}-triage.jsonl แล้ว`);
+    pushToast(`ดาวน์โหลด ${slug}-triage.jsonl แล้ว`, "success");
   };
 
   const saveConnectionSettings = async (nextUrl: string, nextToken: string) => {
@@ -763,14 +838,14 @@ function App() {
     setLocalBrowse(null);
     setConnectionStatus("auth_required");
     setConnectionModalOpen(false);
-    setToast("ตัดการเชื่อมต่อ token แล้ว");
+    pushToast("ตัดการเชื่อมต่อ token แล้ว", "info");
   };
 
   const handlePickNativePath = async (purpose: NativePickPurpose) => {
     if (isPickingPath) return;
     if (connectionStatus !== "connected") {
       setConnectionModalOpen(true);
-      setToast("กรุณาเชื่อมต่อ Backend API ก่อนเปิด OS File Manager");
+      pushToast("กรุณาเชื่อมต่อ Backend API ก่อนเปิด OS File Manager", "warn");
       return;
     }
     setIsPickingPath(true);
@@ -778,32 +853,36 @@ function App() {
       const res = await api.pickNativePath(purpose);
       setWorkspaceConfig(res.workspace);
       if (res.cancelled) {
-        setToast("ยกเลิกการเลือกไฟล์ / โฟลเดอร์");
+        pushToast("ยกเลิกการเลือกไฟล์ / โฟลเดอร์", "info");
         return;
       }
       if (purpose === "data_dir") {
-        setToast(`สลับ Data Directory เป็น ${res.selected_path} แล้ว (API และ Worker ซิงค์อัตโนมัติ)`);
+        pushToast("สลับ Data Directory สำเร็จ", "success", `${res.selected_path} (API และ Worker ซิงค์อัตโนมัติ)`);
       } else if (purpose === "capture_root") {
-        setToast(`เพิ่มโฟลเดอร์ PCAP: ${res.selected_path}`);
+        pushToast(`เพิ่มโฟลเดอร์ PCAP สำเร็จ`, "success", res.selected_path ?? undefined);
       } else if (purpose === "model_file") {
-        setToast(
-          `เชื่อมต่อโมเดล ET-BERT: ${res.selected_path ?? res.filename ?? "pre-trained_model.bin"} เรียบร้อยแล้ว`,
+        pushToast(
+          "เชื่อมต่อโมเดล ET-BERT สำเร็จ",
+          "success",
+          res.selected_path ?? res.filename ?? "pre-trained_model.bin",
         );
       } else if (purpose === "capture_file") {
         if (!res.file_grant_token) {
-          setToast("Backend ไม่ได้ออก one-time file grant; เลือกไฟล์ใหม่หรือตรวจรุ่น backend");
+          pushToast("Backend ไม่ได้ออก one-time file grant", "warn", "เลือกไฟล์ใหม่หรือตรวจรุ่น backend");
           return;
         }
         setLocalFileGrantToken(res.file_grant_token);
         setLocalPathInput(res.filename ?? "ไฟล์ capture ที่เลือก");
         setSourceTab("local");
-        setToast(
-          `เลือก ${res.filename ?? "capture"}${res.size_bytes ? ` (${formatBytes(res.size_bytes)})` : ""}; สิทธิ์ไฟล์เดียวหมดอายุใน ${res.grant_expires_in_seconds ?? 300} วินาที และไม่เพิ่มโฟลเดอร์แม่`,
+        pushToast(
+          `เลือก ${res.filename ?? "capture"}${res.size_bytes ? ` (${formatBytes(res.size_bytes)})` : ""}`,
+          "success",
+          `สิทธิ์ไฟล์เดียวหมดอายุใน ${res.grant_expires_in_seconds ?? 300} วินาที และไม่เพิ่มโฟลเดอร์แม่`,
         );
       }
       await refreshWorkspace(true);
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("เปิด OS File Manager ไม่สำเร็จ", "error", safeFormatError(err));
     } finally {
       setIsPickingPath(false);
     }
@@ -819,10 +898,10 @@ function App() {
     try {
       const ws = await api.updateWorkspaceConfig({ data_dir: clean });
       setWorkspaceConfig(ws);
-      setToast(`ตั้งค่า Data Directory เป็น ${ws.data_dir} แล้ว`);
+      pushToast("ตั้งค่า Data Directory สำเร็จ", "success", ws.data_dir);
       await refreshWorkspace(true);
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("ตั้งค่า Data Directory ไม่สำเร็จ", "error", safeFormatError(err));
     }
   };
 
@@ -836,10 +915,10 @@ function App() {
     try {
       const ws = await api.updateWorkspaceConfig({ etbert_checkpoint_path: clean, etbert_enabled: true });
       setWorkspaceConfig(ws);
-      setToast(`ตั้งค่าไฟล์โมเดล ET-BERT เป็น ${ws.etbert_checkpoint_path ?? clean} แล้ว`);
+      pushToast("เชื่อมไฟล์โมเดล ET-BERT สำเร็จ", "success", ws.etbert_checkpoint_path ?? clean);
       await refreshWorkspace(true);
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("ตั้งค่าโมเดล ET-BERT ไม่สำเร็จ", "error", safeFormatError(err));
     }
   };
 
@@ -848,10 +927,65 @@ function App() {
     try {
       const ws = await api.updateWorkspaceConfig({ remove_local_ingest_root: rootPath });
       setWorkspaceConfig(ws);
-      setToast(`นำโฟลเดอร์ capture ออกจากรายการที่อนุญาตแล้ว`);
+      pushToast("นำโฟลเดอร์ capture ออกจากรายการที่อนุญาตแล้ว", "info", rootPath);
       await refreshWorkspace(true);
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("นำโฟลเดอร์ออกไม่สำเร็จ", "error", safeFormatError(err));
+    }
+  };
+
+  const handleSaveAiConfig = async (payload: AIConfigUpdatePayload): Promise<AIConfigResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนตั้งค่า AI");
+    }
+    try {
+      const updated = await api.updateAiConfig(payload);
+      setAiConfig(updated);
+      if (updated.configuration.enabled && updated.configuration.model) {
+        pushToast(
+          `บันทึก Layer-2 AI (${updated.configuration.provider}: ${updated.configuration.model}) แล้ว`,
+          "success",
+          `Boundary: ${updated.configuration.data_boundary} · ENV key ${updated.api_key_env_set || updated.manus_env_set ? "ready" : "optional/unset"}`,
+        );
+      } else {
+        pushToast(
+          "อัปเดตการตั้งค่า Layer-2 AI แล้ว (Standby)",
+          "info",
+          "Deterministic + Layer-1 Tier-1/ET-BERT ยังทำงานอัตโนมัติ",
+        );
+      }
+      await refreshWorkspace(true);
+      return updated;
+    } catch (err) {
+      pushToast("บันทึกการตั้งค่า AI ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
+    }
+  };
+
+  const handleProbeAiModels = async (payload: AIModelProbePayload): Promise<AIModelsResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนตรวจสอบโมเดล");
+    }
+    try {
+      const res = await api.probeAiModels(payload);
+      setAiModels(res);
+      if (res.items.length > 0) {
+        pushToast(
+          `พบ ${res.items.length} โมเดลจาก provider`,
+          "success",
+          res.items.slice(0, 3).map((m) => m.id).join(", "),
+        );
+      } else {
+        pushToast(
+          "ไม่พบรายชื่อโมเดลจาก endpoint",
+          "warn",
+          res.warning ?? "ตรวจสอบ endpoint URL, Ollama service หรือ API Key ENV",
+        );
+      }
+      return res;
+    } catch (err) {
+      pushToast("ตรวจสอบโมเดลจาก AI Endpoint ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
     }
   };
 
@@ -1211,6 +1345,7 @@ function App() {
               }}
               onNavigate={navigate}
               onOpenEvidence={openEvidence}
+              onOpenConnectionModal={() => setConnectionModalOpen(true)}
             />
           )}
 
@@ -1240,11 +1375,15 @@ function App() {
           statusError={connectionError}
           capabilities={capabilities}
           workspaceConfig={workspaceConfig}
+          aiConfig={aiConfig}
+          aiModels={aiModels}
           isPickingPath={isPickingPath}
           onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
           onUpdateDataDir={(dir) => void handleUpdateDataDir(dir)}
           onUpdateModelPath={(path) => void handleUpdateModelPath(path)}
           onRemoveRoot={(root) => void handleRemoveLocalRoot(root)}
+          onSaveAiConfig={handleSaveAiConfig}
+          onProbeAiModels={handleProbeAiModels}
           onClose={() => setConnectionModalOpen(false)}
           onSave={saveConnectionSettings}
           onDisconnect={handleDisconnect}
@@ -1252,14 +1391,92 @@ function App() {
         />
       )}
 
-      {toast && (
-        <div className="toast" role="status">
-          <Icon name="check" size={16} />
-          {toast}
-        </div>
-      )}
+      <ToastStack items={toasts} onDismiss={dismissToast} />
     </div>
   );
+}
+
+function ToastStack({
+  items,
+  onDismiss,
+}: {
+  items: ToastItem[];
+  onDismiss: (id: number) => void;
+}) {
+  if (items.length === 0) return null;
+  const iconMap: Record<ToastTone, IconName> = {
+    success: "check",
+    info: "info",
+    warn: "alert",
+    error: "alert",
+  };
+  return (
+    <div className="toast-stack" aria-live="polite" aria-atomic="false">
+      {items.map((item) => (
+        <div
+          key={item.id}
+          className={`toast-item toast-${item.tone}`}
+          role={item.tone === "error" || item.tone === "warn" ? "alert" : "status"}
+        >
+          <div className="toast-item-icon">
+            <Icon name={iconMap[item.tone]} size={14} />
+          </div>
+          <div className="toast-item-body">
+            <strong>{item.title}</strong>
+            {item.detail && <small>{item.detail}</small>}
+          </div>
+          <button
+            type="button"
+            className="toast-close"
+            aria-label="ปิดการแจ้งเตือน"
+            onClick={() => onDismiss(item.id)}
+          >
+            <Icon name="close" size={13} />
+          </button>
+          <div
+            className="toast-progress"
+            style={{ "--toast-duration": `${item.durationMs ?? 4500}ms` } as CSSProperties}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function normalizeOriginToken(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  if (!trimmed) return null;
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return null;
+  }
+}
+
+function buildAllowedOriginsList(
+  rawOrigins: string,
+  baseUrlDraft: string,
+  provider: AIProviderName,
+  dataBoundary: "local" | "remote",
+): string[] {
+  const origins = new Set<string>();
+  for (const token of rawOrigins.split(",")) {
+    const normalized = normalizeOriginToken(token);
+    if (normalized) origins.add(normalized);
+  }
+  const cleanUrl = baseUrlDraft.trim();
+  if (cleanUrl) {
+    const baseOrigin = normalizeOriginToken(cleanUrl);
+    if (baseOrigin) origins.add(baseOrigin);
+  } else if (provider === "openai_compatible" && dataBoundary === "local") {
+    origins.add("http://127.0.0.1:11434");
+  }
+  return Array.from(origins);
+}
+
+function asAIProviderName(value?: string | null): AIProviderName {
+  if (value === "anthropic" || value === "manus" || value === "openai_compatible") return value;
+  return "openai_compatible";
 }
 
 function ConnectionModal({
@@ -1269,11 +1486,15 @@ function ConnectionModal({
   statusError,
   capabilities,
   workspaceConfig,
+  aiConfig,
+  aiModels,
   isPickingPath,
   onPickNativePath,
   onUpdateDataDir,
   onUpdateModelPath,
   onRemoveRoot,
+  onSaveAiConfig,
+  onProbeAiModels,
   onClose,
   onSave,
   onDisconnect,
@@ -1285,11 +1506,15 @@ function ConnectionModal({
   statusError: string;
   capabilities: SystemCapabilities | null;
   workspaceConfig: WorkspaceConfigState | null;
+  aiConfig: AIConfigResponse | null;
+  aiModels: AIModelsResponse | null;
   isPickingPath: boolean;
   onPickNativePath: (purpose: NativePickPurpose) => void;
   onUpdateDataDir: (dir: string) => void;
   onUpdateModelPath: (path: string) => void;
   onRemoveRoot: (root: string) => void;
+  onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
+  onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
   onClose: () => void;
   onSave: (url: string, token: string) => void;
   onDisconnect: () => void;
@@ -1305,6 +1530,17 @@ function ConnectionModal({
   const [dataDirDraft, setDataDirDraft] = useState(resolvedDataDir);
   const [modelPathDraft, setModelPathDraft] = useState(resolvedModelPath);
 
+  const [aiDraftEnabled, setAiDraftEnabled] = useState<boolean>(aiConfig?.configuration.enabled ?? false);
+  const [aiDraftProvider, setAiDraftProvider] = useState<AIProviderName>(asAIProviderName(aiConfig?.configuration.provider));
+  const [aiDraftBoundary, setAiDraftBoundary] = useState<"local" | "remote">(aiConfig?.configuration.data_boundary ?? "local");
+  const [aiDraftBaseUrl, setAiDraftBaseUrl] = useState<string>(aiConfig?.configuration.base_url ?? "");
+  const [aiDraftAllowedOrigins, setAiDraftAllowedOrigins] = useState<string>((aiConfig?.configuration.allowed_origins ?? []).join(", "));
+  const [aiDraftModel, setAiDraftModel] = useState<string>(aiConfig?.configuration.model ?? "");
+  const [aiDraftApiKeyEnv, setAiDraftApiKeyEnv] = useState<string>(aiConfig?.configuration.api_key_env ?? "");
+  const [probingAiModels, setProbingAiModels] = useState(false);
+  const [savingAiConfig, setSavingAiConfig] = useState(false);
+  const [aiFeedback, setAiFeedback] = useState<{ tone: "ok" | "info" | "warn" | "crit"; message: string } | null>(null);
+
   useEffect(() => {
     setDataDirDraft(workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "");
   }, [workspaceConfig?.data_dir, capabilities?.limits.data_dir]);
@@ -1317,9 +1553,158 @@ function ConnectionModal({
     );
   }, [workspaceConfig?.etbert_checkpoint_path, capabilities?.triage.etbert_checkpoint_path]);
 
+  useEffect(() => {
+    if (!aiConfig) return;
+    setAiDraftEnabled(aiConfig.configuration.enabled);
+    setAiDraftProvider(asAIProviderName(aiConfig.configuration.provider));
+    setAiDraftBoundary(aiConfig.configuration.data_boundary);
+    setAiDraftBaseUrl(aiConfig.configuration.base_url ?? "");
+    setAiDraftAllowedOrigins((aiConfig.configuration.allowed_origins ?? []).join(", "));
+    setAiDraftModel(aiConfig.configuration.model ?? "");
+    setAiDraftApiKeyEnv(aiConfig.configuration.api_key_env ?? "");
+  }, [aiConfig]);
+
   const roots = workspaceConfig?.local_ingest_roots ?? capabilities?.limits.local_ingest_roots ?? [];
   const pickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? true;
   const ckptInfo = workspaceConfig?.etbert_checkpoint_info ?? capabilities?.triage.etbert_checkpoint_info ?? null;
+  const discoveredModels = aiModels?.items ?? [];
+
+  const applyLocalOllamaPreset = () => {
+    setAiDraftEnabled(true);
+    setAiDraftProvider("openai_compatible");
+    setAiDraftBoundary("local");
+    setAiDraftBaseUrl("http://127.0.0.1:11434");
+    setAiDraftAllowedOrigins("http://127.0.0.1:11434");
+    setAiDraftApiKeyEnv("");
+    setAiFeedback({
+      tone: "info",
+      message: "เติมค่า Local Ollama (http://127.0.0.1:11434) แล้ว — กด Probe Models เพื่อเลือกโมเดลหรือพิมพ์ชื่อโมเดลแล้วกด Save AI Config",
+    });
+  };
+
+  const validateEndpointInputs = (requireModelWhenEnabled: boolean): { cleanApiKeyEnv: string | null; cleanBaseUrl: string | null; origins: string[] } | null => {
+    const cleanEnv = aiDraftApiKeyEnv.trim();
+    if (cleanEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cleanEnv)) {
+      setAiFeedback({
+        tone: "crit",
+        message: "API Key ENV ต้องเป็นชื่อตัวแปร environment เท่านั้น (เช่น OPENAI_API_KEY หรือ ANTHROPIC_API_KEY) — ห้ามวาง secret key จริง",
+      });
+      return null;
+    }
+
+    const cleanUrl = aiDraftBaseUrl.trim().replace(/\/+$/, "");
+    if (cleanUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(cleanUrl);
+      } catch {
+        setAiFeedback({ tone: "crit", message: "Base URL ไม่ถูกต้องตามรูปแบบ URL (เช่น http://127.0.0.1:11434 หรือ https://api.openai.com)" });
+        return null;
+      }
+      if (aiDraftBoundary === "remote" && parsed.protocol !== "https:") {
+        setAiFeedback({
+          tone: "warn",
+          message: "Remote boundary ต้องใช้ HTTPS เพื่อความปลอดภัยของ structured evidence",
+        });
+        return null;
+      }
+      if (
+        aiDraftBoundary === "local" &&
+        !["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname.toLowerCase())
+      ) {
+        setAiFeedback({
+          tone: "warn",
+          message: "Local boundary อนุญาตเฉพาะ loopback endpoint (127.0.0.1 / localhost) — เปลี่ยน Boundary เป็น remote สำหรับปลายทางภายนอก",
+        });
+        return null;
+      }
+    }
+
+    const origins = buildAllowedOriginsList(aiDraftAllowedOrigins, cleanUrl, aiDraftProvider, aiDraftBoundary);
+    if (aiDraftEnabled && requireModelWhenEnabled) {
+      if (!cleanUrl && aiDraftProvider !== "openai_compatible" && aiDraftProvider !== "manus") {
+        setAiFeedback({ tone: "warn", message: `กรุณาระบุ Base URL สำหรับ provider "${aiDraftProvider}"` });
+        return null;
+      }
+      if (!aiDraftModel.trim()) {
+        setAiFeedback({ tone: "warn", message: "กรุณากด Probe Models หรือระบุชื่อ Model ก่อนเปิดใช้งาน Layer-2 AI" });
+        return null;
+      }
+    }
+
+    return {
+      cleanApiKeyEnv: cleanEnv || null,
+      cleanBaseUrl: cleanUrl || null,
+      origins,
+    };
+  };
+
+  const handleProbeClick = async () => {
+    if (probingAiModels) return;
+    const validated = validateEndpointInputs(false);
+    if (!validated) return;
+    setProbingAiModels(true);
+    setAiFeedback(null);
+    try {
+      const res = await onProbeAiModels({
+        provider: aiDraftProvider,
+        base_url: validated.cleanBaseUrl,
+        allowed_origins: validated.origins,
+        api_key_env: validated.cleanApiKeyEnv,
+        data_boundary: aiDraftBoundary,
+      });
+      setAiDraftAllowedOrigins(validated.origins.join(", "));
+      if (res.items.length > 0) {
+        if (!aiDraftModel.trim()) setAiDraftModel(res.items[0].id);
+        setAiFeedback({
+          tone: "ok",
+          message: `เชื่อมต่อสำเร็จ: พบ ${res.items.length} โมเดล (${res.items.slice(0, 4).map((m) => m.id).join(", ")})`,
+        });
+      } else {
+        setAiFeedback({
+          tone: "warn",
+          message: `ไม่พบรายการโมเดลจาก endpoint (${res.warning ?? "empty_catalog"}) — ตรวจสอบว่าบริการทำงานอยู่หรือใส่ชื่อโมเดลเองได้`,
+        });
+      }
+    } catch (err) {
+      setAiFeedback({ tone: "crit", message: safeFormatError(err) });
+    } finally {
+      setProbingAiModels(false);
+    }
+  };
+
+  const handleSaveAiClick = async () => {
+    if (savingAiConfig) return;
+    const validated = validateEndpointInputs(true);
+    if (!validated) return;
+    setSavingAiConfig(true);
+    setAiFeedback(null);
+    try {
+      const updated = await onSaveAiConfig({
+        enabled: aiDraftEnabled,
+        provider: aiDraftProvider,
+        base_url: validated.cleanBaseUrl,
+        allowed_origins: validated.origins,
+        model: aiDraftModel.trim() || null,
+        api_key_env: validated.cleanApiKeyEnv,
+        data_boundary: aiDraftBoundary,
+      });
+      setAiDraftAllowedOrigins((updated.configuration.allowed_origins ?? []).join(", "));
+      setAiFeedback({
+        tone: updated.configuration.enabled ? "ok" : "info",
+        message: updated.configuration.enabled
+          ? `บันทึกเรียบร้อย · Layer-2 LLM พร้อมใช้งาน (${updated.configuration.provider}: ${updated.configuration.model})`
+          : "บันทึกสถานะ Standby แล้ว — Layer-1 Tier-1 & ET-BERT ยังทำงานอัตโนมัติ",
+      });
+    } catch (err) {
+      setAiFeedback({ tone: "crit", message: safeFormatError(err) });
+    } finally {
+      setSavingAiConfig(false);
+    }
+  };
+
+  const cleanEnvTrimmed = aiDraftApiKeyEnv.trim();
+  const savedEnvMatches = cleanEnvTrimmed !== "" && cleanEnvTrimmed === (aiConfig?.configuration.api_key_env ?? "");
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="conn-modal-title">
@@ -1327,7 +1712,7 @@ function ConnectionModal({
         <div className="modal-head">
           <div>
             <div className="section-kicker">WORKSPACE, FOLDERS &amp; BACKEND</div>
-            <h2 id="conn-modal-title">จัดการ Data Directory, โฟลเดอร์ &amp; การเชื่อมต่อ</h2>
+            <h2 id="conn-modal-title">จัดการ Data Directory, โฟลเดอร์, AI &amp; การเชื่อมต่อ</h2>
           </div>
           <button type="button" className="icon-button" aria-label="ปิดหน้าต่าง" onClick={onClose}>
             <Icon name="close" size={18} />
@@ -1394,10 +1779,10 @@ function ConnectionModal({
 
               <div className="workspace-picker-head workspace-roots-head">
                 <div>
-                  <strong>ET-BERT Local Model Checkpoint (`PCAP_ETBERT_MODEL_BIN`)</strong>
+                  <strong>Layer-1 · ET-BERT Local Checkpoint (`PCAP_ETBERT_MODEL_BIN`)</strong>
                   <small>
-                    เชื่อมไฟล์โมเดล <code>pre-trained_model.bin</code> โดยตรงโดยไม่ต้องพึ่งพา Trainer-Pipeline
-                    {ckptInfo?.valid
+                    เชื่อมไฟล์โมเดล <code>pre-trained_model.bin</code> โดยตรงแบบ offline ไม่ต้องพึ่งพา Trainer-Pipeline
+                    {ckptInfo?.valid || ckptInfo?.ready
                       ? ` · Ready (${ckptInfo.architecture ?? "ET-BERT"} · ${ckptInfo.tensor_count ?? 0} tensors)`
                       : ""}
                   </small>
@@ -1468,6 +1853,191 @@ function ConnectionModal({
                   * ระบบกำลังรันบน headless environment ไม่มีหน้าต่าง File Manager — พิมพ์ path แล้วกด Apply ได้เลย
                 </small>
               )}
+            </div>
+          )}
+
+          {status === "connected" && (
+            <div className="ai-runtime-card">
+              <div className="workspace-picker-head">
+                <div>
+                  <strong>Layer-2 · Optional LLM Narrator (Runtime Configuration)</strong>
+                  <small>
+                    ตั้งค่า LLM สำหรับสรุปรายงานแบบ opt-in เท่านั้น — รับเฉพาะ minimized &amp; redacted evidence (Layer-1 + ET-BERT ทำงานแยกต่างหากโดยอัตโนมัติ)
+                  </small>
+                </div>
+                <span className={`ai-env-pill ${aiConfig?.configuration.enabled && aiConfig.configuration.model ? "env-ok" : ""}`}>
+                  {aiConfig?.configuration.enabled && aiConfig.configuration.model
+                    ? `Active: ${aiConfig.configuration.provider}/${aiConfig.configuration.model}`
+                    : "Standby (Optional)"}
+                </span>
+              </div>
+
+              <div className="ai-preset-row">
+                <label className="ai-toggle-line">
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={aiDraftEnabled}
+                      onChange={(e) => setAiDraftEnabled(e.target.checked)}
+                    />
+                    <span />
+                  </label>
+                  <span>เปิดใช้งาน Layer-2 LLM Narrator บน Backend</span>
+                </label>
+                <button
+                  type="button"
+                  className="secondary-button tiny-btn"
+                  onClick={applyLocalOllamaPreset}
+                >
+                  <Icon name="spark" size={13} /> 1-Click Local Ollama Preset
+                </button>
+              </div>
+
+              <div className="ai-field-grid">
+                <label className="modal-field">
+                  <span>Provider</span>
+                  <select
+                    value={aiDraftProvider}
+                    onChange={(e) => {
+                      const next = asAIProviderName(e.target.value);
+                      setAiDraftProvider(next);
+                      if (next === "anthropic" && aiDraftBoundary === "local") {
+                        setAiDraftBoundary("remote");
+                        if (!aiDraftBaseUrl.trim() || aiDraftBaseUrl === "http://127.0.0.1:11434") {
+                          setAiDraftBaseUrl("https://api.anthropic.com");
+                          setAiDraftAllowedOrigins("https://api.anthropic.com");
+                        }
+                        if (!aiDraftApiKeyEnv.trim()) setAiDraftApiKeyEnv("ANTHROPIC_API_KEY");
+                      }
+                    }}
+                  >
+                    <option value="openai_compatible">openai_compatible (Ollama / OpenAI / vLLM)</option>
+                    <option value="anthropic">anthropic (Claude Messages API)</option>
+                    <option value="manus">manus (MANUS_API_URL / MANUS_API_KEY)</option>
+                  </select>
+                </label>
+
+                <label className="modal-field">
+                  <span>Data Boundary</span>
+                  <select
+                    value={aiDraftBoundary}
+                    onChange={(e) => setAiDraftBoundary(e.target.value === "local" ? "local" : "remote")}
+                  >
+                    <option value="local">local (Loopback 127.0.0.1 / localhost เท่านั้น)</option>
+                    <option value="remote">remote (HTTPS External API)</option>
+                  </select>
+                </label>
+
+                <label className="modal-field">
+                  <span>Base URL ({aiDraftBoundary === "local" ? "http://127.0.0.1:11434" : "https://..."})</span>
+                  <input
+                    type="url"
+                    value={aiDraftBaseUrl}
+                    onChange={(e) => setAiDraftBaseUrl(e.target.value)}
+                    placeholder={aiDraftBoundary === "local" ? "http://127.0.0.1:11434" : "https://api.openai.com"}
+                  />
+                </label>
+
+                <label className="modal-field">
+                  <span>Allowed Origins (คั่นด้วย comma, ไม่มี / ปิดท้าย)</span>
+                  <input
+                    type="text"
+                    value={aiDraftAllowedOrigins}
+                    onChange={(e) => setAiDraftAllowedOrigins(e.target.value)}
+                    placeholder="http://127.0.0.1:11434"
+                  />
+                </label>
+              </div>
+
+              <label className="modal-field">
+                <span>API Key ENV Var Name (ใส่ชื่อตัวแปร ENV เช่น OPENAI_API_KEY — ระบบไม่รับและไม่บันทึก Secret จริง)</span>
+                <input
+                  type="text"
+                  value={aiDraftApiKeyEnv}
+                  onChange={(e) => setAiDraftApiKeyEnv(e.target.value)}
+                  placeholder={aiDraftProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "เว้นว่างสำหรับ Ollama หรือใส่ OPENAI_API_KEY"}
+                  disabled={aiDraftProvider === "manus"}
+                />
+              </label>
+
+              {aiDraftProvider === "manus" ? (
+                <span className={`ai-env-pill ${aiConfig?.manus_env_set ? "env-ok" : "env-missing"}`}>
+                  {aiConfig?.manus_env_set
+                    ? "ENV READY: MANUS_API_URL + MANUS_API_KEY พร้อมใช้"
+                    : "ENV MISSING: ตั้ง MANUS_API_URL และ MANUS_API_KEY ใน shell ก่อนเริ่ม backend"}
+                </span>
+              ) : cleanEnvTrimmed ? (
+                <span className={`ai-env-pill ${savedEnvMatches && aiConfig?.api_key_env_set ? "env-ok" : "env-missing"}`}>
+                  {savedEnvMatches
+                    ? aiConfig?.api_key_env_set
+                      ? `ENV READY: พบค่า $${cleanEnvTrimmed} ใน Backend`
+                      : `ENV MISSING: ยังไม่พบ $${cleanEnvTrimmed} ใน shell ของ Backend`
+                    : `กด Save AI Config เพื่อตรวจ ENV $${cleanEnvTrimmed}`}
+                </span>
+              ) : (
+                <span className="ai-env-pill">ไม่ระบุ API Key ENV (เหมาะสำหรับ Local Ollama ที่ไม่ต้องใช้ token)</span>
+              )}
+
+              <div className="model-probe-row">
+                <label className="modal-field">
+                  <span>Model Name (เลือกจากผล Probe หรือพิมพ์ชื่อโมเดล เช่น qwen2.5:7b)</span>
+                  <input
+                    type="text"
+                    value={aiDraftModel}
+                    onChange={(e) => setAiDraftModel(e.target.value)}
+                    placeholder="qwen2.5:7b / llama3.2 / gpt-4o-mini / claude-3-7-sonnet-latest"
+                  />
+                </label>
+                {discoveredModels.length > 0 && (
+                  <label className="modal-field">
+                    <span>Discovered Catalog ({discoveredModels.length})</span>
+                    <select
+                      value={discoveredModels.some((m) => m.id === aiDraftModel) ? aiDraftModel : ""}
+                      onChange={(e) => {
+                        if (e.target.value) setAiDraftModel(e.target.value);
+                      }}
+                    >
+                      <option value="">-- เลือกโมเดลที่พบ --</option>
+                      {discoveredModels.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.display_name ?? item.id}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <button
+                  type="button"
+                  className="secondary-button tiny-btn"
+                  disabled={probingAiModels}
+                  onClick={() => void handleProbeClick()}
+                >
+                  <Icon name="search" size={13} />{" "}
+                  {probingAiModels ? "Probing..." : "Probe / Discover Models"}
+                </button>
+              </div>
+
+              {aiFeedback && (
+                <div className={`alert-box alert-${aiFeedback.tone}`}>
+                  <Icon name={aiFeedback.tone === "ok" ? "check" : aiFeedback.tone === "info" ? "info" : "alert"} size={15} />
+                  <span>{aiFeedback.message}</span>
+                </div>
+              )}
+
+              <div className="ai-runtime-actions">
+                <small className="muted">
+                  การตั้งค่าบันทึกเฉพาะ metadata ที่ไม่เป็นความลับลง Workspace Config
+                </small>
+                <button
+                  type="button"
+                  className="primary-button tiny-btn"
+                  disabled={savingAiConfig}
+                  onClick={() => void handleSaveAiClick()}
+                >
+                  <Icon name="check" size={13} />{" "}
+                  {savingAiConfig ? "Saving..." : "Save AI Config"}
+                </button>
+              </div>
             </div>
           )}
 
@@ -1684,7 +2254,7 @@ function OverviewPage({
         </div>
       </section>
 
-      <section className="metric-grid">
+      <section className="metric-grid stagger-grid">
         <MetricCard
           label="PACKETS ANALYZED"
           value={formatCompactCount(report.packetsAnalyzed)}
@@ -1720,7 +2290,7 @@ function OverviewPage({
       </section>
 
       {report.triage && (
-        <section className="panel triage-panel">
+        <section className="panel triage-panel panel-enter">
           <div className="triage-panel-head">
             <div>
               <div className="section-kicker">TIER-1 CLASSIFIER · EVIDENCE BUDGET</div>
@@ -1760,7 +2330,7 @@ function OverviewPage({
       )}
 
       <div className="overview-grid">
-        <section className="panel stage-panel">
+        <section className="panel stage-panel panel-enter">
           <PanelTitle
             title="Pipeline coverage"
             detail="ทุก stage มีสถานะ ไม่ซ่อนขั้นที่ข้ามหรือผิดพลาด"
@@ -1780,7 +2350,7 @@ function OverviewPage({
           </button>
         </section>
 
-        <section className="panel findings-panel">
+        <section className="panel findings-panel panel-enter">
           <PanelTitle
             title="Findings ที่ควรดู"
             detail="เรียงตาม severity & Tier-1 priority"
@@ -1825,7 +2395,7 @@ function OverviewPage({
       </div>
 
       <div className="overview-grid bottom-grid">
-        <section className="panel timeline-panel">
+        <section className="panel timeline-panel panel-enter">
           <PanelTitle
             title="Packet activity"
             detail="ปริมาณ packets ตามเวลาใน capture"
@@ -1853,7 +2423,7 @@ function OverviewPage({
           </div>
         </section>
 
-        <section className="panel capture-panel">
+        <section className="panel capture-panel panel-enter">
           <PanelTitle title="Capture receipt" detail="แหล่งที่มาและข้อมูลที่ใช้วิเคราะห์" />
           <div className="capture-file">
             <div className="file-icon">
@@ -1889,7 +2459,7 @@ function OverviewPage({
       </div>
 
       {report.rawBundle?.flow_analytics && (
-        <section className="panel" style={{ marginTop: "1rem" }}>
+        <section className="panel analytics-section-panel panel-enter">
           <PanelTitle
             title="Flow Analytics & Topology"
             detail="Capped Top Talkers, Protocol Breakdown, Packet Size / IAT Histograms, Sankey & Topology"
@@ -1904,7 +2474,7 @@ function OverviewPage({
       )}
 
       {report.rawBundle?.geoip && (
-        <section className="panel" style={{ marginTop: "1rem" }}>
+        <section className="panel geomap-section-panel panel-enter">
           <WorldFlowMap
             geoip={report.rawBundle.geoip}
             onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
@@ -2014,6 +2584,8 @@ function AnalyzePage({
   const isCsvSelected = fileInspection?.detectedFormat === "csv" || fileInspection?.detectedFormat === "tsv";
   const effectiveChunkSize = activeProfile?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes ?? null;
   const canStartBackendAi = Boolean(aiConfig?.configuration.enabled && aiConfig?.configuration.model);
+  const etbertInfo = workspaceConfig?.etbert_checkpoint_info ?? capabilities?.triage.etbert_checkpoint_info ?? null;
+  const etbertReady = Boolean(etbertInfo ? (etbertInfo.valid || etbertInfo.ready) : capabilities?.triage.etbert_enabled);
   const triageEndpointConfigured = Boolean(
     aiConfig?.triage?.endpoint_configured || aiConfig?.triage?.etbert_endpoint_configured,
   );
@@ -2091,13 +2663,24 @@ function AnalyzePage({
           </small>
         </div>
         <div className="hw-item">
-          <span>PARSERS &amp; TIER-1</span>
+          <span>PARSERS, ET-BERT &amp; LAYER-2 LLM</span>
           <strong>
             {capabilities
               ? `TShark ${capabilities.host.tshark_available ? "Ready" : "Missing"} · Zeek ${capabilities.host.zeek_available ? "Ready" : "Off"} · YARA ${capabilities.host.yara_available ? "Ready" : "Off"}`
               : "CSV Engine Ready · TShark via API"}
           </strong>
-          <small>Tier-1 classifier: {capabilities?.triage.model_name ?? "openjev-cal-tier1"}</small>
+          <small className="hw-subline">
+            <span className={etbertReady ? "hw-badge-ok" : "hw-badge-warn"}>
+              {etbertReady
+                ? `ET-BERT .bin Ready (${etbertInfo?.architecture ?? "checkpoint"})`
+                : "ET-BERT .bin Missing (Heuristic Tier-1)"}
+            </span>
+            <span className={canStartBackendAi ? "hw-badge-ok" : "muted"}>
+              {canStartBackendAi
+                ? `LLM Ready (${aiConfig?.configuration.model})`
+                : "LLM Standby"}
+            </span>
+          </small>
         </div>
       </section>
 
@@ -2142,7 +2725,7 @@ function AnalyzePage({
                   onChange={handleFileInput}
                 />
                 <div
-                  className={`dropzone ${dragging ? "dropzone-active" : ""}`}
+                  className={`dropzone ${dragging ? "dropzone-active" : ""} ${selectedFile && fileInspection && !fileInspection.valid ? "dropzone-error" : ""}`}
                   onDragOver={(e) => {
                     e.preventDefault();
                     setDragging(true);
@@ -2453,6 +3036,37 @@ function AnalyzePage({
               })}
             </div>
 
+            <div className="ai-layer-status-grid">
+              <div className="ai-layer-card">
+                <div className="ai-layer-card-head">
+                  <strong>Layer 1 · Offline Tier-1 + ET-BERT</strong>
+                  <span className={`ai-env-pill ${etbertReady ? "env-ok" : "env-missing"}`}>
+                    {etbertReady ? "ET-BERT .bin Ready" : "Heuristics Only"}
+                  </span>
+                </div>
+                <small>
+                  ทำงานอัตโนมัติแบบ offline โดยไม่ต้องใช้ API key (หากเป็น capture ระดับ L2/WLAN/ARP จะขึ้น L7 datagrams = 0 ซึ่งเป็นพฤติกรรมปกติ)
+                </small>
+              </div>
+              <div className="ai-layer-card">
+                <div className="ai-layer-card-head">
+                  <strong>Layer 2 · Optional LLM Narrator</strong>
+                  <button
+                    type="button"
+                    className="hw-action-btn"
+                    onClick={onOpenConnectionModal}
+                  >
+                    {canStartBackendAi ? "แก้ไข LLM" : "ตั้งค่า LLM"}
+                  </button>
+                </div>
+                <small>
+                  {canStartBackendAi
+                    ? `พร้อมใช้งาน: ${aiConfig?.configuration.provider} (${aiConfig?.configuration.model})`
+                    : "Standby — ตั้งค่า Local Ollama หรือ API Endpoint + ชื่อ ENV var แล้วเปิด Opt-in เมื่อต้องการสรุปรายงาน"}
+                </small>
+              </div>
+            </div>
+
             <div className="option-row">
               <div className="option-symbol intel-symbol">
                 <Icon name="nodes" size={18} />
@@ -2521,7 +3135,19 @@ function AnalyzePage({
               <div className="ai-config-callout">
                 {connectionStatus === "connected" && !canStartBackendAi ? (
                   <div className="consent-required">
-                    Backend ตั้งค่า <code>ai.enabled = false</code> หรือยังไม่ได้กำหนด <code>ai.model</code> — deterministic detectors และ Tier-1 classifier ยังทำงานได้เต็มรูปแบบ
+                    <strong>ยังไม่ได้ตั้งค่า Layer-2 LLM Provider บน Backend</strong>
+                    <span>
+                      Backend ตั้งค่า <code>ai.enabled = false</code> หรือยังไม่ได้กำหนด <code>ai.model</code> — Layer-1 deterministic detectors และ ET-BERT .bin ยังทำงานได้เต็มรูปแบบ
+                    </span>
+                    <div className="consent-cta">
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        onClick={onOpenConnectionModal}
+                      >
+                        <Icon name="spark" size={13} /> ตั้งค่า &amp; เปิดใช้ AI Provider
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <>
@@ -2710,7 +3336,7 @@ function JobsPage({
         }
       />
 
-      <div className="jobs-summary">
+      <div className="jobs-summary stagger-grid">
         <div className="queue-stat">
           <span>ACTIVE JOBS</span>
           <strong>{String(activeCount).padStart(2, "0")}</strong>
@@ -2732,7 +3358,7 @@ function JobsPage({
         </div>
       </div>
 
-      <section className="panel lifecycle-panel" aria-label="Job lifecycle">
+      <section className="panel lifecycle-panel panel-enter" aria-label="Job lifecycle">
         <div className="lifecycle-heading">
           <div>
             <span className="section-kicker">ASYNC JOB LIFECYCLE</span>
@@ -2748,14 +3374,18 @@ function JobsPage({
           {focusedJob ? lifecycleSteps.map((label, index) => {
             const optionalOff = index === 5 && !(focusedJob ? focusedJob.ai_enabled : aiEnabled);
             const state = optionalOff
-              ? "skipped"
+              ? "standby"
               : index < lifecycleCurrent
                 ? "done"
                 : index === lifecycleCurrent
                   ? "current"
                   : "queued";
             return (
-              <div className={`lifecycle-step lifecycle-${state}`} key={label}>
+              <div
+                className={`lifecycle-step lifecycle-${state}`}
+                key={label}
+                title={optionalOff ? "Layer-2 AI optional (Standby สำหรับ job นี้)" : undefined}
+              >
                 <span className="lifecycle-dot">{state === "done" ? <Icon name="check" size={11} /> : index + 1}</span>
                 <span>{label}</span>
               </div>
@@ -3552,6 +4182,7 @@ function ReportsPage({
   onChat,
   onNavigate,
   onOpenEvidence,
+  onOpenConnectionModal,
 }: {
   report: WorkspaceReport;
   apiClient: PcapApiClient;
@@ -3562,6 +4193,7 @@ function ReportsPage({
   onChat: (question: string, consent: boolean) => Promise<GroundedChatResponse>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
+  onOpenConnectionModal: () => void;
 }) {
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   const aiActive = report.ai?.state === "completed" && Boolean(report.ai.report);
@@ -3810,6 +4442,9 @@ function ReportsPage({
                   Tier-1 Classifier ({report.triage.model}): evaluated {formatCompactCount(report.triage.total_evaluated)} items · filtered{" "}
                   {formatCompactCount(report.triage.benign_filtered)} Benign ({Math.round(report.triage.reduction_ratio * 100)}% reduction) ·{" "}
                   escalated {formatCompactCount(report.triage.escalated_count)} · mean PPL={report.triage.mean_ppl.toFixed(2)}
+                  {(report.triage.etbert_scored_count ?? 0) > 0
+                    ? ` · ET-BERT L7 scored=${report.triage.etbert_scored_count}`
+                    : " · ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)"}
                 </span>
                 {report.ai?.context_reduction && (
                   <span>
@@ -3879,12 +4514,17 @@ function ReportsPage({
                 <Icon name="shield" size={17} />
                 <span>
                   {report.ai?.error_code
-                    ? `AI narrative ถูกข้ามด้วย fallback (${report.ai.error_code}) — deterministic findings และ Tier-1 triage ยังอยู่ครบ`
-                    : "AI narrative ปิดอยู่ — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
+                    ? `Layer-2 AI narrative ถูกข้ามด้วย fallback (${report.ai.error_code}) — deterministic findings และ Layer-1 Tier-1 triage ยังอยู่ครบ`
+                    : "Layer-2 AI narrative ปิดอยู่สำหรับรอบนี้ (Standby) — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
                 </span>
-                <button className="text-button" onClick={() => onNavigate("analyze")}>
-                  ดูตัวเลือก <Icon name="arrow" size={14} />
-                </button>
+                <div className="ai-disabled-actions">
+                  <button type="button" className="secondary-button tiny-btn" onClick={onOpenConnectionModal}>
+                    <Icon name="spark" size={13} /> ตั้งค่า AI Provider
+                  </button>
+                  <button type="button" className="text-button" onClick={() => onNavigate("analyze")}>
+                    ดูตัวเลือก <Icon name="arrow" size={14} />
+                  </button>
+                </div>
               </div>
             )}
           </div>

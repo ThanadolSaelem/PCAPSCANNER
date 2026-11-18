@@ -247,3 +247,154 @@ test("extractLaunchHashCredentials parses loopback launcher tokens and rejects r
   assert.equal(rejectedRemote.token, "tok_xyz");
   assert.equal(rejectedRemote.backendUrl, undefined);
 });
+
+test("PcapApiClient updateAiConfig and probeAiModels send expected non-secret requests", async () => {
+  const previousFetch = globalThis.fetch;
+  const client = new PcapApiClient("http://127.0.0.1:8000/", "op-token");
+  const seenCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    seenCalls.push({ url: String(input), method: init.method, headers: init.headers, body: init.body });
+    if (String(input).endsWith("/api/v1/ai/models/probe")) {
+      return new Response(
+        JSON.stringify({ state: "completed", items: [{ id: "qwen2.5:7b" }], warning: null }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        configuration: {
+          schema_version: "1.0",
+          enabled: true,
+          provider: "openai_compatible",
+          base_url: "http://127.0.0.1:11434",
+          allowed_origins: ["http://127.0.0.1:11434"],
+          model: "qwen2.5:7b",
+          api_key_env: null,
+          data_boundary: "local",
+          timeout_seconds: 60,
+          input_max_bytes: 65536,
+          max_output_tokens: 1200,
+          context_window_tokens: 32768,
+        },
+        policy_hash: "abc123",
+        editable: "runtime_non_secret_fields_via_put",
+        api_key_env_set: false,
+        manus_env_set: false,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  try {
+    const probed = await client.probeAiModels({
+      provider: "openai_compatible",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: ["http://127.0.0.1:11434"],
+      data_boundary: "local",
+    });
+    assert.equal(probed.items[0].id, "qwen2.5:7b");
+
+    const updated = await client.updateAiConfig({
+      enabled: true,
+      provider: "openai_compatible",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: ["http://127.0.0.1:11434"],
+      model: "qwen2.5:7b",
+      api_key_env: null,
+      data_boundary: "local",
+    });
+    assert.equal(updated.configuration.enabled, true);
+    assert.equal(updated.configuration.model, "qwen2.5:7b");
+
+    assert.equal(seenCalls.length, 2);
+    assert.equal(seenCalls[0].url, "http://127.0.0.1:8000/api/v1/ai/models/probe");
+    assert.equal(seenCalls[0].method, "POST");
+    assert.equal(seenCalls[0].headers.Authorization, "Bearer op-token");
+    assert.equal(seenCalls[1].url, "http://127.0.0.1:8000/api/v1/ai/config");
+    assert.equal(seenCalls[1].method, "PUT");
+    assert.equal(seenCalls[1].headers.Authorization, "Bearer op-token");
+    const putBody = JSON.parse(seenCalls[1].body);
+    assert.equal(putBody.model, "qwen2.5:7b");
+    assert.equal("api_key" in putBody, false);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("adaptBackendReport distinguishes Layer-1 ET-BERT L2 fallback from Layer-2 LLM states", () => {
+  const baseBundle = {
+    schema_version: "1.0",
+    capture_sha256: "b".repeat(64),
+    created_at: "2026-11-18T00:00:00Z",
+    coverage: {
+      packets_seen: 120,
+      packets_analyzed: 120,
+      truncated: false,
+      parser: "tshark-fields-offline",
+      warnings: [],
+      stages: [{ name: "tshark", state: "completed", detail: "120 packets" }],
+    },
+    triage: {
+      enabled: true,
+      model: "openjev-cal-tier1+etbert",
+      mode: "etbert_local_checkpoint",
+      total_evaluated: 10,
+      benign_filtered: 8,
+      escalated_count: 2,
+      uncertain_count: 0,
+      reduction_ratio: 0.8,
+      mean_confidence: 0.91,
+      mean_ppl: 1.05,
+      etbert_scored_count: 0,
+      top_classes: [],
+      escalated_evidence_ids: [],
+    },
+    evidence: [],
+    findings: [],
+  };
+
+  const disabledL2 = adaptBackendReport({
+    analysis_id: "1111111122222222",
+    status: "completed",
+    evidence: baseBundle,
+    ai: { state: "disabled" },
+    disclaimer: "Detector findings are candidates.",
+  });
+  const tier1Zero = disabledL2.stages.find((s) => s.name === "TIER-1 CLASSIFIER");
+  const aiDisabled = disabledL2.stages.find((s) => s.name === "AI NARRATIVE");
+  assert.match(tier1Zero?.detail ?? "", /ET-BERT: 0 L7 datagrams/);
+  assert.equal(aiDisabled?.status, "skipped");
+  assert.match(aiDisabled?.detail ?? "", /Layer-2 LLM disabled for this run/);
+
+  const scoredAndCompleted = adaptBackendReport({
+    analysis_id: "3333333344444444",
+    status: "completed",
+    evidence: {
+      ...baseBundle,
+      triage: { ...baseBundle.triage, etbert_scored_count: 42 },
+    },
+    ai: {
+      state: "completed",
+      provider: "openai_compatible",
+      model: "qwen2.5:7b",
+      report: { summary: [], assessments: [], limitations: [], recommended_actions: [] },
+    },
+    disclaimer: "Detector findings are candidates.",
+  });
+  assert.match(scoredAndCompleted.stages.find((s) => s.name === "TIER-1 CLASSIFIER")?.detail ?? "", /ET-BERT 42 L7 scored/);
+  const aiDone = scoredAndCompleted.stages.find((s) => s.name === "AI NARRATIVE");
+  assert.equal(aiDone?.status, "done");
+  assert.match(aiDone?.detail ?? "", /Layer-2 LLM \(qwen2\.5:7b\) generated evidence-grounded summary/);
+
+  const fallbackError = adaptBackendReport({
+    analysis_id: "5555555566666666",
+    status: "partial",
+    evidence: baseBundle,
+    ai: { state: "unavailable", error_code: "ai_provider_unreachable" },
+    disclaimer: "Detector findings are candidates.",
+  });
+  const aiFallback = fallbackError.stages.find((s) => s.name === "AI NARRATIVE");
+  assert.equal(aiFallback?.status, "partial");
+  assert.match(aiFallback?.detail ?? "", /Layer-2 Fallback \(ai_provider_unreachable\)/);
+});

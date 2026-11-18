@@ -20,11 +20,14 @@ from typing import Annotated
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from .config import AppSettings, load_settings
+from .config import AIConfig, AppSettings, load_settings
 from .batch_upload import BatchUploadError, stage_batch_upload
 from .models import (
+    AIConfigUpdateRequest,
+    AIModelProbeRequest,
     AIResult,
     BatchResponse,
     AnalysisRequest,
@@ -60,14 +63,14 @@ from .picker import (
 from .store import ACTIVE, Store, StoreError
 from .system import build_capabilities_payload, probe_capabilities, recommended_chunk_size_bytes
 from .triage import bundle_to_triage_jsonl
-from .etbert_bridge import inspect_etbert_checkpoint
+from .etbert_bridge import inspect_etbert_checkpoint, is_etbert_effectively_enabled
 from .yara import default_rules_dir, inspect_yara_rules
 from .geoip import build_world_map_flows
 from .exporters.csv_json import export_findings_and_evidence_csv
 from .exporters.cef import export_findings_cef
 from .exporters.navigator import export_attack_navigator_layer
 from .exporters.pdf_report import export_snapshot_pdf
-from .llm import generate_chat_completion
+from .llm import generate_chat_completion, probe_models
 from .llm.chat import ChatLimits, answer_question
 from .stix_export import export_stix_bundle
 from .osint_service import OSINTService, extract_ioc_candidates, MAX_IOCS_PER_OPERATION
@@ -382,7 +385,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "resource_mode": str(getattr(cfg_now, "resource_mode", "auto")),
             "etbert_checkpoint_path": ckpt_path,
             "etbert_checkpoint_configured": bool(ckpt_path),
-            "etbert_enabled": bool(getattr(cfg_now.triage, "etbert_enabled", False) or ckpt_info.get("ready")),
+            "etbert_enabled": is_etbert_effectively_enabled(
+                cfg_now.triage, ckpt_ready=bool(ckpt_info.get("ready"))
+            ),
             "etbert_checkpoint_info": ckpt_info,
             "etbert_checkpoint_status": ckpt_info,
             "native_picker_available": bool(picker_backend is not None),
@@ -478,13 +483,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             app.state.store = next_store
             ws_path = resolve_workspace_config_path()
             if ws_path is not None:
+                explicit_etbert = (
+                    bool(updated_cfg.triage.etbert_enabled)
+                    if "etbert_enabled" in updated_cfg.triage.model_fields_set
+                    else None
+                )
                 update_workspace_config(
                     path=ws_path,
                     data_dir=str(updated_cfg.data_dir),
                     local_ingest_roots=list(updated_cfg.local_ingest_roots),
                     resource_mode=str(updated_cfg.resource_mode),
                     etbert_checkpoint_path=updated_cfg.triage.etbert_checkpoint_path,
-                    etbert_enabled=bool(updated_cfg.triage.etbert_enabled),
+                    etbert_enabled=explicit_etbert,
                     prefer_workspace=True,
                 )
 
@@ -522,7 +532,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         status = inspect_etbert_checkpoint(cfg_now.triage.etbert_checkpoint_path)
         return {
             **status,
-            "etbert_enabled": bool(cfg_now.triage.etbert_enabled or status.get("ready")),
+            "etbert_enabled": is_etbert_effectively_enabled(
+                cfg_now.triage, ckpt_ready=bool(status.get("ready"))
+            ),
             "mode": str(cfg_now.triage.mode),
         }
 
@@ -1540,16 +1552,50 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         items = _store().list_api_key_audit(limit=limit)
         return {"items": items, "total": len(items)}
 
-    @app.get("/api/v1/ai/config", tags=["AI"])
-    def ai_config():
-        # AIConfig stores only secret ENV references, never values.
-        cfg_now = _cfg()
+    def _ai_config_payload(cfg_now: AppSettings) -> dict[str, object]:
+        api_key_env = cfg_now.ai.api_key_env
         return {
             "configuration": cfg_now.ai.model_dump(mode="json"),
             "triage": cfg_now.triage.model_dump(mode="json"),
             "policy_hash": profile_hash(cfg_now),
-            "editable": "server_config_file_and_environment_only",
+            "editable": "loopback_nonsecret_runtime_and_env",
+            "api_key_env_set": bool(api_key_env and os.environ.get(api_key_env)),
+            "manus_env_set": bool(os.environ.get("MANUS_API_URL") and os.environ.get("MANUS_API_KEY")),
         }
+
+    @app.get("/api/v1/ai/config", tags=["AI"])
+    def ai_config():
+        # AIConfig stores only secret ENV references, never values.
+        return _ai_config_payload(_cfg())
+
+    @app.put("/api/v1/ai/config", tags=["AI"])
+    def update_ai_config(body: AIConfigUpdateRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_config_mutation_loopback_only")
+
+        cfg_now = _cfg()
+        next_ai_data = cfg_now.ai.model_dump(mode="python")
+        for field_name in body.model_fields_set:
+            val = getattr(body, field_name)
+            if field_name in {"base_url", "model", "api_key_env"} and isinstance(val, str):
+                val = val.strip() or None
+            next_ai_data[field_name] = val
+        try:
+            updated_ai = AIConfig.model_validate(next_ai_data)
+        except ValidationError:
+            raise HTTPException(422, "invalid_ai_configuration") from None
+
+        updated_cfg = cfg_now.model_copy(update={"ai": updated_ai})
+        app.state.settings = updated_cfg
+        ws_path = resolve_workspace_config_path()
+        if ws_path is not None:
+            update_workspace_config(
+                path=ws_path,
+                ai=updated_ai.model_dump(mode="json"),
+                prefer_workspace=True,
+            )
+        return _ai_config_payload(updated_cfg)
 
     @app.get("/api/v1/ai/config/schema", tags=["AI"])
     def ai_schema():
@@ -1568,6 +1614,34 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "state": "disabled" if not cfg_now.ai.enabled else ("completed" if items else "unavailable_or_empty"),
                 "items": items,
                 "warning": None if items else "No catalog returned; this does not prove the provider has no models",
+            }
+        except Exception:
+            raise HTTPException(502, "ai_model_discovery_unavailable")
+
+    @app.post("/api/v1/ai/models/probe", tags=["AI"])
+    async def ai_models_probe(body: AIModelProbeRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_probe_loopback_only")
+
+        cfg_now = _cfg()
+        probe_data = cfg_now.ai.model_dump(mode="python")
+        for field_name in body.model_fields_set:
+            val = getattr(body, field_name)
+            if field_name in {"base_url", "api_key_env"} and isinstance(val, str):
+                val = val.strip() or None
+            probe_data[field_name] = val
+        probe_data["enabled"] = False
+        try:
+            probe_cfg = AIConfig.model_validate(probe_data)
+        except ValidationError:
+            raise HTTPException(422, "invalid_ai_configuration") from None
+        try:
+            items, warning = await probe_models(probe_cfg)
+            return {
+                "state": "completed" if items else "unavailable_or_empty",
+                "items": items,
+                "warning": warning,
             }
         except Exception:
             raise HTTPException(502, "ai_model_discovery_unavailable")

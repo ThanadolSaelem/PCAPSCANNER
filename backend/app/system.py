@@ -364,17 +364,21 @@ def build_capabilities_payload(settings: object) -> dict[str, object]:
     triage_cfg = getattr(settings, "triage", None)
     etbert_ckpt_path = getattr(triage_cfg, "etbert_checkpoint_path", None)
     try:
-        from .etbert_bridge import inspect_etbert_checkpoint
+        from .etbert_bridge import inspect_etbert_checkpoint, is_etbert_effectively_enabled
 
         etbert_ckpt_status = inspect_etbert_checkpoint(etbert_ckpt_path)
+        etbert_effective = is_etbert_effectively_enabled(
+            triage_cfg, ckpt_ready=bool(etbert_ckpt_status.get("ready"))
+        )
     except Exception:
         etbert_ckpt_status = {"configured": bool(etbert_ckpt_path), "ready": False}
+        etbert_effective = bool(getattr(triage_cfg, "etbert_enabled", False))
     triage_info = {
         "enabled": bool(getattr(triage_cfg, "enabled", True)),
         "mode": str(getattr(triage_cfg, "mode", "heuristic_calibrated")),
         "model_name": str(getattr(triage_cfg, "model_name", "openjev-cal-tier1")),
         "endpoint_configured": bool(getattr(triage_cfg, "endpoint_url", None)),
-        "etbert_enabled": bool(getattr(triage_cfg, "etbert_enabled", False) or etbert_ckpt_status.get("ready")),
+        "etbert_enabled": etbert_effective,
         "etbert_endpoint_configured": bool(getattr(triage_cfg, "etbert_endpoint_url", None)),
         "etbert_checkpoint_configured": bool(etbert_ckpt_path),
         "etbert_checkpoint_path": str(etbert_ckpt_path) if etbert_ckpt_path else None,
