@@ -426,3 +426,78 @@ def test_triage_falls_back_to_local_bin_when_etbert_http_returns_empty(tmp_path,
     assert report.etbert_scored_count == 1
     assert report.decisions[0].etbert_label is not None
 
+
+def test_ai_runtime_credentials_are_memory_only_loopback_and_wired_to_provider(tmp_path, monkeypatch):
+    from backend.app.llm import providers as llm_providers
+
+    ws_file = tmp_path / "workspace.json"
+    monkeypatch.setenv("PCAP_WORKSPACE_CONFIG", str(ws_file))
+    monkeypatch.delenv("MANUS_API_URL", raising=False)
+    monkeypatch.delenv("MANUS_API_KEY", raising=False)
+
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        api_token=TOKEN,
+        ai=AIConfig(enabled=False),
+    )
+    app = create_app(settings)
+    client = TestClient(app, headers={"Authorization": f"Bearer {TOKEN}"})
+
+    secret = "sk-manus-unit-test-secret-998877"
+    try:
+        # Store runtime API key strictly in RAM via loopback endpoint
+        put_res = client.put(
+            "/api/v1/ai/credentials",
+            json={"provider": "manus", "api_key": secret},
+        )
+        assert put_res.status_code == 200, put_res.text
+        put_body = put_res.json()
+        assert put_body["configured"] is True
+        assert put_body["provider"] == "manus"
+        assert len(put_body["key_fingerprint"]) == 12
+        assert put_body["runtime_keys"]["manus"] is True
+        # Secret must NEVER be echoed back in response or written to workspace.json
+        assert secret not in put_res.text
+
+        # Configure Manus HTTPS base_url + allowed_origins via non-secret /api/v1/ai/config
+        cfg_res = client.put(
+            "/api/v1/ai/config",
+            json={
+                "enabled": True,
+                "provider": "manus",
+                "base_url": "https://api.manus.im",
+                "allowed_origins": ["https://api.manus.im"],
+                "data_boundary": "remote",
+                "model": "manus-1",
+            },
+        )
+        assert cfg_res.status_code == 200, cfg_res.text
+        cfg_body = cfg_res.json()
+        assert cfg_body["manus_ready"] is True
+        assert cfg_body["runtime_key_set"] is True
+        assert secret not in cfg_res.text
+        assert not ws_file.exists() or secret not in ws_file.read_text(encoding="utf-8")
+
+        # Provider runtime resolves configured base_url and RAM key cleanly
+        rt = llm_providers._runtime(app.state.settings)
+        assert rt.endpoint == "https://api.manus.im/v1/chat/completions"
+        assert rt.headers["authorization"] == f"Bearer {secret}"
+
+        # Clear key removes it from RAM cleanly
+        del_res = client.delete("/api/v1/ai/credentials", params={"provider": "manus"})
+        assert del_res.status_code == 200
+        assert del_res.json()["cleared"] is True
+        assert del_res.json()["runtime_keys"]["manus"] is False
+
+        # Non-loopback caller is blocked on both PUT and DELETE
+        monkeypatch.setattr(main_module, "is_loopback_client", lambda _host: False)
+        denied_put = client.put("/api/v1/ai/credentials", json={"provider": "manus", "api_key": secret})
+        denied_del = client.delete("/api/v1/ai/credentials", params={"provider": "manus"})
+        assert denied_put.status_code == 403
+        assert denied_put.json()["code"] == "ai_credentials_loopback_only"
+        assert denied_del.status_code == 403
+        assert denied_del.json()["code"] == "ai_credentials_loopback_only"
+    finally:
+        llm_providers.clear_runtime_api_key("manus")
+
+

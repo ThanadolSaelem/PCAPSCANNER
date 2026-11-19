@@ -1229,10 +1229,11 @@ function App() {
       const updated = await api.updateAiConfig(payload);
       setAiConfig(updated);
       if (updated.configuration.enabled && updated.configuration.model) {
+        const keyReady = Boolean(updated.runtime_key_set || updated.api_key_env_set || updated.manus_ready || updated.manus_env_set);
         pushToast(
           `บันทึก Layer-2 AI (${updated.configuration.provider}: ${updated.configuration.model}) แล้ว`,
           "success",
-          `Boundary: ${updated.configuration.data_boundary} · ENV key ${updated.api_key_env_set || updated.manus_env_set ? "ready" : "optional/unset"}`,
+          `Boundary: ${updated.configuration.data_boundary} · API Key ${keyReady ? "ready" : "optional/unset"}`,
         );
       } else {
         pushToast(
@@ -1245,6 +1246,41 @@ function App() {
       return updated;
     } catch (err) {
       pushToast("บันทึกการตั้งค่า AI ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
+    }
+  };
+
+  const handleSetAiCredentials = async (provider: AIProviderName, apiKey: string): Promise<AIConfigResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนบันทึก API Key");
+    }
+    try {
+      const updated = await api.setAiCredentials(provider, apiKey);
+      setAiConfig(updated);
+      const fp = updated.runtime_key_fingerprints?.[provider] ?? updated.runtime_key_fingerprint;
+      pushToast(
+        `บันทึก API Key สำหรับ ${provider} ใน RAM แล้ว`,
+        "success",
+        fp ? `Fingerprint: ${fp} · ไม่บันทึกลงดิสก์และไม่ส่งกลับใน API` : "เก็บเฉพาะในหน่วยความจำของ Backend",
+      );
+      return updated;
+    } catch (err) {
+      pushToast("บันทึก API Key ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
+    }
+  };
+
+  const handleClearAiCredentials = async (provider: AIProviderName): Promise<AIConfigResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนล้าง API Key");
+    }
+    try {
+      const updated = await api.clearAiCredentials(provider);
+      setAiConfig(updated);
+      pushToast(`ล้าง API Key ของ ${provider} ออกจาก RAM แล้ว`, "info");
+      return updated;
+    } catch (err) {
+      pushToast("ล้าง API Key ไม่สำเร็จ", "error", safeFormatError(err));
       throw err;
     }
   };
@@ -1815,6 +1851,8 @@ function App() {
           onClearModelPath={() => void handleClearModelPath()}
           onRemoveRoot={(root) => void handleRemoveLocalRoot(root)}
           onSaveAiConfig={handleSaveAiConfig}
+          onSetAiCredentials={handleSetAiCredentials}
+          onClearAiCredentials={handleClearAiCredentials}
           onProbeAiModels={handleProbeAiModels}
           onClose={() => setConnectionModalOpen(false)}
           onSave={saveConnectionSettings}
@@ -1971,6 +2009,8 @@ function ConnectionModal({
   onClearModelPath,
   onRemoveRoot,
   onSaveAiConfig,
+  onSetAiCredentials,
+  onClearAiCredentials,
   onProbeAiModels,
   onClose,
   onSave,
@@ -1993,6 +2033,8 @@ function ConnectionModal({
   onClearModelPath: () => void;
   onRemoveRoot: (root: string) => void;
   onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
+  onSetAiCredentials: (provider: AIProviderName, apiKey: string) => Promise<AIConfigResponse>;
+  onClearAiCredentials: (provider: AIProviderName) => Promise<AIConfigResponse>;
   onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
   onClose: () => void;
   onSave: (url: string, token: string) => void;
@@ -2020,6 +2062,9 @@ function ConnectionModal({
   const [aiDraftAllowedOrigins, setAiDraftAllowedOrigins] = useState<string>((aiConfig?.configuration.allowed_origins ?? []).join(", "));
   const [aiDraftModel, setAiDraftModel] = useState<string>(aiConfig?.configuration.model ?? "");
   const [aiDraftApiKeyEnv, setAiDraftApiKeyEnv] = useState<string>(aiConfig?.configuration.api_key_env ?? "");
+  const [aiDraftApiKey, setAiDraftApiKey] = useState<string>("");
+  const [showApiKey, setShowApiKey] = useState<boolean>(false);
+  const [savingApiKey, setSavingApiKey] = useState<boolean>(false);
   const [probingAiModels, setProbingAiModels] = useState(false);
   const [savingAiConfig, setSavingAiConfig] = useState(false);
   const [aiFeedback, setAiFeedback] = useState<{ tone: "ok" | "info" | "warn" | "crit"; message: string } | null>(null);
@@ -2056,15 +2101,17 @@ function ConnectionModal({
     draft: {
       enabled: aiDraftEnabled,
       provider: aiDraftProvider,
-      data_boundary: aiDraftBoundary,
-      base_url: aiDraftProvider === "manus" ? "" : aiDraftBaseUrl,
-      allowed_origins: aiDraftProvider === "manus" ? "" : aiDraftAllowedOrigins,
+      data_boundary: aiDraftProvider === "manus" ? "remote" : aiDraftBoundary,
+      base_url: aiDraftBaseUrl,
+      allowed_origins: aiDraftAllowedOrigins,
       model: aiDraftModel,
       api_key_env: aiDraftProvider === "manus" ? "" : aiDraftApiKeyEnv,
     },
   });
   const dataDirDirty = Boolean(dataDirDraft.trim()) && dataDirDraft.trim() !== resolvedDataDir;
   const modelPathDirty = Boolean(modelPathDraft.trim()) && modelPathDraft.trim() !== resolvedModelPath;
+  const runtimeKeyActive = Boolean(aiConfig?.runtime_keys?.[aiDraftProvider]);
+  const runtimeKeyFingerprint = aiConfig?.runtime_key_fingerprints?.[aiDraftProvider] ?? null;
 
   const applyLocalOllamaPreset = () => {
     setAiDraftEnabled(true);
@@ -2079,20 +2126,56 @@ function ConnectionModal({
     });
   };
 
-  const validateEndpointInputs = (requireModelWhenEnabled: boolean): { cleanApiKeyEnv: string | null; cleanBaseUrl: string | null; origins: string[] } | null => {
-    if (aiDraftProvider === "manus") {
-      if (aiDraftEnabled && requireModelWhenEnabled && !aiDraftModel.trim()) {
-        setAiFeedback({ tone: "warn", message: "กรุณากด Probe / Discover Models หรือระบุชื่อ Model ก่อนเปิดใช้งาน Layer-2 AI" });
-        return null;
-      }
-      return { cleanApiKeyEnv: null, cleanBaseUrl: null, origins: [] };
+  const handleSaveApiKeyClick = async () => {
+    if (savingApiKey) return;
+    const trimmed = aiDraftApiKey.trim();
+    if (trimmed.length < 4) {
+      setAiFeedback({ tone: "warn", message: "กรุณากรอก API Key อย่างน้อย 4 ตัวอักษร" });
+      return;
     }
+    setSavingApiKey(true);
+    setAiFeedback(null);
+    try {
+      const updated = await onSetAiCredentials(aiDraftProvider, trimmed);
+      setAiDraftApiKey("");
+      setShowApiKey(false);
+      const fp = updated.runtime_key_fingerprints?.[aiDraftProvider] ?? updated.runtime_key_fingerprint;
+      setAiFeedback({
+        tone: "ok",
+        message: `บันทึก API Key ของ ${aiDraftProvider} ใน RAM ของ Backend แล้ว${fp ? ` (fp: ${fp})` : ""} — กด Probe / Discover Models หรือ Save AI Config ต่อได้เลย`,
+      });
+    } catch (err) {
+      setAiFeedback({ tone: "crit", message: safeFormatError(err) });
+    } finally {
+      setSavingApiKey(false);
+    }
+  };
 
-    const cleanEnv = aiDraftApiKeyEnv.trim();
+  const handleClearApiKeyClick = async () => {
+    if (savingApiKey) return;
+    setSavingApiKey(true);
+    setAiFeedback(null);
+    try {
+      await onClearAiCredentials(aiDraftProvider);
+      setAiDraftApiKey("");
+      setAiFeedback({
+        tone: "info",
+        message: `ล้าง API Key ของ ${aiDraftProvider} ออกจากหน่วยความจำของ Backend แล้ว`,
+      });
+    } catch (err) {
+      setAiFeedback({ tone: "crit", message: safeFormatError(err) });
+    } finally {
+      setSavingApiKey(false);
+    }
+  };
+
+  const validateEndpointInputs = (requireModelWhenEnabled: boolean): { cleanApiKeyEnv: string | null; cleanBaseUrl: string | null; origins: string[] } | null => {
+    const effectiveBoundary: "local" | "remote" = aiDraftProvider === "manus" ? "remote" : aiDraftBoundary;
+    const cleanEnv = aiDraftProvider === "manus" ? "" : aiDraftApiKeyEnv.trim();
     if (cleanEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cleanEnv)) {
       setAiFeedback({
         tone: "crit",
-        message: "API Key ENV ต้องเป็นชื่อตัวแปร environment เท่านั้น (เช่น OPENAI_API_KEY หรือ ANTHROPIC_API_KEY) — ห้ามวาง secret key จริง",
+        message: "API Key ENV ต้องเป็นชื่อตัวแปร environment เท่านั้น (เช่น OPENAI_API_KEY หรือ ANTHROPIC_API_KEY) — หากต้องการวาง Key จริง ให้ใส่ในช่อง API Key ด้านบนแทน",
       });
       return null;
     }
@@ -2106,7 +2189,7 @@ function ConnectionModal({
         setAiFeedback({ tone: "crit", message: "Base URL ไม่ถูกต้องตามรูปแบบ URL (เช่น http://127.0.0.1:11434 หรือ https://api.openai.com)" });
         return null;
       }
-      if (aiDraftBoundary === "remote" && parsed.protocol !== "https:") {
+      if (effectiveBoundary === "remote" && parsed.protocol !== "https:") {
         setAiFeedback({
           tone: "warn",
           message: "Remote boundary ต้องใช้ HTTPS เพื่อความปลอดภัยของ structured evidence",
@@ -2114,7 +2197,7 @@ function ConnectionModal({
         return null;
       }
       if (
-        aiDraftBoundary === "local" &&
+        effectiveBoundary === "local" &&
         !["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname.toLowerCase())
       ) {
         setAiFeedback({
@@ -2125,9 +2208,9 @@ function ConnectionModal({
       }
     }
 
-    const origins = buildAllowedOriginsList(aiDraftAllowedOrigins, cleanUrl, aiDraftProvider, aiDraftBoundary);
+    const origins = buildAllowedOriginsList(aiDraftAllowedOrigins, cleanUrl, aiDraftProvider, effectiveBoundary);
     if (aiDraftEnabled && requireModelWhenEnabled) {
-      if (!cleanUrl && aiDraftProvider !== "openai_compatible") {
+      if (!cleanUrl && aiDraftProvider === "anthropic") {
         setAiFeedback({ tone: "warn", message: `กรุณาระบุ Base URL สำหรับ provider "${aiDraftProvider}"` });
         return null;
       }
@@ -2151,6 +2234,12 @@ function ConnectionModal({
     setProbingAiModels(true);
     setAiFeedback(null);
     try {
+      const pendingKey = aiDraftApiKey.trim();
+      if (pendingKey.length >= 4) {
+        await onSetAiCredentials(aiDraftProvider, pendingKey);
+        setAiDraftApiKey("");
+        setShowApiKey(false);
+      }
       const res = await onProbeAiModels({
         provider: aiDraftProvider,
         base_url: validated.cleanBaseUrl,
@@ -2158,9 +2247,7 @@ function ConnectionModal({
         api_key_env: validated.cleanApiKeyEnv,
         data_boundary: aiDraftProvider === "manus" ? "remote" : aiDraftBoundary,
       });
-      if (aiDraftProvider !== "manus") {
-        setAiDraftAllowedOrigins(validated.origins.join(", "));
-      }
+      setAiDraftAllowedOrigins(validated.origins.join(", "));
       if (res.items.length > 0) {
         if (!aiDraftModel.trim()) setAiDraftModel(res.items[0].id);
         setAiFeedback({
@@ -2170,7 +2257,7 @@ function ConnectionModal({
       } else {
         setAiFeedback({
           tone: "warn",
-          message: `ไม่พบรายการโมเดลจาก endpoint (${res.warning ?? "empty_catalog"}) — ตรวจสอบว่าบริการทำงานอยู่หรือใส่ชื่อโมเดลเองได้`,
+          message: `ไม่พบรายการโมเดลจาก endpoint (${res.warning ?? "empty_catalog"}) — ตรวจสอบว่า Base URL/API Key ถูกต้องหรือพิมพ์ชื่อโมเดลเองได้`,
         });
       }
     } catch (err) {
@@ -2187,6 +2274,12 @@ function ConnectionModal({
     setSavingAiConfig(true);
     setAiFeedback(null);
     try {
+      const pendingKey = aiDraftApiKey.trim();
+      if (pendingKey.length >= 4) {
+        await onSetAiCredentials(aiDraftProvider, pendingKey);
+        setAiDraftApiKey("");
+        setShowApiKey(false);
+      }
       const updated = await onSaveAiConfig({
         enabled: aiDraftEnabled,
         provider: aiDraftProvider,
@@ -2344,7 +2437,7 @@ function ConnectionModal({
                   </div>
 
                   <div className="ai-field-grid">
-                    <label className="modal-field" style={aiDraftProvider === "manus" ? { gridColumn: "1 / -1" } : undefined}>
+                    <label className="modal-field">
                       <span>Provider</span>
                       <select
                         value={aiDraftProvider}
@@ -2353,8 +2446,10 @@ function ConnectionModal({
                           setAiDraftProvider(next);
                           if (next === "manus") {
                             setAiDraftBoundary("remote");
-                            setAiDraftBaseUrl("");
-                            setAiDraftAllowedOrigins("");
+                            if (aiDraftBaseUrl === "http://127.0.0.1:11434") {
+                              setAiDraftBaseUrl("");
+                              setAiDraftAllowedOrigins("");
+                            }
                             setAiDraftApiKeyEnv("");
                           } else if (next === "anthropic" && aiDraftBoundary === "local") {
                             setAiDraftBoundary("remote");
@@ -2366,77 +2461,154 @@ function ConnectionModal({
                           }
                         }}
                       >
-                        <option value="openai_compatible">openai_compatible (Ollama / OpenAI / vLLM)</option>
+                        <option value="openai_compatible">openai_compatible (Ollama / OpenAI / OpenRouter / vLLM)</option>
                         <option value="anthropic">anthropic (Claude Messages API)</option>
-                        <option value="manus">manus (MANUS_API_URL / MANUS_API_KEY)</option>
+                        <option value="manus">manus (Manus API / Custom HTTPS)</option>
                       </select>
                     </label>
 
-                    {aiDraftProvider !== "manus" && (
-                      <>
-                        <label className="modal-field">
-                          <span>Data Boundary</span>
-                          <select
-                            value={aiDraftBoundary}
-                            onChange={(e) => setAiDraftBoundary(e.target.value === "local" ? "local" : "remote")}
-                          >
-                            <option value="local">local (Loopback 127.0.0.1 / localhost เท่านั้น)</option>
-                            <option value="remote">remote (HTTPS External API)</option>
-                          </select>
-                        </label>
-
-                        <label className="modal-field">
-                          <span>Base URL ({aiDraftBoundary === "local" ? "loopback" : "https://..."})</span>
-                          <input
-                            type="url"
-                            value={aiDraftBaseUrl}
-                            onChange={(e) => setAiDraftBaseUrl(e.target.value)}
-                            placeholder={aiDraftBoundary === "local" ? "เช่น http://127.0.0.1:11434 (ว่าง = ค่า Ollama เริ่มต้น)" : "เช่น https://api.openai.com"}
-                          />
-                        </label>
-
-                        <label className="modal-field">
-                          <span>Allowed Origins (คั่นด้วย comma, ไม่มี / ปิดท้าย)</span>
-                          <input
-                            type="text"
-                            value={aiDraftAllowedOrigins}
-                            onChange={(e) => setAiDraftAllowedOrigins(e.target.value)}
-                            placeholder="เช่น http://127.0.0.1:11434"
-                          />
-                        </label>
-                      </>
-                    )}
-                  </div>
-
-                  {aiDraftProvider !== "manus" && (
                     <label className="modal-field">
-                      <span>API Key ENV Var Name (ใส่ชื่อตัวแปร ENV เช่น OPENAI_API_KEY — ระบบไม่รับและไม่บันทึก Secret จริง)</span>
+                      <span>Data Boundary</span>
+                      <select
+                        value={aiDraftProvider === "manus" ? "remote" : aiDraftBoundary}
+                        disabled={aiDraftProvider === "manus"}
+                        onChange={(e) => setAiDraftBoundary(e.target.value === "local" ? "local" : "remote")}
+                      >
+                        <option value="local">local (Loopback 127.0.0.1 / localhost เท่านั้น)</option>
+                        <option value="remote">remote (HTTPS External API)</option>
+                      </select>
+                    </label>
+
+                    <label className="modal-field">
+                      <span>
+                        Base URL ({aiDraftProvider === "manus" || aiDraftBoundary === "remote" ? "https://..." : "loopback"})
+                      </span>
                       <input
-                        type="text"
-                        value={aiDraftApiKeyEnv}
-                        onChange={(e) => setAiDraftApiKeyEnv(e.target.value)}
-                        placeholder={aiDraftProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "เว้นว่างสำหรับ Ollama หรือใส่ OPENAI_API_KEY"}
+                        type="url"
+                        value={aiDraftBaseUrl}
+                        onChange={(e) => {
+                          const nextUrl = e.target.value;
+                          const prevOrigin = normalizeOriginToken(aiDraftBaseUrl);
+                          const nextOrigin = normalizeOriginToken(nextUrl);
+                          setAiDraftBaseUrl(nextUrl);
+                          if (nextOrigin && (!aiDraftAllowedOrigins.trim() || aiDraftAllowedOrigins.trim() === prevOrigin)) {
+                            setAiDraftAllowedOrigins(nextOrigin);
+                          }
+                        }}
+                        placeholder={
+                          aiDraftProvider === "manus"
+                            ? "เช่น https://api.manus.im (หรือเว้นว่างเพื่อใช้ MANUS_API_URL)"
+                            : aiDraftBoundary === "local"
+                              ? "เช่น http://127.0.0.1:11434 (ว่าง = ค่า Ollama เริ่มต้น)"
+                              : "เช่น https://api.openai.com"
+                        }
                       />
                     </label>
-                  )}
 
-                  {aiDraftProvider === "manus" ? (
-                    <span className={`ai-env-pill ${aiConfig?.manus_env_set ? "env-ok" : "env-missing"}`}>
-                      {aiConfig?.manus_env_set
-                        ? "ENV READY: MANUS_API_URL + MANUS_API_KEY พร้อมใช้ (อ่านจาก Backend ENV อัตโนมัติ)"
-                        : "ENV MISSING: ตั้ง MANUS_API_URL และ MANUS_API_KEY ใน shell ก่อนเริ่ม backend"}
-                    </span>
-                  ) : cleanEnvTrimmed ? (
-                    <span className={`ai-env-pill ${savedEnvMatches && aiConfig?.api_key_env_set ? "env-ok" : "env-missing"}`}>
-                      {savedEnvMatches
-                        ? aiConfig?.api_key_env_set
-                          ? `ENV READY: พบค่า $${cleanEnvTrimmed} ใน Backend`
-                          : `ENV MISSING: ยังไม่พบ $${cleanEnvTrimmed} ใน shell ของ Backend`
-                        : `กด Save AI Config เพื่อตรวจ ENV $${cleanEnvTrimmed}`}
-                    </span>
-                  ) : (
-                    <span className="ai-env-pill env-neutral">ไม่ระบุ API Key ENV (เหมาะสำหรับ Local Ollama ที่ไม่ต้องใช้ token)</span>
-                  )}
+                    <label className="modal-field">
+                      <span>Allowed Origins (คั่นด้วย comma, ไม่มี / ปิดท้าย)</span>
+                      <input
+                        type="text"
+                        value={aiDraftAllowedOrigins}
+                        onChange={(e) => setAiDraftAllowedOrigins(e.target.value)}
+                        placeholder={aiDraftProvider === "manus" ? "เช่น https://api.manus.im" : "เช่น http://127.0.0.1:11434"}
+                      />
+                    </label>
+                  </div>
+
+                  <div className="api-key-box">
+                    <div className="api-key-head">
+                      <span>API Key ({aiDraftProvider})</span>
+                      <small>เก็บเฉพาะใน RAM ของ Backend (loopback) · ไม่บันทึกลงดิสก์และไม่ส่งกลับ UI</small>
+                    </div>
+                    <div className="api-key-row">
+                      <div className="api-key-input-wrap">
+                        <input
+                          type={showApiKey ? "text" : "password"}
+                          autoComplete="new-password"
+                          spellCheck={false}
+                          value={aiDraftApiKey}
+                          onChange={(e) => setAiDraftApiKey(e.target.value)}
+                          placeholder={
+                            runtimeKeyActive
+                              ? "มี Key อยู่ใน RAM แล้ว — วาง Key ใหม่เพื่ออัปเดต หรือกดล้าง Key"
+                              : aiDraftProvider === "manus"
+                                ? "วาง Manus API Key ที่นี่ (หรือตั้ง MANUS_API_KEY ใน shell)"
+                                : aiDraftProvider === "anthropic"
+                                  ? "วาง Anthropic API Key (sk-ant-...)"
+                                  : "วาง API Key (เช่น sk-... หรือเว้นว่างสำหรับ Local Ollama)"
+                          }
+                        />
+                        <button
+                          type="button"
+                          className="api-key-toggle"
+                          onClick={() => setShowApiKey((prev) => !prev)}
+                          aria-label={showApiKey ? "ซ่อน API Key" : "แสดง API Key"}
+                        >
+                          {showApiKey ? "ซ่อน" : "แสดง"}
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary-button tiny-btn"
+                        disabled={savingApiKey || aiDraftApiKey.trim().length < 4}
+                        onClick={() => void handleSaveApiKeyClick()}
+                      >
+                        <Icon name="check" size={13} /> {savingApiKey ? "Saving..." : "บันทึก Key"}
+                      </button>
+                      {runtimeKeyActive && (
+                        <button
+                          type="button"
+                          className="secondary-button tiny-btn"
+                          disabled={savingApiKey}
+                          onClick={() => void handleClearApiKeyClick()}
+                        >
+                          ล้าง Key
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="api-key-status-row">
+                      {runtimeKeyActive ? (
+                        <span className="ai-env-pill env-ok">
+                          RAM KEY READY{runtimeKeyFingerprint ? ` (fp: ${runtimeKeyFingerprint})` : ""} · พร้อมใช้กับ {aiDraftProvider}
+                        </span>
+                      ) : aiDraftProvider === "manus" ? (
+                        <span className={`ai-env-pill ${aiConfig?.manus_env_set ? "env-ok" : "env-missing"}`}>
+                          {aiConfig?.manus_env_set
+                            ? "ENV READY: MANUS_API_URL + MANUS_API_KEY พร้อมใช้จาก Backend ENV"
+                            : "ยังไม่ได้ใส่ API Key — วาง Key ด้านบนได้เลย หรือตั้ง MANUS_API_URL / MANUS_API_KEY ใน shell"}
+                        </span>
+                      ) : cleanEnvTrimmed ? (
+                        <span className={`ai-env-pill ${savedEnvMatches && aiConfig?.api_key_env_set ? "env-ok" : "env-missing"}`}>
+                          {savedEnvMatches
+                            ? aiConfig?.api_key_env_set
+                              ? `ENV READY: พบค่า $${cleanEnvTrimmed} ใน Backend`
+                              : `ENV MISSING: ยังไม่พบ $${cleanEnvTrimmed} — วาง Key ด้านบนเพื่อใช้งานทันทีได้เลย`
+                            : `กด Save AI Config เพื่อตรวจ ENV $${cleanEnvTrimmed} หรือวาง Key ด้านบน`}
+                        </span>
+                      ) : aiDraftBoundary === "local" && aiDraftProvider === "openai_compatible" ? (
+                        <span className="ai-env-pill env-neutral">Local Ollama ไม่ต้องใช้ API Key (หรือวาง Key ได้หาก endpoint ต้องการ)</span>
+                      ) : (
+                        <span className="ai-env-pill env-missing">ยังไม่ได้ใส่ API Key — วาง Key ด้านบนได้เลย (กด Probe หรือ Save จะบันทึก Key ให้อัตโนมัติ)</span>
+                      )}
+                    </div>
+
+                    {aiDraftProvider !== "manus" && (
+                      <details className="ai-advanced-details">
+                        <summary>ตัวเลือกขั้นสูง: อ้างอิงชื่อตัวแปร ENV แทนการวาง Key ({cleanEnvTrimmed || "ไม่ได้ระบุ"})</summary>
+                        <label className="modal-field">
+                          <span>API Key ENV Var Name (ใส่เฉพาะชื่อตัวแปร เช่น OPENAI_API_KEY)</span>
+                          <input
+                            type="text"
+                            value={aiDraftApiKeyEnv}
+                            onChange={(e) => setAiDraftApiKeyEnv(e.target.value)}
+                            placeholder={aiDraftProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "เว้นว่างสำหรับ Ollama หรือใส่ OPENAI_API_KEY"}
+                          />
+                        </label>
+                      </details>
+                    )}
+                  </div>
 
                   <div className="model-probe-row">
                     <label className="modal-field">

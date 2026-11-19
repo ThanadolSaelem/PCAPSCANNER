@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -27,6 +27,7 @@ from .config import AIConfig, AppSettings, load_settings
 from .batch_upload import BatchUploadError, stage_batch_upload
 from .models import (
     AIConfigUpdateRequest,
+    AICredentialUpdateRequest,
     AIModelProbeRequest,
     AIResult,
     BatchResponse,
@@ -71,7 +72,13 @@ from .exporters.csv_json import export_findings_and_evidence_csv
 from .exporters.cef import export_findings_cef
 from .exporters.navigator import export_attack_navigator_layer
 from .exporters.pdf_report import export_snapshot_pdf
-from .llm import generate_chat_completion, probe_models
+from .llm import (
+    clear_runtime_api_key,
+    generate_chat_completion,
+    probe_models,
+    runtime_api_key_status,
+    set_runtime_api_key,
+)
 from .llm.chat import ChatLimits, answer_question
 from .stix_export import export_stix_bundle
 from .osint_service import OSINTService, extract_ioc_candidates, MAX_IOCS_PER_OPERATION
@@ -1630,19 +1637,54 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     def _ai_config_payload(cfg_now: AppSettings) -> dict[str, object]:
         api_key_env = cfg_now.ai.api_key_env
+        rt_status = runtime_api_key_status()
+        cur_provider = cfg_now.ai.provider.value if hasattr(cfg_now.ai.provider, "value") else str(cfg_now.ai.provider)
+        cur_rt = rt_status.get(cur_provider, {"configured": False, "key_fingerprint": None})
+        manus_env_set = bool(os.environ.get("MANUS_API_URL") and os.environ.get("MANUS_API_KEY"))
+        manus_ready = bool(
+            (cfg_now.ai.base_url or os.environ.get("MANUS_API_URL"))
+            and (rt_status.get("manus", {}).get("configured") or os.environ.get("MANUS_API_KEY"))
+        )
         return {
             "configuration": cfg_now.ai.model_dump(mode="json"),
             "triage": cfg_now.triage.model_dump(mode="json"),
             "policy_hash": profile_hash(cfg_now),
             "editable": "loopback_nonsecret_runtime_and_env",
             "api_key_env_set": bool(api_key_env and os.environ.get(api_key_env)),
-            "manus_env_set": bool(os.environ.get("MANUS_API_URL") and os.environ.get("MANUS_API_KEY")),
+            "manus_env_set": manus_env_set,
+            "manus_ready": manus_ready,
+            "runtime_key_set": bool(cur_rt["configured"]),
+            "runtime_key_fingerprint": cur_rt["key_fingerprint"],
+            "runtime_keys": {k: bool(v["configured"]) for k, v in rt_status.items()},
+            "runtime_key_fingerprints": {k: v["key_fingerprint"] for k, v in rt_status.items()},
         }
 
     @app.get("/api/v1/ai/config", tags=["AI"])
     def ai_config():
         # AIConfig stores only secret ENV references, never values.
         return _ai_config_payload(_cfg())
+
+    @app.put("/api/v1/ai/credentials", tags=["AI"])
+    def set_ai_credentials(body: AICredentialUpdateRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_credentials_loopback_only")
+        try:
+            meta = set_runtime_api_key(body.provider, body.api_key)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return {**meta, **_ai_config_payload(_cfg())}
+
+    @app.delete("/api/v1/ai/credentials", tags=["AI"])
+    def delete_ai_credentials(
+        request: Request,
+        provider: Annotated[Literal["openai_compatible", "anthropic", "manus"], Query()],
+    ):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_credentials_loopback_only")
+        cleared = clear_runtime_api_key(provider)
+        return {"provider": provider, "cleared": cleared, **_ai_config_payload(_cfg())}
 
     @app.put("/api/v1/ai/config", tags=["AI"])
     def update_ai_config(body: AIConfigUpdateRequest, request: Request):

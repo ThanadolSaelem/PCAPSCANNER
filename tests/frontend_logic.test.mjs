@@ -1244,6 +1244,48 @@ test("buildTimelineBucketDetails maps UTC HH:MM:SS.fff packets, midnight rollove
   assert.equal(rolloverBuckets[5].targetPacketNo, 100);
 });
 
+test("PcapApiClient setAiCredentials and clearAiCredentials call loopback /api/v1/ai/credentials cleanly", async () => {
+  const seen = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    seen.push({ url: String(url), method: init.method ?? "GET", body: init.body ? String(init.body) : "" });
+    return new Response(
+      JSON.stringify({
+        configuration: {
+          schema_version: "1.0",
+          enabled: true,
+          provider: "manus",
+          base_url: "https://api.manus.im",
+          allowed_origins: ["https://api.manus.im"],
+          model: "manus-1",
+          api_key_env: null,
+          data_boundary: "remote",
+          timeout_seconds: 30,
+          input_max_bytes: 100000,
+          max_output_tokens: 2048,
+          context_window_tokens: 16384,
+        },
+        policy_hash: "h1",
+        editable: "loopback_nonsecret_runtime_and_env",
+        runtime_key_set: init.method === "PUT",
+        runtime_keys: { manus: init.method === "PUT", openai_compatible: false, anthropic: false },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+  try {
+    const client = new PcapApiClient("http://127.0.0.1:8000", "tok123");
+    const saved = await client.setAiCredentials("manus", "sk-test-key-123456");
+    assert.equal(saved.runtime_key_set, true);
+    assert.equal(seen[0].url, "http://127.0.0.1:8000/api/v1/ai/credentials");
+    assert.equal(seen[0].method, "PUT");
+    assert.deepEqual(JSON.parse(seen[0].body), { provider: "manus", api_key: "sk-test-key-123456" });
 
-
-
+    const cleared = await client.clearAiCredentials("manus");
+    assert.equal(cleared.runtime_key_set, false);
+    assert.equal(seen[1].url, "http://127.0.0.1:8000/api/v1/ai/credentials?provider=manus");
+    assert.equal(seen[1].method, "DELETE");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

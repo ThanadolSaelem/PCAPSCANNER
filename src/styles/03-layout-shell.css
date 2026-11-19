@@ -242,17 +242,18 @@ button:disabled { opacity: .55; cursor: not-allowed; }
   position: sticky;
   z-index: 20;
   top: 0;
-  height: 58px;
+  min-height: 58px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 0 28px;
+  gap: 10px 16px;
+  padding: 8px 28px;
   border-bottom: 1px solid rgba(41, 56, 71, .9);
   background: rgba(16, 23, 32, .88);
   backdrop-filter: blur(14px);
 }
-.topbar-left, .topbar-right { display: flex; align-items: center; gap: 13px; }
+.topbar-left, .topbar-right { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; }
 .crumb { display: flex; align-items: center; gap: 9px; color: #6d8090; font-size: 10px; }
 .crumb strong { color: #cbd7df; font-weight: 600; }
 .crumb svg { color: #586b7a; }
@@ -325,12 +326,12 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .top-search { border-color: #293846; }
 .top-avatar { width: 26px; height: 26px; color: #bad0df; background: #233545; }
 
-.main-content { width: min(1510px, 100%); margin: 0 auto; padding: 18px 28px 28px; }
-.page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.main-content { width: min(1510px, 100%); margin: 0 auto; padding: 22px 28px 34px; }
+.page-heading { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 14px 20px; margin-bottom: 20px; }
 .eyebrow, .section-kicker { color: #7990a0; font-size: 9px; font-weight: 700; letter-spacing: .13em; }
 .page-heading h1 { margin: 4px 0 3px; color: #e5edf3; font-size: clamp(21px, 2vw, 26px); font-weight: 600; letter-spacing: -.03em; line-height: 1.25; }
 .page-heading p { max-width: 720px; color: #889aa8; font-size: 11px; }
-.heading-actions { display: flex; align-items: center; gap: 8px; }
+.heading-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 
 .footer-note { display: flex; justify-content: space-between; gap: 12px; padding: 18px 1px 4px; color: #586b7a; font-size: 8px; letter-spacing: .03em; }
 .mobile-backdrop { display: none; }

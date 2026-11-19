@@ -494,6 +494,13 @@ class AIConfigUpdateRequest(Contract):
         return self
 
 
+class AICredentialUpdateRequest(Contract):
+    """Loopback-only in-memory API key registration (never persisted to disk or echoed)."""
+
+    provider: Literal["openai_compatible", "anthropic", "manus"]
+    api_key: str = Field(min_length=4, max_length=4096)
+
+
 class AIModelProbeRequest(Contract):
     """Non-secret endpoint parameters for probing available provider models."""
 

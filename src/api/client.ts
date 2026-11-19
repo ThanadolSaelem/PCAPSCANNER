@@ -179,6 +179,11 @@ export interface AIConfigResponse {
   editable: string;
   api_key_env_set?: boolean;
   manus_env_set?: boolean;
+  manus_ready?: boolean;
+  runtime_key_set?: boolean;
+  runtime_key_fingerprint?: string | null;
+  runtime_keys?: Record<string, boolean>;
+  runtime_key_fingerprints?: Record<string, string | null>;
 }
 
 export interface AIConfigUpdatePayload {
@@ -826,6 +831,21 @@ export class PcapApiClient {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+  }
+
+  setAiCredentials(provider: AIProviderName, apiKey: string): Promise<AIConfigResponse> {
+    return this.requestJson<AIConfigResponse>("/api/v1/ai/credentials", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, api_key: apiKey }),
+    });
+  }
+
+  clearAiCredentials(provider: AIProviderName): Promise<AIConfigResponse> {
+    return this.requestJson<AIConfigResponse>(
+      `/api/v1/ai/credentials?provider=${encodeURIComponent(provider)}`,
+      { method: "DELETE" },
+    );
   }
 
   probeAiModels(payload: AIModelProbePayload = {}): Promise<AIModelsResponse> {

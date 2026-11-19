@@ -9,7 +9,7 @@
   transition: border-color .22s var(--ease);
 }
 
-.panel-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+.panel-title { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 14px; margin-bottom: 15px; }
 .panel-title h2 { color: #dce6ec; font-size: 12px; font-weight: 600; }
 .panel-title p { margin-top: 2px; color: #7d909f; font-size: 9px; }
 .panel-title .icon-button { margin-top: -4px; }
@@ -118,9 +118,10 @@
 /* Interactive Capture Context Action Bar (replaces passive status banner) */
 .capture-context-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: stretch;
-  gap: 8px;
-  margin-bottom: 18px;
+  gap: 10px;
+  margin-bottom: 20px;
   animation: rise .32s var(--ease) backwards;
 }
 .capture-context-trigger {

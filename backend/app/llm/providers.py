@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +34,66 @@ from ..models import AIResult, AISummary, EvidenceBundle
 MAX_RESPONSE_BYTES = 1024 * 1024
 PROMPT_VERSION = "2.0"
 AIState = Literal["disabled", "completed", "unavailable", "refused", "invalid_output", "budget_exceeded", "cancelled"]
+
+_RUNTIME_API_KEYS_LOCK = threading.Lock()
+_RUNTIME_API_KEYS: dict[str, str] = {}
+_VALID_PROVIDERS = frozenset(p.value for p in ProviderName)
+
+
+def _clean_runtime_api_key(raw: str | None) -> str | None:
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if len(cleaned) < 4 or len(cleaned) > 4096:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        return None
+    return cleaned
+
+
+def set_runtime_api_key(provider: str, api_key: str) -> dict[str, Any]:
+    """Store a provider API key strictly in process RAM without persisting or echoing secrets."""
+    if provider not in _VALID_PROVIDERS:
+        raise ValueError("unsupported_ai_provider")
+    cleaned = _clean_runtime_api_key(api_key)
+    if cleaned is None:
+        raise ValueError("invalid_api_key_format")
+    fingerprint = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12]
+    with _RUNTIME_API_KEYS_LOCK:
+        _RUNTIME_API_KEYS[provider] = cleaned
+    return {
+        "provider": provider,
+        "configured": True,
+        "source": "runtime",
+        "key_fingerprint": fingerprint,
+    }
+
+
+def clear_runtime_api_key(provider: str) -> bool:
+    """Remove an in-memory provider API key."""
+    if provider not in _VALID_PROVIDERS:
+        raise ValueError("unsupported_ai_provider")
+    with _RUNTIME_API_KEYS_LOCK:
+        return _RUNTIME_API_KEYS.pop(provider, None) is not None
+
+
+def get_runtime_api_key(provider: str) -> str | None:
+    with _RUNTIME_API_KEYS_LOCK:
+        return _RUNTIME_API_KEYS.get(provider)
+
+
+def runtime_api_key_status() -> dict[str, dict[str, Any]]:
+    """Return non-secret presence and SHA-256 fingerprint metadata for all AI providers."""
+    with _RUNTIME_API_KEYS_LOCK:
+        snapshot = dict(_RUNTIME_API_KEYS)
+    out: dict[str, dict[str, Any]] = {}
+    for provider in sorted(_VALID_PROVIDERS):
+        val = snapshot.get(provider)
+        out[provider] = {
+            "configured": bool(val),
+            "key_fingerprint": hashlib.sha256(val.encode("utf-8")).hexdigest()[:12] if val else None,
+        }
+    return out
 
 # Only these structured values may leave the process from evidence attributes.
 _IDENTIFIER_KEYS = {
@@ -345,10 +406,21 @@ def _base_url(config: AIConfig) -> str:
             raise _RequestFailure("config_base_url_required")
         return config.base_url
     # Manus intentionally never falls back to a sandbox/OpenAI key or URL.
-    value = os.environ.get("MANUS_API_URL")
+    value = config.base_url or os.environ.get("MANUS_API_URL")
     if not value:
         raise _RequestFailure("provider_endpoint_missing")
     return value
+
+
+def _resolve_provider_api_key(provider: str, config: AIConfig) -> str:
+    runtime_key = get_runtime_api_key(provider)
+    if runtime_key:
+        return runtime_key
+    if provider == ProviderName.MANUS.value:
+        return os.environ.get("MANUS_API_KEY", "")
+    if config.api_key_env:
+        return os.environ.get(config.api_key_env, "")
+    return ""
 
 
 def _append_path(base: str, suffix: str) -> str:
@@ -384,7 +456,7 @@ def _runtime(settings: AppSettings, *, require_model: bool = True) -> _Runtime:
     headers = {"accept": "application/json", "content-type": "application/json"}
     if provider == ProviderName.ANTHROPIC.value:
         endpoint = _append_path(base, "/v1/messages")
-        key = os.environ.get(config.api_key_env, "") if config.api_key_env else ""
+        key = _resolve_provider_api_key(provider, config)
         if not key:
             raise _RequestFailure("provider_credentials_missing")
         headers["x-api-key"] = key
@@ -392,16 +464,15 @@ def _runtime(settings: AppSettings, *, require_model: bool = True) -> _Runtime:
         route = "anthropic"
     else:
         endpoint = _append_path(base, "/v1/chat/completions")
+        key = _resolve_provider_api_key(provider, config)
         if provider == ProviderName.MANUS.value:
-            key = os.environ.get("MANUS_API_KEY", "")
             if not key:
                 raise _RequestFailure("provider_credentials_missing")
+            headers["authorization"] = f"Bearer {key}"
+        elif key:
             headers["authorization"] = f"Bearer {key}"
         elif config.api_key_env:
-            key = os.environ.get(config.api_key_env, "")
-            if not key:
-                raise _RequestFailure("provider_credentials_missing")
-            headers["authorization"] = f"Bearer {key}"
+            raise _RequestFailure("provider_credentials_missing")
         route = "chat"
     return _Runtime(provider=provider, model=model or "", endpoint=endpoint, headers=headers, route=route)
 
@@ -1042,4 +1113,13 @@ async def list_models(
     return items
 
 
-__all__ = ["generate_chat_completion", "generate_summary", "list_models", "probe_models"]
+__all__ = [
+    "clear_runtime_api_key",
+    "generate_chat_completion",
+    "generate_summary",
+    "get_runtime_api_key",
+    "list_models",
+    "probe_models",
+    "runtime_api_key_status",
+    "set_runtime_api_key",
+]
