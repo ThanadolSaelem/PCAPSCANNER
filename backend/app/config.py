@@ -163,6 +163,21 @@ class AIConfig(BaseModel):
     response_mode: ResponseMode = "json_schema"
     temperature: float | None = Field(default=None, ge=0, le=2)
     anthropic_version: str = Field(default="2023-06-01", min_length=1, max_length=64)
+    # Non-secret catalog card id (see backend/app/llm/catalog.py).  It drives UI
+    # presets and selects a dedicated in-memory credential slot; it never
+    # relaxes the origin/boundary policy below.
+    preset: str | None = Field(default=None, max_length=48)
+
+    @field_validator("preset")
+    @classmethod
+    def known_preset(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from .llm.catalog import PRESET_ID_RE, is_known_preset
+
+        if not PRESET_ID_RE.fullmatch(value) or not is_known_preset(value):
+            raise ValueError("unknown_ai_preset")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -207,6 +222,13 @@ class AIConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_policy(self) -> "AIConfig":
+        if self.preset is not None:
+            from .llm.catalog import get_preset
+
+            preset_meta = get_preset(self.preset)
+            provider_value = self.provider.value if isinstance(self.provider, ProviderName) else str(self.provider)
+            if preset_meta is None or preset_meta["protocol"] != provider_value:
+                raise ValueError("preset_protocol_mismatch")
         if self.base_url is not None:
             _validate_endpoint(self.base_url, data_boundary=self.data_boundary)
         if not self.enabled:
@@ -540,6 +562,7 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_AI_RESPONSE_MODE": ("response_mode", "str"),
         "PCAP_AI_TEMPERATURE": ("temperature", "float"),
         "PCAP_AI_ANTHROPIC_VERSION": ("anthropic_version", "str"),
+        "PCAP_AI_PRESET": ("preset", "str"),
     }
     # Double-underscore names are accepted as a conventional nested alias too.
     for env_name, (field_name, kind) in ai_map.items():

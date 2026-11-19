@@ -154,6 +154,42 @@ export interface NativePickResponse {
 
 export type AIProviderName = "openai_compatible" | "anthropic" | "manus";
 
+export type AIPresetCategory = "local" | "cloud" | "agent" | "custom";
+
+/** Non-secret provider card from the backend catalog (`GET /api/v1/ai/providers`). */
+export interface AIProviderPreset {
+  id: string;
+  label: string;
+  initials: string;
+  accent: string;
+  category: AIPresetCategory;
+  protocol: AIProviderName;
+  tagline: string;
+  base_url: string | null;
+  allowed_origins: string[];
+  data_boundary: "local" | "remote";
+  api_key_env: string | null;
+  key_required: boolean;
+  key_placeholder: string;
+  model_label: string;
+  default_model: string | null;
+  model_suggestions: string[];
+  supports_discovery: boolean;
+  token_parameter: "max_tokens" | "max_completion_tokens";
+  response_mode: "json_schema" | "json_object" | "text";
+  timeout_seconds: number;
+  base_url_editable: boolean;
+  docs_url: string | null;
+  runtime_key_set?: boolean;
+  runtime_key_fingerprint?: string | null;
+  env_key_set?: boolean;
+}
+
+export interface AIProvidersResponse {
+  schema_version: string;
+  items: AIProviderPreset[];
+}
+
 export interface AIConfigResponse {
   configuration: {
     schema_version: string;
@@ -173,7 +209,10 @@ export interface AIConfigResponse {
     response_mode?: "json_schema" | "json_object" | "text";
     temperature?: number | null;
     anthropic_version?: string;
+    preset?: string | null;
   };
+  active_preset?: string | null;
+  credential_slot?: string;
   triage?: TriageConfigInfo;
   policy_hash: string;
   editable: string;
@@ -203,10 +242,12 @@ export interface AIConfigUpdatePayload {
   response_mode?: "json_schema" | "json_object" | "text";
   temperature?: number | null;
   anthropic_version?: string;
+  preset?: string | null;
 }
 
 export interface AIModelProbePayload {
   provider?: AIProviderName;
+  preset?: string | null;
   base_url?: string | null;
   allowed_origins?: string[];
   api_key_env?: string | null;
@@ -821,6 +862,10 @@ export class PcapApiClient {
     return this.requestJson<AIConfigResponse>("/api/v1/ai/config");
   }
 
+  getAiProviders(): Promise<AIProvidersResponse> {
+    return this.requestJson<AIProvidersResponse>("/api/v1/ai/providers");
+  }
+
   getAiModels(): Promise<AIModelsResponse> {
     return this.requestJson<AIModelsResponse>("/api/v1/ai/models");
   }
@@ -833,7 +878,8 @@ export class PcapApiClient {
     });
   }
 
-  setAiCredentials(provider: AIProviderName, apiKey: string): Promise<AIConfigResponse> {
+  /** `provider` is a credential slot: a wire provider or a catalog preset id. */
+  setAiCredentials(provider: string, apiKey: string): Promise<AIConfigResponse> {
     return this.requestJson<AIConfigResponse>("/api/v1/ai/credentials", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -841,7 +887,7 @@ export class PcapApiClient {
     });
   }
 
-  clearAiCredentials(provider: AIProviderName): Promise<AIConfigResponse> {
+  clearAiCredentials(provider: string): Promise<AIConfigResponse> {
     return this.requestJson<AIConfigResponse>(
       `/api/v1/ai/credentials?provider=${encodeURIComponent(provider)}`,
       { method: "DELETE" },

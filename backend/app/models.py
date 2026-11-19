@@ -486,6 +486,7 @@ class AIConfigUpdateRequest(Contract):
     response_mode: Literal["json_schema", "json_object", "text"] | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     anthropic_version: str | None = Field(default=None, min_length=1, max_length=64)
+    preset: str | None = Field(default=None, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")
 
     @model_validator(mode="after")
     def require_at_least_one_field(self):
@@ -497,7 +498,9 @@ class AIConfigUpdateRequest(Contract):
 class AICredentialUpdateRequest(Contract):
     """Loopback-only in-memory API key registration (never persisted to disk or echoed)."""
 
-    provider: Literal["openai_compatible", "anthropic", "manus"]
+    # Credential slot: a wire provider (openai_compatible/anthropic/manus) or a
+    # catalog preset id (e.g. "openai", "groq").  Unknown slots are rejected.
+    provider: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")
     api_key: str = Field(min_length=4, max_length=4096)
 
 
@@ -511,6 +514,7 @@ class AIModelProbeRequest(Contract):
     data_boundary: Literal["local", "remote"] | None = None
     timeout_seconds: int | None = Field(default=None, ge=1, le=120)
     anthropic_version: str | None = Field(default=None, min_length=1, max_length=64)
+    preset: str | None = Field(default=None, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")
 
 
 class JobsPruneRequest(Contract):

@@ -21,6 +21,16 @@ import {
   inspectCaptureHeaderBytes,
   parseCsvRow,
 } from "../src/utils/localAnalyzer.ts";
+import {
+  FALLBACK_PRESETS,
+  buildProbePayload,
+  buildSavePayload,
+  draftFromPreset,
+  groupPresets,
+  resolveActivePreset,
+  resolveKeyState,
+  validateDraft,
+} from "../src/utils/modelPresets.ts";
 import { PrivacyRedactor } from "../src/utils/privacy.ts";
 import { computeScrollDuration, easeInOutQuint } from "../src/utils/smoothScroll.ts";
 import { buildTimelineBucketDetails, parseComparableTime } from "../src/utils/timelineEvents.ts";
@@ -1327,3 +1337,70 @@ test("resolveLayer2DraftStatus treats Manus default standard profile as ready wi
   assert.match(status.badgeLabel, /manus\/standard/);
 });
 
+
+test("model presets: draft, validation and payloads keep the security policy for every card", () => {
+  const byId = Object.fromEntries(FALLBACK_PRESETS.map((p) => [p.id, p]));
+
+  const openai = draftFromPreset(byId.openai);
+  assert.equal(openai.baseUrl, "https://api.openai.com/v1");
+  assert.equal(openai.model, "gpt-4.1-mini");
+  assert.equal(openai.tokenParameter, "max_completion_tokens");
+  const okOpenai = validateDraft(openai, byId.openai, { requireModel: true });
+  assert.equal(okOpenai.ok, true);
+  const savePayload = buildSavePayload(openai, byId.openai, okOpenai);
+  assert.deepEqual(savePayload.allowed_origins, ["https://api.openai.com"]);
+  assert.equal(savePayload.preset, "openai");
+  assert.equal(savePayload.provider, "openai_compatible");
+  assert.equal(savePayload.data_boundary, "remote");
+  assert.equal("api_key" in savePayload, false);
+  assert.equal(buildProbePayload(openai, byId.openai, okOpenai).preset, "openai");
+
+  // Local cards only accept loopback; remote cards require https.
+  const badLocal = { ...draftFromPreset(byId.ollama), baseUrl: "http://192.168.1.9:11434" };
+  assert.equal(validateDraft(badLocal, byId.ollama, { requireModel: false }).ok, false);
+  const badRemote = { ...draftFromPreset(byId.custom), baseUrl: "http://api.example.com/v1", boundary: "remote" };
+  assert.equal(validateDraft(badRemote, byId.custom, { requireModel: false }).ok, false);
+  const badEnv = { ...openai, apiKeyEnv: "sk-live-secret-value" };
+  assert.equal(validateDraft(badEnv, byId.openai, { requireModel: true }).ok, false);
+
+  // Ollama needs a model name, Manus never does.
+  const ollama = draftFromPreset(byId.ollama);
+  assert.equal(validateDraft(ollama, byId.ollama, { requireModel: true }).ok, false);
+  const manus = draftFromPreset(byId.manus);
+  const okManus = validateDraft(manus, byId.manus, { requireModel: true });
+  assert.equal(okManus.ok, true);
+  assert.equal(okManus.model, "standard");
+
+  // Custom endpoint keeps its own boundary choice.
+  const custom = { ...draftFromPreset(byId.custom), baseUrl: "http://127.0.0.1:8080/v1", boundary: "local", model: "m" };
+  const okCustom = validateDraft(custom, byId.custom, { requireModel: true });
+  assert.equal(okCustom.ok, true);
+  assert.equal(buildSavePayload(custom, byId.custom, okCustom).data_boundary, "local");
+});
+
+test("model presets: legacy configs are mapped to a card and key state is per vendor", () => {
+  const cfg = (over) => ({
+    configuration: {
+      schema_version: "1.0", enabled: true, provider: "openai_compatible", base_url: null, allowed_origins: [],
+      model: "m", api_key_env: null, data_boundary: "local", timeout_seconds: 30, input_max_bytes: 1, max_output_tokens: 1,
+      context_window_tokens: 1, ...over,
+    },
+    policy_hash: "x", editable: "x", runtime_keys: { groq: true }, runtime_key_fingerprints: { groq: "abc123" },
+  });
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({})).id, "ollama");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ base_url: "https://api.openai.com/v1", data_boundary: "remote" })).id, "openai");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ base_url: "https://llm.corp.example/v1", data_boundary: "remote" })).id, "custom");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ provider: "manus" })).id, "manus");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ preset: "openai", base_url: "https://api.openai.com/v1" })).id, "openai");
+
+  const groups = groupPresets(FALLBACK_PRESETS).map((g) => g.category);
+  assert.deepEqual(groups, ["local", "cloud", "agent", "custom"]);
+
+  const groq = { ...FALLBACK_PRESETS.find((p) => p.id === "openai"), id: "groq" };
+  assert.equal(resolveKeyState(groq, cfg({}), null).state, "ready_runtime");
+  assert.equal(resolveKeyState(groq, cfg({}), null).fingerprint, "abc123");
+  const openai = FALLBACK_PRESETS.find((p) => p.id === "openai");
+  assert.equal(resolveKeyState(openai, cfg({}), null).state, "missing");
+  assert.equal(resolveKeyState(openai, cfg({}), { ...openai, env_key_set: true }).state, "ready_env");
+  assert.equal(resolveKeyState(FALLBACK_PRESETS[0], null, null).state, "not_required");
+});

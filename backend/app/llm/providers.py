@@ -29,6 +29,7 @@ from pydantic import ValidationError
 
 from ..config import AIConfig, AppSettings, ProviderName
 from ..models import AIResult, AISummary, EvidenceBundle
+from .catalog import preset_ids
 
 
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -51,6 +52,14 @@ MANUS_AGENT_PROFILES: tuple[dict[str, str], ...] = (
 _RUNTIME_API_KEYS_LOCK = threading.Lock()
 _RUNTIME_API_KEYS: dict[str, str] = {}
 _VALID_PROVIDERS = frozenset(p.value for p in ProviderName)
+# Credential slots: the three wire protocols (legacy, preset-less configs) plus
+# one slot per catalog preset, so a key typed for e.g. Groq is never sent to
+# OpenAI even though both speak the OpenAI-compatible protocol.
+_VALID_CREDENTIAL_SLOTS = _VALID_PROVIDERS | preset_ids()
+
+
+def credential_slot_names() -> frozenset[str]:
+    return _VALID_CREDENTIAL_SLOTS
 
 
 def _clean_runtime_api_key(raw: str | None) -> str | None:
@@ -65,8 +74,11 @@ def _clean_runtime_api_key(raw: str | None) -> str | None:
 
 
 def set_runtime_api_key(provider: str, api_key: str) -> dict[str, Any]:
-    """Store a provider API key strictly in process RAM without persisting or echoing secrets."""
-    if provider not in _VALID_PROVIDERS:
+    """Store a provider API key strictly in process RAM without persisting or echoing secrets.
+
+    ``provider`` is a credential slot: a wire provider name or a catalog preset id.
+    """
+    if provider not in _VALID_CREDENTIAL_SLOTS:
         raise ValueError("unsupported_ai_provider")
     cleaned = _clean_runtime_api_key(api_key)
     if cleaned is None:
@@ -84,7 +96,7 @@ def set_runtime_api_key(provider: str, api_key: str) -> dict[str, Any]:
 
 def clear_runtime_api_key(provider: str) -> bool:
     """Remove an in-memory provider API key."""
-    if provider not in _VALID_PROVIDERS:
+    if provider not in _VALID_CREDENTIAL_SLOTS:
         raise ValueError("unsupported_ai_provider")
     with _RUNTIME_API_KEYS_LOCK:
         return _RUNTIME_API_KEYS.pop(provider, None) is not None
@@ -96,11 +108,11 @@ def get_runtime_api_key(provider: str) -> str | None:
 
 
 def runtime_api_key_status() -> dict[str, dict[str, Any]]:
-    """Return non-secret presence and SHA-256 fingerprint metadata for all AI providers."""
+    """Return non-secret presence and SHA-256 fingerprint metadata for all credential slots."""
     with _RUNTIME_API_KEYS_LOCK:
         snapshot = dict(_RUNTIME_API_KEYS)
     out: dict[str, dict[str, Any]] = {}
-    for provider in sorted(_VALID_PROVIDERS):
+    for provider in sorted(_VALID_CREDENTIAL_SLOTS):
         val = snapshot.get(provider)
         out[provider] = {
             "configured": bool(val),
@@ -425,10 +437,23 @@ def _base_url(config: AIConfig) -> str:
     return config.base_url or os.environ.get("MANUS_API_URL") or MANUS_DEFAULT_BASE_URL
 
 
+def credential_slot_for(config: AIConfig) -> str:
+    """The RAM credential slot used by a config: its catalog preset, else its wire provider."""
+    return config.preset or _provider_text(config)
+
+
 def _resolve_provider_api_key(provider: str, config: AIConfig) -> str:
-    runtime_key = get_runtime_api_key(provider)
+    slot = config.preset or provider
+    runtime_key = get_runtime_api_key(slot)
     if runtime_key:
         return runtime_key
+    # Only fall back to the wire-protocol slot when it denotes the *same* vendor
+    # (anthropic/manus).  A generic openai_compatible key is never reused for a
+    # named vendor preset such as groq or openai.
+    if slot != provider and provider in {ProviderName.ANTHROPIC.value, ProviderName.MANUS.value}:
+        legacy_key = get_runtime_api_key(provider)
+        if legacy_key:
+            return legacy_key
     if provider == ProviderName.MANUS.value:
         return os.environ.get("MANUS_API_KEY", "")
     if config.api_key_env:
@@ -436,11 +461,17 @@ def _resolve_provider_api_key(provider: str, config: AIConfig) -> str:
     return ""
 
 
+# A base URL whose path already ends in an API version (``/v1``, ``/v1beta``)
+# or a vendor's OpenAI-compatibility root (``/openai``) is treated as the API
+# root, exactly like the official OpenAI SDK ``base_url`` semantics.
+_API_ROOT_SUFFIX_RE = re.compile(r"/(?:v\d+(?:alpha|beta)?\d*|openai)$", re.I)
+
+
 def _append_path(base: str, suffix: str) -> str:
     normalized = base.rstrip("/")
     if normalized.endswith(suffix):
         return normalized
-    if suffix.startswith("/v1/") and normalized.endswith("/v1"):
+    if suffix.startswith("/v1/") and _API_ROOT_SUFFIX_RE.search(urlsplit(normalized).path or ""):
         return normalized + suffix[3:]
     return normalized + suffix
 
@@ -1349,6 +1380,8 @@ async def list_models(
 
 __all__ = [
     "clear_runtime_api_key",
+    "credential_slot_for",
+    "credential_slot_names",
     "generate_chat_completion",
     "generate_summary",
     "get_runtime_api_key",

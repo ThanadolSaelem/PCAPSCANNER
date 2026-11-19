@@ -74,7 +74,11 @@ from .exporters.navigator import export_attack_navigator_layer
 from .exporters.pdf_report import export_snapshot_pdf
 from .llm import (
     clear_runtime_api_key,
+    credential_slot_for,
+    credential_slot_names,
     generate_chat_completion,
+    infer_preset,
+    list_presets,
     probe_models,
     runtime_api_key_status,
     set_runtime_api_key,
@@ -1639,7 +1643,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         api_key_env = cfg_now.ai.api_key_env
         rt_status = runtime_api_key_status()
         cur_provider = cfg_now.ai.provider.value if hasattr(cfg_now.ai.provider, "value") else str(cfg_now.ai.provider)
-        cur_rt = rt_status.get(cur_provider, {"configured": False, "key_fingerprint": None})
+        cur_slot = credential_slot_for(cfg_now.ai)
+        cur_rt = rt_status.get(cur_slot, {"configured": False, "key_fingerprint": None})
         manus_env_set = bool(os.environ.get("MANUS_API_KEY"))
         manus_ready = bool(rt_status.get("manus", {}).get("configured") or os.environ.get("MANUS_API_KEY"))
         return {
@@ -1650,16 +1655,70 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "api_key_env_set": bool(api_key_env and os.environ.get(api_key_env)),
             "manus_env_set": manus_env_set,
             "manus_ready": manus_ready,
+            # Catalog card that best describes the active route (explicit preset,
+            # else inferred from provider + base_url origin for legacy configs).
+            "active_preset": cfg_now.ai.preset or infer_preset(cur_provider, cfg_now.ai.base_url),
+            "credential_slot": cur_slot,
             "runtime_key_set": bool(cur_rt["configured"]),
             "runtime_key_fingerprint": cur_rt["key_fingerprint"],
             "runtime_keys": {k: bool(v["configured"]) for k, v in rt_status.items()},
             "runtime_key_fingerprints": {k: v["key_fingerprint"] for k, v in rt_status.items()},
         }
 
+    def _drop_mismatched_preset(data: dict[str, object], fields_set: set[str]) -> None:
+        """Keep a catalog preset (and therefore its RAM key slot) only while it still describes the route.
+
+        A preset is dropped when the wire protocol changes, or when a vendor preset with a fixed
+        endpoint is re-pointed at another origin, so a vendor's key is never replayed elsewhere.
+        """
+        if "preset" in fields_set or not data.get("preset"):
+            return
+        from .llm import get_preset
+
+        meta = get_preset(str(data.get("preset")))
+        provider_value = data.get("provider")
+        provider_text = getattr(provider_value, "value", provider_value)
+        if meta is None or meta["protocol"] != str(provider_text):
+            data["preset"] = None
+            return
+        base_url = data.get("base_url")
+        if (
+            not meta.get("base_url_editable")
+            and meta.get("base_url")
+            and isinstance(base_url, str)
+            and base_url.strip()
+        ):
+            from .config import _origin
+
+            try:
+                if _origin(base_url.strip().rstrip("/")) != _origin(str(meta["base_url"])):
+                    data["preset"] = None
+            except ValueError:
+                data["preset"] = None
+
     @app.get("/api/v1/ai/config", tags=["AI"])
     def ai_config():
         # AIConfig stores only secret ENV references, never values.
         return _ai_config_payload(_cfg())
+
+    @app.get("/api/v1/ai/providers", tags=["AI"])
+    def ai_providers():
+        """Non-secret provider catalog used by the Model Settings UI (LiteLLM-style registry)."""
+        rt_status = runtime_api_key_status()
+        items = []
+        for preset in list_presets():
+            slot = rt_status.get(preset["id"], {"configured": False, "key_fingerprint": None})
+            env_name = preset.get("api_key_env")
+            items.append(
+                {
+                    **preset,
+                    "runtime_key_set": bool(slot["configured"]),
+                    "runtime_key_fingerprint": slot["key_fingerprint"],
+                    "env_key_set": bool(env_name and os.environ.get(env_name))
+                    or (preset["id"] == "manus" and bool(os.environ.get("MANUS_API_KEY"))),
+                }
+            )
+        return {"schema_version": "1.0", "items": items}
 
     @app.put("/api/v1/ai/credentials", tags=["AI"])
     def set_ai_credentials(body: AICredentialUpdateRequest, request: Request):
@@ -1675,11 +1734,13 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     @app.delete("/api/v1/ai/credentials", tags=["AI"])
     def delete_ai_credentials(
         request: Request,
-        provider: Annotated[Literal["openai_compatible", "anthropic", "manus"], Query()],
+        provider: Annotated[str, Query(min_length=1, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")],
     ):
         client_host = request.client.host if request.client else None
         if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
             raise HTTPException(403, "ai_credentials_loopback_only")
+        if provider not in credential_slot_names():
+            raise HTTPException(422, "unsupported_ai_provider")
         cleared = clear_runtime_api_key(provider)
         return {"provider": provider, "cleared": cleared, **_ai_config_payload(_cfg())}
 
@@ -1693,9 +1754,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         next_ai_data = cfg_now.ai.model_dump(mode="python")
         for field_name in body.model_fields_set:
             val = getattr(body, field_name)
-            if field_name in {"base_url", "model", "api_key_env"} and isinstance(val, str):
+            if field_name in {"base_url", "model", "api_key_env", "preset"} and isinstance(val, str):
                 val = val.strip() or None
             next_ai_data[field_name] = val
+        # Switching wire protocol without naming a new preset drops a stale card.
+        _drop_mismatched_preset(next_ai_data, body.model_fields_set)
         if (
             next_ai_data.get("enabled")
             and str(next_ai_data.get("provider")) == "openai_compatible"
@@ -1766,9 +1829,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         probe_data = cfg_now.ai.model_dump(mode="python")
         for field_name in body.model_fields_set:
             val = getattr(body, field_name)
-            if field_name in {"base_url", "api_key_env"} and isinstance(val, str):
+            if field_name in {"base_url", "api_key_env", "preset"} and isinstance(val, str):
                 val = val.strip() or None
             probe_data[field_name] = val
+        _drop_mismatched_preset(probe_data, body.model_fields_set)
         if str(probe_data.get("provider")) == "manus":
             if probe_data.get("base_url") is None and not probe_data.get("allowed_origins"):
                 probe_data["base_url"] = "https://api.manus.ai"

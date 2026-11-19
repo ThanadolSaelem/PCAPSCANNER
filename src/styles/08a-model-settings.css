@@ -1,0 +1,223 @@
+/* Model Settings panel — provider cards, 3-step flow, uncluttered layout.
+   Every row is a wrapping flex/grid with min-width:0 so nothing overlaps. */
+.ms-panel {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid rgba(183, 160, 235, .26);
+  border-radius: 12px;
+  background: rgba(17, 23, 36, .84);
+  min-width: 0;
+}
+.ms-panel * { min-width: 0; overflow-wrap: anywhere; }
+
+.ms-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px 18px;
+}
+.ms-head-text { display: grid; gap: 5px; flex: 1 1 280px; }
+.ms-head-text strong { color: #dce8f0; font-size: 12.5px; line-height: 1.35; }
+.ms-head-text small { color: #8095a4; font-size: 10px; line-height: 1.55; }
+.ms-head-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+.ms-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--ink);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ms-step {
+  display: grid;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid rgba(53, 73, 90, .6);
+  border-radius: 10px;
+  background: rgba(10, 18, 26, .55);
+}
+.ms-step-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  color: #d6e4ed;
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: .01em;
+}
+.ms-step-num {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: #08202a;
+  background: var(--cyan);
+  font-size: 10px;
+  font-weight: 700;
+}
+.ms-hint { margin: 0; color: #8a9fae; font-size: 10px; line-height: 1.55; }
+
+/* Provider cards */
+.ms-groups { display: grid; gap: 14px; }
+.ms-group { display: grid; gap: 8px; }
+.ms-group-label {
+  color: #7f95a6;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.ms-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 10px;
+}
+.ms-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #2f4152;
+  border-radius: 9px;
+  color: var(--ink);
+  background: rgba(20, 31, 43, .78);
+  text-align: left;
+  cursor: pointer;
+  transition: transform .16s var(--ease), border-color .16s, background .16s, box-shadow .16s;
+}
+.ms-card:hover {
+  transform: translateY(-1px);
+  border-color: #4a6479;
+  background: rgba(27, 40, 54, .92);
+}
+.ms-card:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.ms-card-selected {
+  border-color: var(--cyan);
+  background: rgba(50, 189, 209, .1);
+  box-shadow: 0 0 0 1px rgba(50, 189, 209, .35), 0 8px 20px rgba(0, 0, 0, .28);
+}
+.ms-card-logo {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: #fff;
+  background: var(--ms-accent, #4b5563);
+  font: 700 11px var(--mono);
+  letter-spacing: -.02em;
+}
+.ms-card-body { display: grid; gap: 2px; flex: 1 1 auto; padding-right: 14px; }
+.ms-card-name { font-size: 11px; font-weight: 600; line-height: 1.25; }
+.ms-card-meta { color: #8396a5; font-size: 9px; line-height: 1.3; }
+.ms-card-check {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  color: var(--cyan-2);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* Connect step */
+.ms-field-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+.ms-grow { flex: 1 1 240px; }
+.ms-boundary { flex: 0 1 auto; }
+.ms-segmented {
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid #35495a;
+  border-radius: 8px;
+  background: #0e1720;
+}
+.ms-segmented button {
+  min-height: 30px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 6px;
+  color: #93a8b7;
+  background: transparent;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.ms-segmented button.ms-seg-active { color: #08202a; background: var(--cyan); }
+.ms-endpoint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 9px 12px;
+  border: 1px dashed #35495a;
+  border-radius: 8px;
+  background: rgba(14, 23, 32, .7);
+}
+.ms-endpoint-text { flex: 1 1 200px; color: #a9c2d1; font: 10.5px var(--mono); }
+.ms-endpoint-tag { color: #7d93a3; font-size: 9px; }
+.ms-test-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; }
+.ms-doc-link { color: var(--cyan-2); font-size: 10px; text-decoration: none; }
+.ms-doc-link:hover { text-decoration: underline; }
+
+/* Model step */
+.ms-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.ms-chip {
+  padding: 6px 11px;
+  border: 1px solid #35495a;
+  border-radius: 999px;
+  color: #b4c7d4;
+  background: rgba(16, 26, 36, .9);
+  font: 10px var(--mono);
+  cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s, transform .15s var(--ease);
+}
+.ms-chip:hover { border-color: #5a768b; color: #e2ecf2; transform: translateY(-1px); }
+.ms-chip-active { border-color: var(--cyan); color: #dff7fb; background: rgba(50, 189, 209, .16); }
+
+/* Advanced */
+.ms-advanced { padding: 12px 14px; border: 1px solid rgba(53, 73, 90, .5); border-radius: 9px; }
+.ms-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px 14px;
+  margin-top: 12px;
+}
+.ms-advanced-grid .modal-field { margin-top: 0; }
+
+/* Footer */
+.ms-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 18px;
+  padding: 13px 16px;
+  border: 1px solid rgba(53, 73, 90, .55);
+  border-radius: 10px;
+  background: rgba(10, 16, 24, .6);
+}
+.ms-footer-dirty { border-color: rgba(229, 184, 92, .4); background: rgba(229, 184, 92, .06); }
+.ms-summary { display: grid; gap: 3px; flex: 1 1 260px; }
+.ms-summary strong { color: #dce8f0; font-size: 11.5px; }
+.ms-summary span { color: #a5b8c6; font: 10px var(--mono); }
+.ms-summary small { color: #8499a8; font-size: 9.5px; line-height: 1.5; }
+
+@media (max-width: 640px) {
+  .ms-panel { padding: 12px; }
+  .ms-step { padding: 12px; }
+  .ms-cards { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .ms-footer .primary-button { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ms-card, .ms-chip { transition: none; }
+  .ms-card:hover, .ms-chip:hover { transform: none; }
+}
