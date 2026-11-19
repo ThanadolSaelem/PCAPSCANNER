@@ -481,8 +481,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if plan is not None:
                 tier1_cmd, tier1_cwd = plan
+                tier1_token = (
+                    os.environ.get("TIER1_API_TOKEN")
+                    or os.environ.get("PCAP_TIER1_API_TOKEN")
+                    or secrets.token_urlsafe(24)
+                ).strip()
                 tier1_env = os.environ.copy()
                 tier1_env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+                tier1_env["TIER1_API_TOKEN"] = tier1_token
                 print(f"[PCAPSCANNER] Starting Tier-1 classifier service on http://127.0.0.1:{tier1_port} ...")
                 tier1_proc = subprocess.Popen(tier1_cmd, cwd=str(tier1_cwd), env=tier1_env)
                 children.append(("tier1", tier1_proc))
@@ -496,6 +502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     child_env["PCAP_TRIAGE_ENDPOINT_URL"] = f"{origin}/v1/systemone"
                     child_env["PCAP_TRIAGE_ETBERT_ENABLED"] = "1"
                     child_env["PCAP_TRIAGE_ETBERT_ENDPOINT_URL"] = f"{origin}/etbert/score"
+                    child_env["PCAP_TIER1_API_TOKEN"] = tier1_token
                     print("[PCAPSCANNER] Tier-1 ET-BERT + OpenJev service ready.")
                 else:
                     print("[PCAPSCANNER] Tier-1 service did not become ready in time; using built-in calibrated Tier-1 scorer.")

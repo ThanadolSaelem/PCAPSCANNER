@@ -64,7 +64,7 @@ fi
 if [[ "${NEED_BUILD}" -eq 1 ]]; then
   echo "[PCAPSCANNER] Building Web UI bundle (dist/)..."
   if command -v pnpm >/dev/null 2>&1; then
-    [[ -d "${SCRIPT_DIR}/node_modules" ]] || pnpm install --frozen-lockfile || pnpm install
+    [[ -d "${SCRIPT_DIR}/node_modules" ]] || pnpm install --frozen-lockfile
     pnpm build
   elif command -v npm >/dev/null 2>&1; then
     [[ -d "${SCRIPT_DIR}/node_modules" ]] || npm install

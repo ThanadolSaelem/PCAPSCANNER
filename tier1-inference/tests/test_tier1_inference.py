@@ -354,6 +354,11 @@ class FastApiServerAndCliTests(unittest.TestCase):
 
         # Protected endpoints reject missing or invalid bearer tokens
         self.assertEqual(client.post("/classify", json={"items": []}).status_code, 401)
+        self.assertEqual(client.post("/etbert/score", json={"items": []}).status_code, 401)
+        self.assertEqual(
+            client.post("/etbert/score", json={"items": []}, headers={"Authorization": "Bearer wrong"}).status_code,
+            401,
+        )
         self.assertEqual(
             client.post("/v1/systemone", json={"state": "hi"}, headers={"Authorization": "Bearer wrong"}).status_code,
             401,
@@ -641,6 +646,134 @@ class UerToHfConversionTests(unittest.TestCase):
             saved_cfg = json.loads((out_dir / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(saved_cfg["id2label"]["2"], "C2_Beaconing")
             self.assertEqual(saved_cfg["etbert_input_mode"], "bigram")
+
+    def test_convert_uer_checkpoint_fails_closed_when_weights_only_unsupported(self) -> None:
+        from tier1_inference import convert_uer
+
+        class _MiniTensor:
+            def __init__(self, shape: tuple[int, ...]) -> None:
+                self.shape = shape
+
+            def clone(self):
+                return _MiniTensor(self.shape)
+
+            def __getitem__(self, item):
+                if isinstance(item, slice):
+                    start, stop, _ = item.indices(self.shape[0])
+                    return _MiniTensor((max(0, stop - start), *self.shape[1:]))
+                raise TypeError
+
+        raw_uer = {
+            "embedding.word_embedding.weight": _MiniTensor((8, 4)),
+            "embedding.position_embedding.weight": _MiniTensor((16, 4)),
+            "embedding.segment_embedding.weight": _MiniTensor((3, 4)),
+            "embedding.layer_norm.gamma": _MiniTensor((4,)),
+            "embedding.layer_norm.beta": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.linear_layers.0.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.linear_layers.0.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.linear_layers.1.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.linear_layers.1.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.linear_layers.2.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.linear_layers.2.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.self_attn.final_linear.weight": _MiniTensor((4, 4)),
+            "encoder.transformer.0.self_attn.final_linear.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_1.gamma": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_1.beta": _MiniTensor((4,)),
+            "encoder.transformer.0.feed_forward.linear_1.weight": _MiniTensor((16, 4)),
+            "encoder.transformer.0.feed_forward.linear_1.bias": _MiniTensor((16,)),
+            "encoder.transformer.0.feed_forward.linear_2.weight": _MiniTensor((4, 16)),
+            "encoder.transformer.0.feed_forward.linear_2.bias": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_2.gamma": _MiniTensor((4,)),
+            "encoder.transformer.0.layer_norm_2.beta": _MiniTensor((4,)),
+            "output_layer_1.weight": _MiniTensor((4, 4)),
+            "output_layer_1.bias": _MiniTensor((4,)),
+            "output_layer_2.weight": _MiniTensor((3, 4)),
+            "output_layer_2.bias": _MiniTensor((3,)),
+        }
+
+        load_calls: list[dict] = []
+
+        def _legacy_torch_load(_path, **kwargs):
+            load_calls.append(dict(kwargs))
+            if "weights_only" in kwargs:
+                raise TypeError("load() got an unexpected keyword argument 'weights_only'")
+            return raw_uer
+
+        class _FakeBertConfig:
+            def __init__(self, d):
+                self._d = dict(d)
+
+            @classmethod
+            def from_dict(cls, d):
+                return cls(d)
+
+        class _FakeBertModel:
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def load_state_dict(self, _state, strict=True):
+                assert strict
+                return [], []
+
+            def eval(self):
+                return self
+
+            def save_pretrained(self, out_dir):
+                p = Path(out_dir)
+                (p / "config.json").write_text(json.dumps(self.cfg._d), encoding="utf-8")
+                (p / "model.safetensors").write_bytes(b"mock-safetensors")
+
+        fake_torch = types.ModuleType("torch")
+        fake_torch.load = _legacy_torch_load
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.BertConfig = _FakeBertConfig
+        fake_transformers.BertForSequenceClassification = _FakeBertModel
+        fake_transformers.AutoModelForSequenceClassification = _FakeBertModel
+        fake_transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda *_a, **_kw: None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            bin_file = tmp_dir / "legacy.bin"
+            bin_file.write_bytes(b"bin")
+            vocab_file = tmp_dir / "vocab.txt"
+            vocab_file.write_text("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n1603\n", encoding="utf-8")
+            uer_cfg_file = tmp_dir / "cfg.json"
+            uer_cfg_file.write_text(
+                json.dumps({"layers_num": 1, "heads_num": 1, "feedforward_size": 16, "hidden_size": 4}),
+                encoding="utf-8",
+            )
+            out_dir = tmp_dir / "hf-out"
+
+            with mock.patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
+                # Default unsafe_pickle=False MUST fail closed instead of falling back to unsafe pickle.
+                with self.assertRaises(RuntimeError) as ctx:
+                    convert_uer.convert_uer_checkpoint(
+                        bin_path=bin_file,
+                        vocab_path=vocab_file,
+                        output_dir=out_dir,
+                        uer_config_path=uer_cfg_file,
+                        verify=False,
+                        unsafe_pickle=False,
+                    )
+                self.assertIn("weights_only=True", str(ctx.exception))
+                self.assertEqual(len(load_calls), 1)
+                self.assertTrue(load_calls[0].get("weights_only"))
+
+                # Explicit unsafe_pickle=True falls back cleanly on legacy torch.load signatures.
+                load_calls.clear()
+                summary = convert_uer.convert_uer_checkpoint(
+                    bin_path=bin_file,
+                    vocab_path=vocab_file,
+                    output_dir=out_dir,
+                    uer_config_path=uer_cfg_file,
+                    verify=False,
+                    unsafe_pickle=True,
+                )
+                self.assertEqual(summary["num_labels"], 3)
+                self.assertEqual(len(load_calls), 2)
+                self.assertIs(load_calls[0].get("weights_only"), False)
+                self.assertNotIn("weights_only", load_calls[1])
 
 
 if __name__ == "__main__":

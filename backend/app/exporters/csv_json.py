@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any
 
+from .redaction import redact_text
+
 # Spreadsheet formula injection characters (including ASCII & fullwidth equivalents)
 _CSV_FORMULA = re.compile(r"^[\s\x00-\x1f\ufeff]*[=+\-@＝＋－＠]")
 _MAX_EXPORT_ROWS = 100_000
@@ -106,10 +108,12 @@ def export_findings_and_evidence_csv(
     *,
     snapshot: dict[str, Any] | None = None,
     snapshot_id: str | None = None,
+    redact: bool = False,
 ) -> str:
     """Export findings and evidence rows from an EvidenceBundle or dict to formula-safe CSV text."""
     eff_snapshot_id = snapshot_id or (snapshot or {}).get("snapshot_id")
     bundle_dict = bundle.model_dump(mode="json") if hasattr(bundle, "model_dump") else dict(bundle)
+    rx = redact_text if redact else (lambda v: v)
     rows: list[dict[str, Any]] = []
     for f in bundle_dict.get("findings") or []:
         rows.append(
@@ -117,10 +121,10 @@ def export_findings_and_evidence_csv(
                 "record_type": "finding",
                 "snapshot_id": eff_snapshot_id or "",
                 "id": f.get("finding_id", ""),
-                "detector_or_kind": f.get("detector", ""),
+                "detector_or_kind": rx(str(f.get("detector", ""))),
                 "severity": f.get("severity", ""),
                 "confidence": f.get("confidence", ""),
-                "title_or_summary": f.get("title", ""),
+                "title_or_summary": rx(str(f.get("title", ""))),
                 "refs": ",".join(str(x) for x in (f.get("evidence_ids") or [])),
             }
         )
@@ -130,10 +134,10 @@ def export_findings_and_evidence_csv(
                 "record_type": "evidence",
                 "snapshot_id": eff_snapshot_id or "",
                 "id": ev.get("evidence_id", ""),
-                "detector_or_kind": ev.get("kind", ""),
+                "detector_or_kind": rx(str(ev.get("kind", ""))),
                 "severity": "",
                 "confidence": "",
-                "title_or_summary": ev.get("summary", ""),
+                "title_or_summary": rx(str(ev.get("summary", ""))),
                 "refs": ",".join(str(x) for x in (ev.get("packet_refs") or [])),
             }
         )

@@ -10,6 +10,7 @@ import type {
   Tier1Summary,
   WorkspaceConfigState,
 } from "../api/client.ts";
+import { PrivacyRedactor } from "./privacy.ts";
 export type Severity = "critical" | "high" | "medium" | "low";
 
 export type ReportOrigin = "live" | "local-csv" | "empty";
@@ -386,66 +387,79 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
   };
 }
 
-export function exportReportJson(report: WorkspaceReport): string {
+export interface ExportRedactionOptions {
+  redact?: boolean;
+  redactor?: PrivacyRedactor;
+}
+
+function resolveExportReport(report: WorkspaceReport, options?: ExportRedactionOptions): WorkspaceReport {
+  const activeRedactor = options?.redactor ?? (options?.redact ? new PrivacyRedactor(true) : null);
+  if (!activeRedactor || !activeRedactor.isEnabled()) return report;
+  return activeRedactor.redactReport(report);
+}
+
+export function exportReportJson(report: WorkspaceReport, options?: ExportRedactionOptions): string {
+  const src = resolveExportReport(report, options);
   return JSON.stringify(
     {
-      analysis_id: report.analysisId,
-      origin: report.origin,
-      status: report.status,
-      case_id: report.caseId,
-      filename: report.fileName,
-      sha256: report.fullSha,
-      packets_seen: report.packetCapReached ? null : report.packetsSeen,
-      packets_seen_lower_bound: report.packetCapReached ? report.packetsSeen : null,
-      packet_cap_reached: report.packetCapReached,
-      packets_analyzed: report.packetsAnalyzed,
-      triage: report.triage ?? null,
-      findings: report.findings,
-      evidence: report.rawBundle?.evidence ?? report.flows,
-      ai: report.ai ?? null,
-      osint: report.osint ?? null,
-      warnings: report.warnings,
-      disclaimer: report.disclaimer,
+      analysis_id: src.analysisId,
+      origin: src.origin,
+      status: src.status,
+      case_id: src.caseId,
+      filename: src.fileName,
+      sha256: src.fullSha,
+      packets_seen: src.packetCapReached ? null : src.packetsSeen,
+      packets_seen_lower_bound: src.packetCapReached ? src.packetsSeen : null,
+      packet_cap_reached: src.packetCapReached,
+      packets_analyzed: src.packetsAnalyzed,
+      triage: src.triage ?? null,
+      findings: src.findings,
+      evidence: src.rawBundle?.evidence ?? src.flows,
+      ai: src.ai ?? null,
+      osint: src.osint ?? null,
+      warnings: src.warnings,
+      disclaimer: src.disclaimer,
     },
     null,
     2,
   );
 }
 
-export function exportReportMarkdown(report: WorkspaceReport): string {
+export function exportReportMarkdown(report: WorkspaceReport, options?: ExportRedactionOptions): string {
+  const src = resolveExportReport(report, options);
   const lines: string[] = [
-    `# PCAPSCANNER Analysis Report — ${report.caseId}`,
+    `# PCAPSCANNER Analysis Report — ${src.caseId}`,
     ``,
-    `- **Origin**: ${report.origin}`,
-    `- **Status**: ${report.status}`,
-    `- **File**: \`${report.fileName}\` (${report.sizeLabel})`,
-    `- **SHA-256**: \`${report.fullSha}\``,
-    `- **Coverage**: ${packetCoverageSummary(report)}`,
-    `- **Protocol Mix**: ${report.protocolSummary}`,
+    `- **Origin**: ${src.origin}`,
+    `- **Status**: ${src.status}`,
+    `- **File**: \`${src.fileName}\` (${src.sizeLabel})`,
+    `- **SHA-256**: \`${src.fullSha}\``,
+    `- **Coverage**: ${packetCoverageSummary(src)}`,
+    `- **Protocol Mix**: ${src.protocolSummary}`,
     ``,
   ];
 
-  if (report.triage) {
-    const etbertCount = report.triage.etbert_scored_count ?? 0;
+  if (src.triage) {
+    const etbertCount = src.triage.etbert_scored_count ?? 0;
     const etbertLine =
       etbertCount > 0
         ? `- ET-BERT L7 Scored Flows: **${etbertCount}**`
         : `- ET-BERT L7 Scored Flows: **0** (L2/control/WLAN records evaluated via Layer-1 heuristics)`;
     lines.push(
-      `## Tier-1 Calibrated Triage (${report.triage.model})`,
-      `- Evaluated: **${report.triage.total_evaluated}** records`,
-      `- High-Confidence Benign Filtered: **${report.triage.benign_filtered}** (${(report.triage.reduction_ratio * 100).toFixed(1)}% noise reduction)`,
-      `- Escalated / Uncertain: **${report.triage.escalated_count}** (${report.triage.uncertain_count} uncertain, mean PPL=${report.triage.mean_ppl.toFixed(2)})`,
+      `## Tier-1 Calibrated Triage (${src.triage.model})`,
+      `- Evaluated: **${src.triage.total_evaluated}** records`,
+      `- High-Confidence Benign Filtered: **${src.triage.benign_filtered}** (${(src.triage.reduction_ratio * 100).toFixed(1)}% noise reduction)`,
+      `- Escalated / Uncertain: **${src.triage.escalated_count}** (${src.triage.uncertain_count} uncertain, mean PPL=${src.triage.mean_ppl.toFixed(2)})`,
       etbertLine,
       ``,
     );
   }
 
-  lines.push(`## Deterministic Findings (${report.findings.length})`, ``);
-  if (report.findings.length === 0) {
+  lines.push(`## Deterministic Findings (${src.findings.length})`, ``);
+  if (src.findings.length === 0) {
     lines.push(`No deterministic heuristics exceeded thresholds inside the analyzed window.`, ``);
   } else {
-    for (const f of report.findings) {
+    for (const f of src.findings) {
       lines.push(
         `### [${f.severity.toUpperCase()}] ${f.id} — ${f.title}`,
         `- **Confidence**: ${f.confidence}${f.triageClass ? ` · Tier-1: \`${f.triageClass}\` (${((f.triageConfidence ?? 0) * 100).toFixed(1)}%)` : ""}`,
@@ -458,24 +472,24 @@ export function exportReportMarkdown(report: WorkspaceReport): string {
     }
   }
 
-  if (report.ai?.report) {
+  if (src.ai?.report) {
     lines.push(
-      `## AI-Assisted Narrative (Advisory — ${report.ai.model ?? "provider"})`,
+      `## AI-Assisted Narrative (Advisory — ${src.ai.model ?? "provider"})`,
       ``,
     );
-    for (const claim of report.ai.report.summary) {
+    for (const claim of src.ai.report.summary) {
       lines.push(`- ${claim.claim}`, `  - Evidence: ${claim.evidence_ids.map((id) => `\`${id}\``).join(", ")}`);
     }
-    for (const assessment of report.ai.report.assessments) {
+    for (const assessment of src.ai.report.assessments) {
       lines.push(
         `- [${assessment.finding_id}] (${assessment.confidence}) ${assessment.interpretation}`,
         `  - Evidence: ${assessment.evidence_ids.map((id) => `\`${id}\``).join(", ")}`,
       );
     }
-    for (const claim of report.ai.report.limitations) {
+    for (const claim of src.ai.report.limitations) {
       lines.push(`- Limitation: ${claim.claim}`, `  - Evidence: ${claim.evidence_ids.map((id) => `\`${id}\``).join(", ")}`);
     }
-    for (const recommendation of report.ai.report.recommended_actions) {
+    for (const recommendation of src.ai.report.recommended_actions) {
       lines.push(
         `- Recommendation: ${recommendation.action}`,
         `  - Evidence: ${recommendation.evidence_ids.map((id) => `\`${id}\``).join(", ")}`,
@@ -484,16 +498,17 @@ export function exportReportMarkdown(report: WorkspaceReport): string {
     lines.push("");
   }
 
-  lines.push(`## Coverage Gaps & Disclaimer`, ``, `> ${report.disclaimer}`, ``);
-  for (const w of report.warnings) {
+  lines.push(`## Coverage Gaps & Disclaimer`, ``, `> ${src.disclaimer}`, ``);
+  for (const w of src.warnings) {
     lines.push(`- ${w}`);
   }
   return lines.join("\n");
 }
 
-export function exportTriageJsonlFallback(report: WorkspaceReport): string {
-  if (report.rawBundle) {
-    const evList = report.rawBundle.evidence;
+export function exportTriageJsonlFallback(report: WorkspaceReport, options?: ExportRedactionOptions): string {
+  const src = resolveExportReport(report, options);
+  if (src.rawBundle) {
+    const evList = src.rawBundle.evidence;
     return (
       evList
         .map((ev) =>
@@ -509,7 +524,7 @@ export function exportTriageJsonlFallback(report: WorkspaceReport): string {
     );
   }
   return (
-    report.flows
+    src.flows
       .map((flow) =>
         JSON.stringify({
           evidence_id: flow.evidence,

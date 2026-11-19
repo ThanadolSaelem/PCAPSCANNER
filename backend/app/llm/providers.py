@@ -15,6 +15,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -314,7 +315,8 @@ def _build_prompt(bundle: EvidenceBundle, config: AIConfig) -> tuple[str, str, i
         "tokenizer_estimate_note": "Conservative UTF-8-byte input budget, with output and 512-token envelope reserve; exact provider tokenizer is unavailable. No sampling or truncation is permitted.",
     }
     context_bytes = len(_json_bytes(payload))
-    input_budget = max(0, config.context_window_tokens - config.max_output_tokens - 512)
+    input_token_budget = max(0, config.context_window_tokens - config.max_output_tokens - 512)
+    input_budget = input_token_budget * 3
     if context_bytes > config.input_max_bytes or context_bytes > input_budget:
         raise _RequestFailure("budget_exceeded")
     prompt = (
@@ -444,6 +446,49 @@ def _request_body(runtime: _Runtime, config: AIConfig, prompt: str) -> dict[str,
     return body
 
 
+async def _ensure_resolved_host_allowed(url: str, data_boundary: str) -> None:
+    """Resolve hostname via async DNS and enforce boundary/SSRF IP checks before connecting."""
+    parts = urlsplit(url)
+    host = parts.hostname
+    if not host:
+        raise _RequestFailure("forbidden_endpoint")
+    port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        resolved_ips = [ip]
+    else:
+        try:
+            loop = asyncio.get_running_loop()
+            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise _RequestFailure("transport_error", retriable=False) from exc
+        resolved_ips = []
+        for info in infos:
+            sockaddr = info[4]
+            if not sockaddr:
+                continue
+            addr_text = str(sockaddr[0]).split("%", 1)[0]
+            try:
+                resolved_ips.append(ipaddress.ip_address(addr_text))
+            except ValueError:
+                continue
+        if not resolved_ips:
+            raise _RequestFailure("transport_error", retriable=False)
+
+    for resolved in resolved_ips:
+        if isinstance(resolved, ipaddress.IPv6Address) and resolved.ipv4_mapped is not None:
+            resolved = resolved.ipv4_mapped
+        if resolved.is_link_local or resolved.is_multicast or resolved.is_unspecified or resolved.is_reserved:
+            raise _RequestFailure("forbidden_endpoint")
+        if data_boundary == "local" and not resolved.is_loopback:
+            raise _RequestFailure("forbidden_endpoint")
+        if data_boundary == "remote" and (resolved.is_loopback or resolved.is_private):
+            raise _RequestFailure("forbidden_endpoint")
+
+
 async def _read_response(response: httpx.Response, deadline: float) -> bytes:
     chunks: list[bytes] = []
     total = 0
@@ -482,6 +527,8 @@ async def _post_json(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
+    if transport is None:
+        await _ensure_resolved_host_allowed(runtime.endpoint, config.data_boundary)
     deadline = time.monotonic() + config.timeout_seconds
     last_failure: _RequestFailure | None = None
     for attempt in range(config.retries + 1):
@@ -697,7 +744,8 @@ async def generate_summary(
     model = config.model
     prompt_sha256: str | None = None
 
-    input_budget = max(0, config.context_window_tokens - config.max_output_tokens - 512)
+    input_token_budget = max(0, config.context_window_tokens - config.max_output_tokens - 512)
+    input_budget = input_token_budget * 3
     effective_max = min(config.input_max_bytes, input_budget)
     target_bundle = bundle
     context_reduction: dict[str, int | float] | None = None
@@ -871,6 +919,8 @@ async def _get_json_with_status(
     # intentionally separate from summary POST so no model is selected silently.
     deadline = time.monotonic() + config.timeout_seconds
     try:
+        if transport is None:
+            await _ensure_resolved_host_allowed(endpoint, config.data_boundary)
         async with asyncio.timeout(config.timeout_seconds):
             async with httpx.AsyncClient(
                 transport=transport,

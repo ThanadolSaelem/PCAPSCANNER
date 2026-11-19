@@ -257,6 +257,40 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .crumb strong { color: #cbd7df; font-weight: 600; }
 .crumb svg { color: #586b7a; }
 
+.privacy-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 31px;
+  padding: 5px 10px;
+  border: 1px solid #2e4050;
+  border-radius: 7px;
+  color: #9bb1c0;
+  background: rgba(23, 34, 46, .84);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  white-space: nowrap;
+  transition: transform .22s var(--ease), border-color .22s, background .18s, color .18s;
+}
+.privacy-pill:hover {
+  transform: translateY(-1px);
+  border-color: #466176;
+  color: #d7e5ee;
+  background: rgba(31, 45, 59, .92);
+}
+.privacy-pill-on {
+  border-color: rgba(50, 189, 209, .55);
+  color: var(--cyan-2);
+  background: rgba(50, 189, 209, .14);
+  box-shadow: 0 0 0 1px rgba(50, 189, 209, .16);
+}
+.privacy-pill-on:hover {
+  border-color: rgba(116, 216, 228, .75);
+  color: #e6f9fc;
+  background: rgba(50, 189, 209, .22);
+}
+
 .connection-pill {
   display: inline-flex;
   align-items: center;

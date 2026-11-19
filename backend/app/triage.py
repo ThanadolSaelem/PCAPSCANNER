@@ -18,12 +18,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import Request
 
 from .etbert_bridge import (
@@ -32,6 +34,14 @@ from .etbert_bridge import (
     score_with_etbert_local_bin,
 )
 from .http_transport import post_json_bounded
+from .picker import is_loopback_client
+
+
+def _loopback_tier1_token(endpoint_url: str) -> str | None:
+    if not endpoint_url or not is_loopback_client(urlsplit(endpoint_url).hostname):
+        return None
+    token = (os.environ.get("PCAP_TIER1_API_TOKEN") or os.environ.get("TIER1_API_TOKEN") or "").strip()
+    return token or None
 
 
 class _BoundedJsonResponse:
@@ -60,12 +70,20 @@ def urlopen(
     """Compatibility adapter backed by a no-proxy, no-redirect bounded client."""
     raw = request.data or b"{}"
     payload = json.loads(raw.decode("utf-8"))
+    call_kwargs: dict[str, Any] = {
+        "timeout_seconds": timeout,
+        "deadline_monotonic": deadline_monotonic,
+        "cancellation_check": cancellation_check,
+    }
+    auth_hdr = request.get_header("Authorization")
+    if isinstance(auth_hdr, str) and auth_hdr.startswith("Bearer "):
+        token = auth_hdr[7:].strip()
+        if token and is_loopback_client(urlsplit(request.full_url).hostname):
+            call_kwargs["bearer_token"] = token
     result = post_json_bounded(
         request.full_url,
         payload,
-        timeout_seconds=timeout,
-        deadline_monotonic=deadline_monotonic,
-        cancellation_check=cancellation_check,
+        **call_kwargs,
     )
     if result is None:
         raise OSError("provider_unavailable")
@@ -660,10 +678,14 @@ def _call_openjev_systemone_http(
                 }
             },
         }
+        req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        bearer_token = _loopback_tier1_token(endpoint_url)
+        if bearer_token:
+            req_headers["Authorization"] = f"Bearer {bearer_token}"
         request = Request(
             endpoint_url,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=req_headers,
             method="POST",
         )
         try:
@@ -777,10 +799,14 @@ def _call_openjev_http(
         for d in decisions[:256]
     ]
     req_body = json.dumps({"model": model_name, "items": payload_items}).encode("utf-8")
+    req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    bearer_token = _loopback_tier1_token(endpoint_url)
+    if bearer_token:
+        req_headers["Authorization"] = f"Bearer {bearer_token}"
     request = Request(
         endpoint_url,
         data=req_body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=req_headers,
         method="POST",
     )
     try:

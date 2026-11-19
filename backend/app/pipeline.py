@@ -2926,12 +2926,29 @@ def _run_yara(
             objects_dir = run_dir / "objects"
             rules_dir = run_dir / "rules"
             objects_dir.mkdir(mode=0o700)
-            ruleset = snapshot_ruleset(
-                limits.yara_rules_dir,
-                rules_dir,
-                max_files=limits.yara_max_rules_files,
-                max_bytes=limits.yara_max_rules_bytes,
-            )
+            try:
+                ruleset = snapshot_ruleset(
+                    limits.yara_rules_dir,
+                    rules_dir,
+                    max_files=limits.yara_max_rules_files,
+                    max_bytes=limits.yara_max_rules_bytes,
+                )
+            except YaraRulesError as exc:
+                default_repo_yara = (Path(__file__).resolve().parents[2] / "yara-rules").resolve()
+                bundled_yara = default_rules_dir()
+                if (
+                    str(exc) == "ruleset_empty"
+                    and limits.yara_rules_dir == default_repo_yara
+                    and bundled_yara is not None
+                ):
+                    ruleset = snapshot_ruleset(
+                        bundled_yara,
+                        rules_dir,
+                        max_files=limits.yara_max_rules_files,
+                        max_bytes=limits.yara_max_rules_bytes,
+                    )
+                else:
+                    raise
 
             carve_process = _spawn(
                 [tshark, "-n", "-r", str(path), "--export-objects", f"http,{objects_dir}"],
@@ -3213,15 +3230,18 @@ _HTTP_METHOD_RE = re.compile(r"\b(GET|POST|PUT|DELETE|HEAD|OPTIONS)\s+([^\s]{1,1
 def _looks_like_wireshark_csv(path: Path) -> bool:
     try:
         with path.open("rb") as f:
-            head = f.read(512).lstrip(b"\xef\xbb\xbf")
+            head = f.read(1024).lstrip(b"\xef\xbb\xbf")
     except OSError:
         return False
     # Check it is not binary PCAP/PCAPNG
-    if head[:4] in {b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a"}:
+    if b"\x00" in head or head[:4] in {b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a"}:
         return False
     text = head.decode("utf-8", errors="ignore").lower()
     first_line = text.splitlines()[0] if text else ""
-    return ("time" in first_line and "source" in first_line and "destination" in first_line)
+    has_time = "time" in first_line
+    has_src = ("source" in first_line) or ("src" in first_line)
+    has_dst = ("destination" in first_line) or ("dst" in first_line)
+    return has_time and has_src and has_dst
 
 
 class _BoundedCSVLines:

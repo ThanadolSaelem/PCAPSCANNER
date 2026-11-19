@@ -235,7 +235,7 @@ export interface BatchItemSummary {
   analysis_id: string;
   sha256: string;
   size_bytes: number;
-  format: "pcap" | "pcapng";
+  format: "pcap" | "pcapng" | "csv" | "tsv";
   state: BatchItemState;
   error_code: string | null;
   evidence_available: boolean;
@@ -251,6 +251,31 @@ export interface BatchSummary {
   partial_items: number;
   cancelled_items: number;
   items: BatchItemSummary[];
+}
+
+export interface JobsPageResponse {
+  items: JobSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface JobDeleteResponse {
+  deleted: boolean;
+  analysis_id: string;
+  capture_deleted: boolean;
+}
+
+export interface JobsPrunePayload {
+  keep_latest?: number;
+  max_age_hours?: number | null;
+}
+
+export interface JobsPruneResponse {
+  deleted_count: number;
+  deleted_ids: string[];
+  captures_deleted: number;
+  remaining_count: number;
 }
 
 export interface ChunkUploadInitResponse {
@@ -1047,8 +1072,14 @@ export class PcapApiClient {
     });
   }
 
-  async listJobs(limit = 50): Promise<JobSummary[]> {
-    const res = await this.requestJson<{ items: JobSummary[] }>(`/api/v1/analyses?limit=${limit}`);
+  listJobsPage(limit = 50, offset = 0): Promise<JobsPageResponse> {
+    const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    const boundedOffset = Math.max(0, Math.trunc(offset));
+    return this.requestJson<JobsPageResponse>(`/api/v1/analyses?limit=${boundedLimit}&offset=${boundedOffset}`);
+  }
+
+  async listJobs(limit = 50, offset = 0): Promise<JobSummary[]> {
+    const res = await this.listJobsPage(limit, offset);
     return res.items;
   }
 
@@ -1058,6 +1089,20 @@ export class PcapApiClient {
 
   cancelJob(analysisId: string): Promise<JobSummary> {
     return this.requestJson<JobSummary>(`/api/v1/analyses/${analysisId}/cancel`, { method: "POST" });
+  }
+
+  deleteJob(analysisId: string): Promise<JobDeleteResponse> {
+    return this.requestJson<JobDeleteResponse>(`/api/v1/analyses/${encodeURIComponent(analysisId)}`, {
+      method: "DELETE",
+    });
+  }
+
+  pruneJobs(payload: JobsPrunePayload = {}): Promise<JobsPruneResponse> {
+    return this.requestJson<JobsPruneResponse>("/api/v1/analyses/prune", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
   }
 
   getReport(analysisId: string): Promise<BackendReport> {
@@ -1158,8 +1203,9 @@ export class PcapApiClient {
     });
   }
 
-  async getStixJson(analysisId: string): Promise<string> {
-    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.stix.json`), {
+  async getStixJson(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.stix.json${q}`), {
       headers: this.authHeaders({ Accept: "application/stix+json" }),
     });
     if (!response.ok) await this.throwProblem(response);
@@ -1180,32 +1226,36 @@ export class PcapApiClient {
     });
   }
 
-  async getExportCsv(analysisId: string): Promise<string> {
-    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.csv`), {
+  async getExportCsv(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.csv${q}`), {
       headers: this.authHeaders({ Accept: "text/csv" }),
     });
     if (!response.ok) await this.throwProblem(response);
     return response.text();
   }
 
-  async getExportCef(analysisId: string): Promise<string> {
-    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.cef`), {
+  async getExportCef(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.cef${q}`), {
       headers: this.authHeaders({ Accept: "text/plain" }),
     });
     if (!response.ok) await this.throwProblem(response);
     return response.text();
   }
 
-  async getExportNavigatorJson(analysisId: string): Promise<string> {
-    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.navigator.json`), {
+  async getExportNavigatorJson(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.navigator.json${q}`), {
       headers: this.authHeaders({ Accept: "application/json" }),
     });
     if (!response.ok) await this.throwProblem(response);
     return response.text();
   }
 
-  async getExportPdfBlob(analysisId: string): Promise<Blob> {
-    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.pdf`), {
+  async getExportPdfBlob(analysisId: string, options: { redact?: boolean } = {}): Promise<Blob> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.pdf${q}`), {
       headers: this.authHeaders({ Accept: "application/pdf" }),
     });
     if (!response.ok) await this.throwProblem(response);

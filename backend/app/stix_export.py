@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
+from .exporters.redaction import redact_value
 from .models import Evidence, EvidenceBundle, Finding
 
 DEFAULT_MAX_OBJECTS = 2_000
@@ -177,6 +178,7 @@ def export_stix_bundle(
     *,
     max_objects: int = DEFAULT_MAX_OBJECTS,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    redact: bool = False,
 ) -> dict[str, Any]:
     """Export a validated ``EvidenceBundle`` as a deterministic STIX 2.1 bundle.
 
@@ -234,6 +236,8 @@ def export_stix_bundle(
         }
         if summary:
             content["summary"] = summary
+        if redact:
+            content = redact_value(content)
         note = _note(
             object_id=object_id,
             created=created,
@@ -255,7 +259,7 @@ def export_stix_bundle(
         # Never output an incomplete citation or invent a substitute reference.
         if not all(evidence_id in evidence_object_ids for evidence_id in finding.evidence_ids):
             continue
-        note = _finding_note(finding, capture_sha, created, identity_id, evidence_object_ids)
+        note = _finding_note(finding, capture_sha, created, identity_id, evidence_object_ids, redact=redact)
         note_size = len(json.dumps(note, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         if current_size + 1 + note_size > max_bytes:
             continue
@@ -271,6 +275,8 @@ def _finding_note(
     created: str,
     identity_id: str,
     evidence_object_ids: dict[str, str],
+    *,
+    redact: bool = False,
 ) -> dict[str, Any]:
     content: dict[str, Any] = {
         "record_type": "finding",
@@ -293,6 +299,8 @@ def _finding_note(
         content["triage_class"] = triage_class
     if finding.triage_confidence is not None:
         content["triage_confidence"] = finding.triage_confidence
+    if redact:
+        content = redact_value(content)
     refs = [identity_id, *(evidence_object_ids[eid] for eid in finding.evidence_ids)]
     return _note(
         object_id=f"note--{_uuid('finding', capture_sha, finding.finding_id)}",

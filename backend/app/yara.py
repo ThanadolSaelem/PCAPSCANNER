@@ -239,8 +239,19 @@ def inspect_yara_rules(
             if not _SAFE_RULE_FILENAME_RE.fullmatch(entry.name) or entry.is_symlink():
                 continue
             p = Path(entry.path)
-            raw = p.read_bytes()
-            if len(raw) <= 0 or total_bytes + len(raw) > max_bytes or _INCLUDE_RE.search(raw):
+            before = p.stat(follow_symlinks=False)
+            if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > max_bytes:
+                continue
+            if total_bytes + before.st_size > max_bytes:
+                continue
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(p, flags)
+            with os.fdopen(fd, "rb") as rule_fh:
+                opened = os.fstat(rule_fh.fileno())
+                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                    continue
+                raw = rule_fh.read(max_bytes - total_bytes + 1)
+            if len(raw) <= 0 or len(raw) != before.st_size or total_bytes + len(raw) > max_bytes or _INCLUDE_RE.search(raw):
                 continue
             file_count += 1
             if file_count > max_files:

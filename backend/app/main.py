@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import ValidationError
@@ -41,6 +41,7 @@ from .models import (
     ChunkUploadInitRequest,
     EvidenceBundle,
     GroundedChatRequest,
+    JobsPruneRequest,
     OSINTKeyRotateRequest,
     OSINTLookupRequest,
     LocalCaptureRequest,
@@ -307,6 +308,15 @@ class BoundaryMiddleware:
                     (b"x-request-id", rid.encode()),
                     (b"cache-control", b"no-store"),
                     (b"x-content-type-options", b"nosniff"),
+                    (b"x-frame-options", b"DENY"),
+                    (b"referrer-policy", b"no-referrer"),
+                    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+                    (
+                        b"content-security-policy",
+                        b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                        b"img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; "
+                        b"object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+                    ),
                 ]
             await send(message)
 
@@ -1102,13 +1112,41 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise HTTPException(409, "ai_model_not_configured")
         return _store().create_job(body, profile_hash(cfg_now), idempotency_key)
 
+    def _require_loopback_workspace_mutation(request: Request, error_code: str) -> None:
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, error_code)
+
     @app.get("/api/v1/analyses", tags=["Analyses"])
-    def list_jobs(limit: Annotated[int, Query(ge=1, le=100)] = 50):
-        return {"items": _store().jobs(limit)}
+    def list_jobs(
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        store_now = _store()
+        return {
+            "items": store_now.jobs(limit=limit, offset=offset),
+            "total": store_now.jobs_count(),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.post("/api/v1/analyses/prune", tags=["Analyses"])
+    def prune_jobs_endpoint(
+        keep_latest: Annotated[int, Query(ge=0, le=500)] = 20,
+        max_age_hours: Annotated[int | None, Query(ge=1, le=8760)] = None,
+        body: JobsPruneRequest | None = Body(default=None),
+    ):
+        eff_keep = body.keep_latest if body is not None else keep_latest
+        eff_age = body.max_age_hours if body is not None else max_age_hours
+        return _store().prune_jobs(keep_latest=eff_keep, max_age_hours=eff_age)
 
     @app.get("/api/v1/analyses/{analysis_id}", tags=["Analyses"])
     def job(analysis_id: str):
         return _store().job(analysis_id)
+
+    @app.delete("/api/v1/analyses/{analysis_id}", tags=["Analyses"])
+    def delete_job_endpoint(analysis_id: str):
+        return _store().delete_job(analysis_id)
 
     @app.post("/api/v1/analyses/{analysis_id}/cancel", tags=["Analyses"])
     def cancel(analysis_id: str):
@@ -1215,22 +1253,32 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         return {"items": items, "total": len(items)}
 
     @app.post("/api/v1/osint/cache/clear", tags=["OSINT"])
-    def clear_osint_cache_entries(provider: Annotated[str | None, Query(max_length=32)] = None):
+    def clear_osint_cache_entries(
+        request: Request,
+        provider: Annotated[str | None, Query(max_length=32)] = None,
+    ):
+        _require_loopback_workspace_mutation(request, "osint_cache_mutation_loopback_only")
         deleted = _store().clear_osint_cache(provider=provider)
         return {"deleted": deleted, "deleted_count": deleted, "provider": provider}
 
     @app.delete("/api/v1/osint/cache", tags=["OSINT"])
-    def delete_all_osint_cache_entries(provider: Annotated[str | None, Query(max_length=32)] = None):
+    def delete_all_osint_cache_entries(
+        request: Request,
+        provider: Annotated[str | None, Query(max_length=32)] = None,
+    ):
+        _require_loopback_workspace_mutation(request, "osint_cache_mutation_loopback_only")
         deleted = _store().clear_osint_cache(provider=provider)
         return {"deleted": deleted, "deleted_count": deleted, "provider": provider}
 
     @app.delete("/api/v1/osint/cache/{cache_id}", status_code=204, tags=["OSINT"])
-    def delete_osint_cache_entry(cache_id: str):
+    def delete_osint_cache_entry(cache_id: str, request: Request):
+        _require_loopback_workspace_mutation(request, "osint_cache_mutation_loopback_only")
         _store().delete_osint_cache_entry(cache_id)
         return Response(status_code=204)
 
     @app.post("/api/v1/osint/keys/rotate", tags=["OSINT"])
-    def rotate_osint_key(body: OSINTKeyRotateRequest):
+    def rotate_osint_key(body: OSINTKeyRotateRequest, request: Request):
+        _require_loopback_workspace_mutation(request, "osint_key_rotation_loopback_only")
         try:
             result = app.state.osint_service.rotate_key(body.provider, body.api_key)
         except ValueError as exc:
@@ -1459,9 +1507,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def export_stix(
         analysis_id: str,
         snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
     ):
         manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
-        payload = export_stix_bundle(bundle)
+        payload = export_stix_bundle(bundle, redact=redact)
         payload["x_pcapscanner_snapshot_id"] = manifest["snapshot_id"]
         return JSONResponse(
             content=payload,
@@ -1476,9 +1525,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def export_csv(
         analysis_id: str,
         snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
     ):
         manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
-        csv_text = export_findings_and_evidence_csv(bundle, snapshot_id=manifest["snapshot_id"])
+        csv_text = export_findings_and_evidence_csv(bundle, snapshot_id=manifest["snapshot_id"], redact=redact)
         return Response(
             content=csv_text.encode("utf-8"),
             media_type="text/csv; charset=utf-8",
@@ -1492,9 +1542,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def export_cef(
         analysis_id: str,
         snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
     ):
         manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
-        cef_text = export_findings_cef(bundle, snapshot_id=manifest["snapshot_id"])
+        cef_text = export_findings_cef(bundle, snapshot_id=manifest["snapshot_id"], redact=redact)
         return PlainTextResponse(
             content=cef_text,
             media_type="text/plain; charset=utf-8",
@@ -1508,12 +1559,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def export_navigator(
         analysis_id: str,
         snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
     ):
         manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
         layer = export_attack_navigator_layer(
             bundle,
             snapshot_id=manifest["snapshot_id"],
             analysis_id=analysis_id,
+            redact=redact,
         )
         return JSONResponse(
             content=layer,
@@ -1528,9 +1581,20 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def export_pdf(
         analysis_id: str,
         snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
     ):
         manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
-        pdf_bytes = export_snapshot_pdf(bundle, snapshot=manifest)
+        store_now = _store()
+        job_meta = store_now.job(analysis_id)
+        internal_row = store_now.job(analysis_id, internal=True)
+        ai_result = json.loads(internal_row["ai_result"]) if internal_row.get("ai_result") else None
+        pdf_bytes = export_snapshot_pdf(
+            bundle,
+            snapshot=manifest,
+            job=job_meta,
+            ai_result=ai_result,
+            redact=redact,
+        )
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",

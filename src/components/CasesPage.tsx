@@ -2,11 +2,13 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import type { CaseCreatePayload, InvestigationCase, InvestigationSeverity, InvestigationStatus, JobSummary } from "../api/client";
 import { PcapApiClient } from "../api/client";
+import type { PrivacyRedactor } from "../utils/privacy";
 
 interface CasesPageProps {
   apiClient: PcapApiClient;
   connected: boolean;
   jobs: JobSummary[];
+  privacyRedactor?: PrivacyRedactor;
   onOpenAnalysis: (analysisId: string) => void;
 }
 
@@ -29,7 +31,9 @@ function CaseSeverity({ value }: { value: InvestigationSeverity }) {
   return <span className={`severity severity-${value === "info" ? "low" : value}`}>{value.toUpperCase()}</span>;
 }
 
-export default function CasesPage({ apiClient, connected, jobs, onOpenAnalysis }: CasesPageProps) {
+export default function CasesPage({ apiClient, connected, jobs, privacyRedactor, onOpenAnalysis }: CasesPageProps) {
+  const maskText = (value: string) => (privacyRedactor ? privacyRedactor.redactFreeText(value) : value);
+  const maskFilename = (value: string) => (privacyRedactor ? privacyRedactor.redactFilename(value) : value);
   const [items, setItems] = useState<InvestigationCase[]>([]);
   const [selected, setSelected] = useState<InvestigationCase | null>(null);
   const [search, setSearch] = useState("");
@@ -144,7 +148,7 @@ export default function CasesPage({ apiClient, connected, jobs, onOpenAnalysis }
   };
 
   const deleteSelected = async () => {
-    if (!selected || !window.confirm(`ลบ case “${selected.title}” และ notes/links ใน case นี้หรือไม่? Analysis ต้นฉบับจะไม่ถูกลบ`)) return;
+    if (!selected || !window.confirm(`ลบ case “${maskText(selected.title)}” และ notes/links ใน case นี้หรือไม่? Analysis ต้นฉบับจะไม่ถูกลบ`)) return;
     setBusy(true);
     setError("");
     try {
@@ -241,10 +245,10 @@ export default function CasesPage({ apiClient, connected, jobs, onOpenAnalysis }
           <div className="cases-list-scroll">
             {items.map((item) => (
               <button type="button" key={item.id} className={`case-list-item ${selected?.id === item.id ? "selected" : ""}`} onClick={() => void openCase(item.id)}>
-                <div className="case-list-title"><strong>{item.title}</strong><span className={`case-state case-state-${item.status}`}>{STATUS_LABELS[item.status]}</span></div>
+                <div className="case-list-title"><strong>{maskText(item.title)}</strong><span className={`case-state case-state-${item.status}`}>{STATUS_LABELS[item.status]}</span></div>
                 <CaseSeverity value={item.severity} />
                 <small>{item.analysis_count} analyses · {item.note_count} notes · {formatDate(item.updated_at)}</small>
-                {item.tags.length > 0 && <div className="case-tags">{item.tags.slice(0, 8).map((tag) => <span key={tag}>{tag}</span>)}</div>}
+                {item.tags.length > 0 && <div className="case-tags">{item.tags.slice(0, 8).map((tag) => <span key={tag}>{maskText(tag)}</span>)}</div>}
               </button>
             ))}
             {items.length === 0 && <div className="cases-empty">{search ? "ไม่พบ case ที่ตรงกับคำค้น" : "ยังไม่มี case ที่บันทึกใน backend"}</div>}
@@ -260,7 +264,7 @@ export default function CasesPage({ apiClient, connected, jobs, onOpenAnalysis }
           {creating || selected ? (
             <>
               <form className="cases-form" onSubmit={(event) => void saveCase(event)}>
-                <div className="cases-form-heading"><div><span className="eyebrow">{creating ? "CREATE CASE" : `CASE ${selected?.id.slice(0, 8)}`}</span><h2>{creating ? "สร้าง Investigation Case" : selected?.title}</h2></div>
+                <div className="cases-form-heading"><div><span className="eyebrow">{creating ? "CREATE CASE" : `CASE ${selected?.id.slice(0, 8)}`}</span><h2>{creating ? "สร้าง Investigation Case" : selected ? maskText(selected.title) : ""}</h2></div>
                   {selected && <span className={`case-state case-state-${selected.status}`}>{STATUS_LABELS[selected.status]}</span>}
                 </div>
                 <label>ชื่อ case<input required minLength={1} maxLength={160} value={title} onChange={(event) => setTitle(event.target.value)} /></label>
@@ -281,13 +285,13 @@ export default function CasesPage({ apiClient, connected, jobs, onOpenAnalysis }
                   <div className="cases-link-controls">
                     <select aria-label="เลือก analysis เพื่อเชื่อม" value={analysisId} onChange={(event) => setAnalysisId(event.target.value)}>
                       <option value="">เลือก analysis ล่าสุด</option>
-                      {jobs.filter((job) => !selected.analyses?.some((linked) => linked.analysis_id === job.id)).map((job) => <option key={job.id} value={job.id}>{job.capture_filename ?? job.id.slice(0, 8)} · {job.state}</option>)}
+                      {jobs.filter((job) => !selected.analyses?.some((linked) => linked.analysis_id === job.id)).map((job) => <option key={job.id} value={job.id}>{job.capture_filename ? maskFilename(job.capture_filename) : job.id.slice(0, 8)} · {job.state}</option>)}
                     </select>
                     <button className="secondary-button" type="button" disabled={busy || !analysisId} onClick={() => void linkAnalysis()}>เชื่อม</button>
                   </div>
                   <div className="cases-linked-list">
                     {(selected.analyses ?? []).map((analysis) => <div className="cases-linked-row" key={analysis.analysis_id}>
-                      <button className="case-analysis-open" type="button" onClick={() => onOpenAnalysis(analysis.analysis_id)}><strong>{analysis.capture_filename ?? `analysis-${analysis.analysis_id.slice(0, 8)}`}</strong><small>{analysis.state} · linked {formatDate(analysis.linked_at)}</small></button>
+                      <button className="case-analysis-open" type="button" onClick={() => onOpenAnalysis(analysis.analysis_id)}><strong>{analysis.capture_filename ? maskFilename(analysis.capture_filename) : `analysis-${analysis.analysis_id.slice(0, 8)}`}</strong><small>{analysis.state} · linked {formatDate(analysis.linked_at)}</small></button>
                       <button className="text-button" type="button" disabled={busy} onClick={() => void unlinkAnalysis(analysis.analysis_id)}>ยกเลิก link</button>
                     </div>)}
                     {(selected.analyses ?? []).length === 0 && <div className="cases-empty">ยังไม่มี analysis ที่เชื่อมกับ case นี้</div>}
@@ -297,7 +301,7 @@ export default function CasesPage({ apiClient, connected, jobs, onOpenAnalysis }
                 <section className="cases-subsection">
                   <div className="cases-subheading"><div><h3>Analyst notes</h3><p>บันทึกใน local backend เท่านั้น; ไม่ส่งเข้า AI หรือ provider</p></div><span>{selected.note_count}</span></div>
                   <form className="cases-note-form" onSubmit={(event) => void addNote(event)}><textarea value={noteText} onChange={(event) => setNoteText(event.target.value)} maxLength={4000} rows={3} placeholder="เพิ่มบันทึกสำหรับ case นี้…" required /><button className="secondary-button" type="submit" disabled={busy || !noteText.trim()}>เพิ่ม note</button></form>
-                  <div className="cases-notes-list">{(selected.notes ?? []).map((note) => <article className="case-note" key={note.id}><div className="case-note-meta"><time>{formatDate(note.created_at)}</time><button className="text-button" type="button" disabled={busy} onClick={() => void deleteNote(note.id)}>ลบ</button></div><p>{note.note}</p></article>)}{(selected.notes ?? []).length === 0 && <div className="cases-empty">ยังไม่มี analyst notes</div>}</div>
+                  <div className="cases-notes-list">{(selected.notes ?? []).map((note) => <article className="case-note" key={note.id}><div className="case-note-meta"><time>{formatDate(note.created_at)}</time><button className="text-button" type="button" disabled={busy} onClick={() => void deleteNote(note.id)}>ลบ</button></div><p>{maskText(note.note)}</p></article>)}{(selected.notes ?? []).length === 0 && <div className="cases-empty">ยังไม่มี analyst notes</div>}</div>
                 </section>
               </>}
             </>

@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from .redaction import redact_text
+
 _CEF_VERSION = "0"
 _VENDOR = "PCAPSCANNER"
 _PRODUCT = "ForensicWorkbench"
@@ -43,9 +45,10 @@ def format_syslog(event: CEFEvent, hostname: str = "pcapscanner") -> str:
     return f"{ts} {hostname} {event.to_cef()}"
 
 
-def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
+def generate_cef_events(bundle: dict[str, Any], *, redact: bool = False) -> list[CEFEvent]:
     events: list[CEFEvent] = []
     snapshot_id = str(bundle.get("snapshot_id") or "")
+    rx = redact_text if redact else (lambda v: v)
 
     for c in bundle.get("correlations") or []:
         verdict = str(c.get("verdict") or "unknown").lower()
@@ -55,11 +58,11 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
             for s in (c.get("signals") or [])
         )
         ext = {
-            "src": str(c.get("indicator") or ""),
+            "src": rx(str(c.get("indicator") or "")),
             "cs1Label": "Verdict",
             "cs1": verdict,
             "cs2Label": "Signals",
-            "cs2": signals,
+            "cs2": rx(signals),
             "cfp1Label": "Score",
             "cfp1": f"{float(c.get('composite_score', c.get('score')) or 0.0):.2f}",
         }
@@ -69,7 +72,7 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
         events.append(
             CEFEvent(
                 signature_id="CORR-001",
-                name=f"Threat Correlation: {verdict}",
+                name=rx(f"Threat Correlation: {verdict}"),
                 severity=sev,
                 extensions=ext,
             )
@@ -86,8 +89,8 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
                 name="C2 Beacon Candidate",
                 severity=sev,
                 extensions={
-                    "src": str(b.get("src") or ""),
-                    "dst": str(b.get("dst") or ""),
+                    "src": rx(str(b.get("src") or "")),
+                    "dst": rx(str(b.get("dst") or "")),
                     "dpt": str(b.get("dport") or ""),
                     "cnt": str(b.get("pkts", b.get("count") or "")),
                     "cfp1Label": "BeaconScore",
@@ -104,17 +107,17 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
                 name="DGA Domain Detected",
                 severity=7,
                 extensions={
-                    "dhost": str(d.get("domain") or ""),
+                    "dhost": rx(str(d.get("domain") or "")),
                     "cfp1Label": "EntropyScore",
                     "cfp1": f"{float(d.get('score') or 0.0):.2f}",
                     "cs1Label": "Reason",
-                    "cs1": str(d.get("reason") or ""),
+                    "cs1": rx(str(d.get("reason") or "")),
                 },
             )
         )
     for t in (dns.get("tunneling_detections") or dns.get("tunneling_suspects") or []):
         dom = t if isinstance(t, str) else t.get("domain", "")
-        events.append(CEFEvent(signature_id="DNS-TUNNEL-001", name="DNS Tunneling Suspect", severity=8, extensions={"dhost": str(dom)}))
+        events.append(CEFEvent(signature_id="DNS-TUNNEL-001", name="DNS Tunneling Suspect", severity=8, extensions={"dhost": rx(str(dom))}))
 
     yara = bundle.get("yara_results") or {}
     for r in yara.get("results") or []:
@@ -125,13 +128,13 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
         events.append(
             CEFEvent(
                 signature_id="YARA-001",
-                name=f"YARA Rule Match ({r.get('severity', 'high')})",
+                name=rx(f"YARA Rule Match ({r.get('severity', 'high')})"),
                 severity=sev,
                 extensions={
-                    "fname": str(r.get("filename") or ""),
+                    "fname": rx(str(r.get("filename") or "")),
                     "fileHash": str(r.get("file_hash") or ""),
                     "cs1Label": "MatchedRules",
-                    "cs1": rules,
+                    "cs1": rx(rules),
                 },
             )
         )
@@ -140,7 +143,7 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
         sev = _SEVERITY_MAP.get(str(f.get("severity") or "low").lower(), 3)
         ext = {
             "cs1Label": "Detector",
-            "cs1": str(f.get("detector") or ""),
+            "cs1": rx(str(f.get("detector") or "")),
             "cs2Label": "Confidence",
             "cs2": str(f.get("confidence") or ""),
             "cs3Label": "EvidenceIDs",
@@ -152,7 +155,7 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
         events.append(
             CEFEvent(
                 signature_id=f"DET-{str(f.get('finding_id') or '0000')}",
-                name=str(f.get("title") or f.get("detector") or "Finding"),
+                name=rx(str(f.get("title") or f.get("detector") or "Finding")),
                 severity=sev,
                 extensions=ext,
             )
@@ -161,9 +164,10 @@ def generate_cef_events(bundle: dict[str, Any]) -> list[CEFEvent]:
     return events
 
 
-def export_cef_text(bundle: dict[str, Any], *, hostname: str = "pcapscanner") -> str:
-    events = generate_cef_events(bundle)
-    return "\n".join(format_syslog(e, hostname=hostname) for e in events) + ("\n" if events else "")
+def export_cef_text(bundle: dict[str, Any], *, hostname: str = "pcapscanner", redact: bool = False) -> str:
+    events = generate_cef_events(bundle, redact=redact)
+    eff_host = redact_text(hostname) if redact else hostname
+    return "\n".join(format_syslog(e, hostname=eff_host) for e in events) + ("\n" if events else "")
 
 
 def export_findings_cef(
@@ -172,12 +176,13 @@ def export_findings_cef(
     snapshot: dict[str, Any] | None = None,
     snapshot_id: str | None = None,
     hostname: str = "pcapscanner",
+    redact: bool = False,
 ) -> str:
     eff_snapshot_id = snapshot_id or (snapshot or {}).get("snapshot_id")
     bundle_dict = bundle.model_dump(mode="json") if hasattr(bundle, "model_dump") else dict(bundle)
     if eff_snapshot_id:
         bundle_dict["snapshot_id"] = eff_snapshot_id
-    return export_cef_text(bundle_dict, hostname=hostname)
+    return export_cef_text(bundle_dict, hostname=hostname, redact=redact)
 
 
 __all__ = ["CEFEvent", "export_cef_text", "export_findings_cef", "format_syslog", "generate_cef_events"]

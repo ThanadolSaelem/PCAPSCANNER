@@ -403,7 +403,11 @@ def convert_uer_checkpoint(
 
     try:
         loaded = torch.load(str(bin_file), **load_kwargs)
-    except TypeError:
+    except TypeError as exc:
+        if not unsafe_pickle:
+            raise RuntimeError(
+                "Safe checkpoint loading (weights_only=True) requires PyTorch >= 2.0 or explicit unsafe_pickle=True."
+            ) from exc
         loaded = torch.load(str(bin_file), map_location="cpu")
 
     if isinstance(loaded, dict):

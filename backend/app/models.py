@@ -273,7 +273,7 @@ class BatchItemResponse(Contract):
     analysis_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     size_bytes: int = Field(ge=1)
-    format: Literal["pcap", "pcapng"]
+    format: Literal["pcap", "pcapng", "csv", "tsv"]
     state: Literal["queued", "parsing", "awaiting_ai", "generating", "completed", "partial", "failed", "cancelled"]
     error_code: str | None = None
     evidence_available: bool = False
@@ -500,3 +500,10 @@ class AIModelProbeRequest(Contract):
     data_boundary: Literal["local", "remote"] | None = None
     timeout_seconds: int | None = Field(default=None, ge=1, le=120)
     anthropic_version: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class JobsPruneRequest(Contract):
+    """Bounded parameters for pruning historical terminal analyses."""
+
+    keep_latest: int = Field(default=20, ge=0, le=500)
+    max_age_hours: int | None = Field(default=None, ge=1, le=8760)

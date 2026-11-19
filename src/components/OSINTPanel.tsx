@@ -7,12 +7,14 @@ import type {
   OSINTProviderId,
   PcapApiClient,
 } from "../api/client";
+import type { PrivacyRedactor } from "../utils/privacy";
 
 type Props = {
   api: PcapApiClient;
   analysisId: string;
   live: boolean;
   connected: boolean;
+  privacyRedactor?: PrivacyRedactor;
   initialResult?: OSINTLookupResponse | { state: "not_requested"; results: [] };
   onOpenEvidence: (evidenceId: string) => void;
 };
@@ -52,7 +54,33 @@ function providerState(state: string): string {
   return labels[state] ?? state;
 }
 
-export default function OSINTPanel({ api, analysisId, live, connected, initialResult, onOpenEvidence }: Props) {
+export default function OSINTPanel({
+  api,
+  analysisId,
+  live,
+  connected,
+  privacyRedactor,
+  initialResult,
+  onOpenEvidence,
+}: Props) {
+  const redactIndicator = (value: string, indicatorType?: string) => {
+    if (!privacyRedactor) return value;
+    if (indicatorType && /hash|sha|md5/i.test(indicatorType)) {
+      return privacyRedactor.redactHash(value);
+    }
+    return privacyRedactor.redactEndpoint(value);
+  };
+  const redactSummaryField = (key: string, value: unknown): string => {
+    if (!privacyRedactor) {
+      return Array.isArray(value) ? value.join(", ") : String(value);
+    }
+    const formatScalar = (item: unknown): string => {
+      if (typeof item !== "string") return String(item);
+      if (/hash|sha|md5/i.test(key)) return privacyRedactor.redactHash(item);
+      return privacyRedactor.redactFreeText(item);
+    };
+    return Array.isArray(value) ? value.map(formatScalar).join(", ") : formatScalar(value);
+  };
   const [capabilities, setCapabilities] = useState<OSINTCapabilities | null>(null);
   const [candidates, setCandidates] = useState<IOCCandidate[]>([]);
   const [unresolvedOperation, setUnresolvedOperation] = useState<OSINTCandidatesResponse["pending_operation"]>(null);
@@ -288,7 +316,7 @@ export default function OSINTPanel({ api, analysisId, live, connected, initialRe
                         onChange={() => toggleCandidate(candidate.candidate_id)}
                         disabled={pending}
                       />
-                      <span className="mono">{candidate.indicator}</span>
+                      <span className="mono">{redactIndicator(candidate.indicator, candidate.indicator_type)}</span>
                       <small>{candidate.indicator_type}</small>
                       <span className="osint-evidence-links">
                         {candidate.evidence_ids.slice(0, 4).map((id) => (
@@ -330,12 +358,12 @@ export default function OSINTPanel({ api, analysisId, live, connected, initialRe
                     <article className="osint-result" key={`${item.provider}-${item.candidate_id}-${index}`}>
                       <div>
                         <strong>{providerNames[item.provider] ?? item.provider}</strong>
-                        <span className="mono">{candidate?.indicator ?? item.indicator_type}</span>
+                        <span className="mono">{candidate ? redactIndicator(candidate.indicator, candidate.indicator_type) : item.indicator_type}</span>
                         <small>{item.state.replaceAll("_", " ")}</small>
                       </div>
                       <dl>
                         {Object.entries(item.summary).map(([key, value]) => (
-                          <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd className="mono">{Array.isArray(value) ? value.join(", ") : String(value)}</dd></div>
+                          <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd className="mono">{redactSummaryField(key, value)}</dd></div>
                         ))}
                       </dl>
                       <a href={item.source_reference} target="_blank" rel="noreferrer">Provider API reference</a>

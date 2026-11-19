@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import html
-import re
 import textwrap
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
+
+from .redaction import redact_text
 
 try:
     from weasyprint import HTML as _WEASYPRINT_HTML  # type: ignore
@@ -15,19 +17,103 @@ except Exception:
     _WEASYPRINT_HTML = None
     WEASYPRINT_AVAILABLE = False
 
-_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|info|biz|ru|cn|xyz|top|dev|local|test)\b", re.I)
+_THAI_PUNCT_MAP = {
+    "\u2014": "-",
+    "\u2013": "-",
+    "\u2022": "*",
+    "\u2192": "->",
+    "\u2190": "<-",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u2026": "...",
+    "\u2265": ">=",
+    "\u2264": "<=",
+    "\u00d7": "x",
+    "\u00a0": " ",
+    "\u0e3f": "THB ",
+}
+
+_THAI_CONSONANTS = {
+    "ก": "k", "ข": "kh", "ฃ": "kh", "ค": "kh", "ฅ": "kh", "ฆ": "kh",
+    "ง": "ng", "จ": "ch", "ฉ": "ch", "ช": "ch", "ซ": "s", "ฌ": "ch",
+    "ญ": "y", "ฎ": "d", "ฏ": "t", "ฐ": "th", "ฑ": "th", "ฒ": "th",
+    "ณ": "n", "ด": "d", "ต": "t", "ถ": "th", "ท": "th", "ธ": "th",
+    "น": "n", "บ": "b", "ป": "p", "ผ": "ph", "ฝ": "f", "พ": "ph",
+    "ฟ": "f", "ภ": "ph", "ม": "m", "ย": "y", "ร": "r", "ล": "l",
+    "ว": "w", "ศ": "s", "ษ": "s", "ส": "s", "ห": "h", "ฬ": "l",
+    "อ": "o", "ฮ": "h",
+}
+_THAI_LEAD_VOWELS = {"เ": "e", "แ": "ae", "โ": "o", "ใ": "ai", "ไ": "ai"}
+_THAI_VOWELS_AND_SIGNS = {
+    "ะ": "a", "ั": "a", "า": "a", "ำ": "am",
+    "ิ": "i", "ี": "i", "ึ": "ue", "ื": "ue",
+    "ุ": "u", "ู": "u", "ฤ": "rue", "ฦ": "lue", "ๅ": "a",
+    "็": "", "่": "", "้": "", "๊": "", "๋": "", "์": "", "ํ": "", "ๆ": "", "ฯ": "", "ฺ": "", "๎": "", "๏": "*",
+    "๐": "0", "๑": "1", "๒": "2", "๓": "3", "๔": "4",
+    "๕": "5", "๖": "6", "๗": "7", "๘": "8", "๙": "9",
+}
+
+
+def _transliterate_thai(text: str) -> str:
+    out: list[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch in _THAI_PUNCT_MAP:
+            out.append(_THAI_PUNCT_MAP[ch])
+            i += 1
+            continue
+        if ch in _THAI_LEAD_VOWELS and i + 1 < n and text[i + 1] in _THAI_CONSONANTS:
+            lead = ch
+            cons = _THAI_CONSONANTS[text[i + 1]]
+            i += 2
+            while i < n and text[i] in ("็", "่", "้", "๊", "๋"):
+                i += 1
+            if lead == "เ" and i + 1 < n and text[i] == "ี" and text[i + 1] == "ย":
+                out.append(cons + "ia")
+                i += 2
+            elif lead == "เ" and i + 1 < n and text[i] == "ื" and text[i + 1] == "อ":
+                out.append(cons + "uea")
+                i += 2
+            elif lead == "เ" and i < n and text[i] == "า":
+                out.append(cons + "ao")
+                i += 1
+            elif lead == "เ" and i < n and text[i] == "อ":
+                out.append(cons + "oe")
+                i += 1
+            else:
+                out.append(cons + _THAI_LEAD_VOWELS[lead])
+            continue
+        if ch in _THAI_CONSONANTS:
+            out.append(_THAI_CONSONANTS[ch])
+        elif ch in _THAI_LEAD_VOWELS:
+            out.append(_THAI_LEAD_VOWELS[ch])
+        elif ch in _THAI_VOWELS_AND_SIGNS:
+            out.append(_THAI_VOWELS_AND_SIGNS[ch])
+        elif 0x0E00 <= ord(ch) <= 0x0E7F:
+            out.append("")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _redact(text: str) -> str:
-    text = _IPV4_RE.sub("[REDACTED_IP]", text)
-    text = _DOMAIN_RE.sub("[REDACTED_HOST]", text)
-    return text
+    return redact_text(text)
 
 
 def _ascii_safe(text: str) -> str:
-    """Transliterate/replace non-Latin1 bytes cleanly for Type1 Helvetica PDF streams."""
-    return text.encode("latin-1", "replace").decode("latin-1")
+    """Transliterate Thai/Unicode text cleanly for Type1 Helvetica PDF streams."""
+    cleaned = _transliterate_thai(str(text or ""))
+    try:
+        cleaned.encode("latin-1")
+        return cleaned
+    except UnicodeEncodeError:
+        normalized = unicodedata.normalize("NFKD", cleaned)
+        return normalized.encode("latin-1", "replace").decode("latin-1")
 
 
 def _pdf_escape(text: str) -> str:
@@ -203,7 +289,7 @@ def _render_html_report(
 ) -> str:
     title = html.escape(tx(str(options.get("title") or f"PCAPSCANNER Forensic Report — {job.get('capture_filename') or job.get('id', '')}")))
     classification = html.escape(str(options.get("classification") or "TLP:AMBER // INTERNAL"))
-    analyst = html.escape(str(options.get("analyst_name") or "Security Analyst"))
+    analyst = html.escape(tx(str(options.get("analyst_name") or "Security Analyst")))
     cov = bundle.get("coverage") or {}
     findings = bundle.get("findings") or []
     iocs = bundle.get("iocs") or []
@@ -274,7 +360,7 @@ def export_analysis_pdf(
     tx = _redact if redact else (lambda s: s)
     title = tx(str(opts.get("title") or f"PCAPSCANNER Forensic Report - {job.get('capture_filename') or job.get('id', '')[:12]}"))
     classification = str(opts.get("classification") or "TLP:AMBER // INTERNAL")
-    analyst = str(opts.get("analyst_name") or "Security Analyst")
+    analyst = tx(str(opts.get("analyst_name") or "Security Analyst"))
     include = set(opts.get("include_sections") or [])
 
     def _want(sec: str) -> bool:
@@ -333,7 +419,7 @@ def export_analysis_pdf(
         triage = bundle.get("triage")
         if triage:
             pdf.paragraph(
-                f"Tier-1 Triage ({triage.get('model')} / {triage.get('mode')}): evaluated {triage.get('total_evaluated', 0)} items, "
+                f"Tier-1 Triage ({tx(str(triage.get('model')))} / {triage.get('mode')}): evaluated {triage.get('total_evaluated', 0)} items, "
                 f"filtered {triage.get('benign_filtered', 0)} benign flows ({round(float(triage.get('reduction_ratio') or 0) * 100, 1)}% reduction), "
                 f"escalated {triage.get('escalated_count', 0)} items (ET-BERT L7 scored: {triage.get('etbert_scored_count', 0)})."
             )
@@ -344,7 +430,8 @@ def export_analysis_pdf(
 
     if _want("visibility") and vis:
         pdf.heading("2. Capture Visibility & Detector Quality", level=2)
-        pdf.paragraph(f"Quality Score: {vis.get('quality_score', 'N/A')}/100 | Parse Ratio: {vis.get('parse_ratio', 'N/A')} | Gaps: {', '.join(vis.get('visibility_gaps') or ['none'])}")
+        gaps_text = tx(", ".join(vis.get("visibility_gaps") or ["none"]))
+        pdf.paragraph(f"Quality Score: {vis.get('quality_score', 'N/A')}/100 | Parse Ratio: {vis.get('parse_ratio', 'N/A')} | Gaps: {gaps_text}")
         for lim in (vis.get("limitations") or [])[:6]:
             pdf.bullet(tx(str(lim)))
 
@@ -394,7 +481,7 @@ def export_analysis_pdf(
                     tx(str(c.get("indicator", ""))),
                     str(c.get("verdict", "")),
                     f"{float(c.get('composite_score', c.get('score')) or 0):.2f}",
-                    ", ".join(str(s.get("name") if isinstance(s, dict) else s) for s in (c.get("signals") or [])[:4]),
+                    tx(", ".join(str(s.get("name") if isinstance(s, dict) else s) for s in (c.get("signals") or [])[:4])),
                 ]
                 for c in correlations[:15]
             ]
@@ -411,16 +498,29 @@ def export_analysis_pdf(
     return pdf.to_bytes()
 
 
-def export_snapshot_pdf(bundle: Any, *, snapshot: dict[str, Any] | None = None) -> bytes:
+def export_snapshot_pdf(
+    bundle: Any,
+    *,
+    snapshot: dict[str, Any] | None = None,
+    job: dict[str, Any] | None = None,
+    ai_result: dict[str, Any] | None = None,
+    redact: bool = False,
+) -> bytes:
     bundle_dict = bundle.model_dump(mode="json") if hasattr(bundle, "model_dump") else dict(bundle)
     snap = dict(snapshot or {})
     if snap.get("snapshot_id"):
         bundle_dict["snapshot_id"] = snap["snapshot_id"]
-    job_stub = {
-        "id": snap.get("analysis_id", ""),
-        "capture_filename": snap.get("capture_filename") or f"capture-{str(bundle_dict.get('capture_sha256', ''))[:8]}.pcap",
-    }
-    return export_analysis_pdf(job_stub, bundle_dict, options={"force_pure_pdf": True})
+    job_payload = dict(job or {})
+    if not job_payload.get("id"):
+        job_payload["id"] = snap.get("analysis_id", "")
+    if not job_payload.get("capture_filename"):
+        job_payload["capture_filename"] = snap.get("capture_filename") or f"capture-{str(bundle_dict.get('capture_sha256', ''))[:8]}.pcap"
+    return export_analysis_pdf(
+        job_payload,
+        bundle_dict,
+        ai_result=ai_result,
+        options={"force_pure_pdf": True, "redact_identifiers": bool(redact)},
+    )
 
 
 __all__ = ["WEASYPRINT_AVAILABLE", "export_analysis_pdf", "export_snapshot_pdf"]

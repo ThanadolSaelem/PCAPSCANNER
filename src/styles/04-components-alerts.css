@@ -235,24 +235,26 @@
 }
 
 .capture-context-live .capture-context-trigger {
-  border-color: rgba(111, 207, 151, .3);
-  color: #bce4ca;
-  background: linear-gradient(120deg, rgba(111, 207, 151, .1), rgba(16, 25, 34, .78));
+  border-color: rgba(50, 189, 209, .34);
+  color: #cfe6ee;
+  background: linear-gradient(115deg, rgba(20, 32, 43, .95), rgba(16, 25, 34, .92));
 }
 .capture-context-live .capture-context-trigger:hover {
-  border-color: rgba(111, 207, 151, .58);
-  background: linear-gradient(120deg, rgba(111, 207, 151, .16), rgba(20, 32, 43, .92));
-  box-shadow: 0 10px 24px -14px rgba(111, 207, 151, .34);
+  border-color: rgba(50, 189, 209, .62);
+  background: linear-gradient(115deg, rgba(25, 42, 56, .98), rgba(19, 30, 41, .96));
+  box-shadow: 0 10px 26px -14px rgba(50, 189, 209, .38);
 }
 .capture-context-live .capture-context-badge {
-  border-color: rgba(111, 207, 151, .35);
-  color: #8ee0ad;
-  background: rgba(111, 207, 151, .14);
+  border-color: rgba(50, 189, 209, .38);
+  color: var(--cyan-2);
+  background: rgba(50, 189, 209, .14);
 }
 .capture-context-live .capture-context-cta {
-  border-color: rgba(111, 207, 151, .38);
-  color: #091d12;
-  background: linear-gradient(100deg, #74d99e, #54c484);
+  padding: 6px 12px;
+  border-color: rgba(50, 189, 209, .45);
+  color: #07181d;
+  background: linear-gradient(100deg, #55c9d6, #39b5c8);
+  box-shadow: 0 4px 12px rgba(28, 160, 182, .22);
 }
 
 .capture-context-local .capture-context-trigger {

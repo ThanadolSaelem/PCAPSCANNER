@@ -6,8 +6,11 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import sys
 from typing import Any
+
+_DEFAULT_CURSOR_SECRET = secrets.token_hex(32)
 
 
 READ_ONLY_MCP_TOOLS: tuple[dict[str, Any], ...] = (
@@ -91,8 +94,9 @@ def encode_signed_cursor(
     snapshot_id: str,
     offset: int,
     kind: str | None = None,
-    secret: str = "pcapscanner-cursor-secret",
+    secret: str | None = None,
 ) -> str:
+    effective_secret = secret or _DEFAULT_CURSOR_SECRET
     payload = {
         "a": str(analysis_id),
         "s": str(snapshot_id),
@@ -100,7 +104,7 @@ def encode_signed_cursor(
         "k": str(kind or ""),
     }
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    sig = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()[:24]
+    sig = hmac.new(effective_secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()[:24]
     token = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     return f"{token}.{sig}"
 
@@ -111,8 +115,9 @@ def decode_signed_cursor(
     expected_analysis_id: str,
     expected_snapshot_id: str,
     expected_kind: str | None = None,
-    secret: str = "pcapscanner-cursor-secret",
+    secret: str | None = None,
 ) -> int:
+    effective_secret = secret or _DEFAULT_CURSOR_SECRET
     if not cursor or "." not in cursor:
         raise ValueError("invalid_cursor")
     token, sig = cursor.rsplit(".", 1)
@@ -122,7 +127,7 @@ def decode_signed_cursor(
         payload = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         raise ValueError("invalid_cursor") from exc
-    expected_sig = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()[:24]
+    expected_sig = hmac.new(effective_secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()[:24]
     if not hmac.compare_digest(sig, expected_sig):
         raise ValueError("invalid_cursor_signature")
     if str(payload.get("a") or "") != str(expected_analysis_id):
@@ -151,7 +156,7 @@ class ReadOnlyMCPServer:
         self.store = store
         self.operator_token = operator_token or os.environ.get("PCAP_API_TOKEN") or ""
         self.default_token = default_token or ""
-        self.cursor_secret = cursor_secret or self.operator_token or "pcapscanner-cursor-secret"
+        self.cursor_secret = cursor_secret or self.operator_token or _DEFAULT_CURSOR_SECRET
 
     def list_tools(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -321,13 +326,7 @@ class ReadOnlyMCPServer:
         req_id = request.get("id")
         method = str(request.get("method") or "")
         params = dict(request.get("params") or {})
-        effective_token = (
-            token
-            or params.get("_token")
-            or self.default_token
-            or os.environ.get("PCAP_MCP_TOKEN")
-            or os.environ.get("PCAP_API_TOKEN")
-        )
+        effective_token = token or params.get("_token") or self.default_token or None
 
         if method == "tools/list":
             return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": self.list_tools()}}
@@ -344,7 +343,10 @@ class ReadOnlyMCPServer:
                 arguments = {k: v for k, v in params.items() if k != "_token"}
             else:
                 name = str(params.get("name") or "")
-                arguments = dict(params.get("arguments") or {})
+                raw_arguments = dict(params.get("arguments") or {})
+                if not effective_token and isinstance(raw_arguments.get("_token"), str):
+                    effective_token = raw_arguments.get("_token")
+                arguments = {k: v for k, v in raw_arguments.items() if k != "_token"}
             try:
                 output = self.call_tool(name, arguments, token=effective_token)
                 return {
@@ -384,7 +386,8 @@ def main() -> int:
         storage_max_bytes=settings.storage_max_bytes,
     )
     op_token = settings.api_token.get_secret_value() if settings.api_token else None
-    server = ReadOnlyMCPServer(store, operator_token=op_token)
+    cli_default_token = (os.environ.get("PCAP_MCP_TOKEN") or "").strip() or None
+    server = ReadOnlyMCPServer(store, operator_token=op_token, default_token=cli_default_token)
     for line in sys.stdin:
         line = line.strip()
         if not line:

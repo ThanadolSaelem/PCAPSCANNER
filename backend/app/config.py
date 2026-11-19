@@ -78,13 +78,18 @@ def _validate_endpoint(value: str, *, data_boundary: str, require_https_remote: 
     except ValueError:
         ip = None
     if ip is not None:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
         # Metadata, link-local, multicast, unspecified and reserved destinations
-        # are never valid provider endpoints.  Loopback/private are allowed only
-        # for an explicitly local data boundary.
+        # are never valid provider endpoints.
         if ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
             raise ValueError("forbidden_endpoint")
+        if data_boundary == "local" and not ip.is_loopback:
+            raise ValueError("local_boundary_requires_loopback")
         if data_boundary == "remote" and (ip.is_loopback or ip.is_private):
             raise ValueError("remote_private_endpoint")
+    elif data_boundary == "local" and lowered_host not in {"localhost", "ip6-localhost"}:
+        raise ValueError("local_boundary_requires_loopback")
     elif data_boundary == "remote" and lowered_host in {"localhost", "ip6-localhost"}:
         raise ValueError("remote_private_endpoint")
     if require_https_remote and data_boundary == "remote" and parts.scheme.lower() != "https":
@@ -125,8 +130,11 @@ def _validate_origin(value: str) -> str:
         ip = ipaddress.ip_address(parts.hostname)
     except ValueError:
         ip = None
-    if ip is not None and (ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved):
-        raise ValueError("forbidden_origin")
+    if ip is not None:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+            raise ValueError("forbidden_origin")
     return value
 
 
@@ -203,7 +211,6 @@ class AIConfig(BaseModel):
             _validate_endpoint(self.base_url, data_boundary=self.data_boundary)
         if not self.enabled:
             return self
-
         if self.provider == ProviderName.MANUS:
             # The actual URL and key are obtained at runtime from MANUS_*.
             # A configured URL is still validated and must be allowlisted.
@@ -224,7 +231,6 @@ class AIConfig(BaseModel):
 
 
 DEFAULT_ETBERT_MODEL_CANDIDATES: tuple[str, ...] = (
-    "/Users/thanadol/Downloads/pre-trained_model.bin",
     str(Path.home() / "Downloads" / "pre-trained_model.bin"),
 )
 

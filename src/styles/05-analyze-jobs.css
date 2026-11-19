@@ -507,6 +507,28 @@
 .table-progress small { color: #8294a2; font: 8px var(--mono); }
 .job-current td { background: rgba(50, 189, 209, .03); }
 .row-actions { display: flex; align-items: center; gap: 6px; }
+.layer1-quick-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.layer1-offline-pill {
+  padding: 2px 7px;
+  border: 1px solid rgba(111, 207, 151, .24);
+  border-radius: 4px;
+  color: #8cdbb0;
+  background: rgba(111, 207, 151, .08);
+  font: 600 8px var(--mono);
+}
+.offline-run-button { margin-top: 8px; border-color: rgba(50, 189, 209, .32); color: #bceaf0; background: rgba(50, 189, 209, .08); }
+.offline-run-button:hover:not(:disabled) { border-color: var(--cyan); color: #e8fcff; background: rgba(50, 189, 209, .16); }
+.jobs-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 -16px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  background: rgba(12, 19, 27, .35);
+}
+.jobs-pagination-info { color: #8398a7; font: 9px var(--mono); }
 
 .stage-monitor { padding: 15px 16px 0; }
 .stage-monitor .stage-row { min-height: 50px; }

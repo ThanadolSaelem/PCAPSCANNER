@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .models import AIResult, utcnow
 
@@ -803,7 +803,7 @@ class Store:
                 raise StoreError("batch_staging_unavailable", 507) from exc
             if not path.is_relative_to(staging_root) or not stat.S_ISREG(info.st_mode):
                 raise StoreError("batch_staging_unavailable", 507)
-            if size_bytes < 1 or info.st_size != size_bytes or fmt not in ("pcap", "pcapng"):
+            if size_bytes < 1 or info.st_size != size_bytes or fmt not in ("pcap", "pcapng", "csv", "tsv"):
                 raise StoreError("batch_staging_integrity_error", 400)
             digest = hashlib.sha256()
             try:
@@ -865,7 +865,7 @@ class Store:
                     )
                     for index, item in enumerate(normalized):
                         capture_id, job_id = uuid.uuid4().hex, uuid.uuid4().hex
-                        destination = self.capture_path(capture_id, "pcap")
+                        destination = self.capture_path(capture_id, "csv" if item["format"] in ("csv", "tsv") else "pcap")
                         if destination.exists():
                             raise StoreError("batch_id_collision", 503)
                         os.replace(item["path"], destination)
@@ -1032,16 +1032,115 @@ class Store:
             raise StoreError("job_not_found", 404)
         return dict(row) if internal else self._public(row)
 
-    def jobs(self, limit=50) -> list[dict]:
+    def jobs(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        bounded_limit = max(1, min(int(limit), 200))
+        bounded_offset = max(0, int(offset))
         with self.connection() as db:
             rows = db.execute(
                 """SELECT j.*, c.filename AS capture_filename, c.size AS capture_size_bytes,
                           c.format AS capture_format, c.source_kind AS capture_source_kind
                    FROM jobs j LEFT JOIN captures c ON c.id = j.capture_id
-                   ORDER BY j.created_at DESC LIMIT ?""",
-                (limit,),
+                   ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?""",
+                (bounded_limit, bounded_offset),
             ).fetchall()
             return [self._public(r) for r in rows]
+
+    def jobs_count(self) -> int:
+        with self.connection() as db:
+            return int(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+
+    def delete_job(self, jid: str) -> dict:
+        unlink_cid: str | None = None
+        capture_deleted = False
+        with self.connection(write=True) as db:
+            row = db.execute(
+                """SELECT j.id, j.state, j.capture_id, c.source_kind
+                   FROM jobs j LEFT JOIN captures c ON c.id = j.capture_id
+                   WHERE j.id=?""",
+                (jid,),
+            ).fetchone()
+            if not row:
+                raise StoreError("job_not_found", 404)
+            if str(row["state"]) in ACTIVE:
+                raise StoreError("job_active_cannot_delete", 409)
+            capture_id = str(row["capture_id"])
+            source_kind = str(row["source_kind"] or "upload")
+            db.execute("DELETE FROM osint_audit WHERE analysis_id=?", (jid,))
+            db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+            ref_count = int(db.execute("SELECT COUNT(*) FROM jobs WHERE capture_id=?", (capture_id,)).fetchone()[0])
+            if ref_count == 0:
+                db.execute("DELETE FROM captures WHERE id=?", (capture_id,))
+                capture_deleted = True
+                if source_kind != "local":
+                    unlink_cid = capture_id
+        if unlink_cid:
+            for ext in ("pcap", "csv", "part"):
+                try:
+                    self.capture_path(unlink_cid, ext).unlink(missing_ok=True)
+                except StoreError:
+                    pass
+        return {
+            "deleted": True,
+            "analysis_id": jid,
+            "capture_deleted": capture_deleted,
+        }
+
+    def prune_jobs(self, *, keep_latest: int = 20, max_age_hours: int | None = None) -> dict:
+        keep = max(0, int(keep_latest))
+        cutoff_dt: datetime | None = None
+        if max_age_hours is not None:
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=max(0, int(max_age_hours)))
+        unlink_targets: list[str] = []
+        deleted_ids: list[str] = []
+        captures_deleted = 0
+        remaining_count = 0
+        with self.connection(write=True) as db:
+            rows = db.execute(
+                """SELECT j.id, j.state, j.created_at, j.capture_id, c.source_kind
+                   FROM jobs j LEFT JOIN captures c ON c.id = j.capture_id
+                   ORDER BY j.created_at DESC, j.id DESC"""
+            ).fetchall()
+            protected_ids = {str(r["id"]) for r in rows[:keep]}
+            case_linked_ids = {
+                str(row[0]) for row in db.execute("SELECT DISTINCT analysis_id FROM case_analyses").fetchall()
+            }
+            for r in rows:
+                jid = str(r["id"])
+                if jid in protected_ids or jid in case_linked_ids or str(r["state"]) in ACTIVE:
+                    continue
+                if cutoff_dt is not None:
+                    try:
+                        created_dt = datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00"))
+                        if created_dt.tzinfo is None:
+                            created_dt = created_dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        continue
+                    if created_dt >= cutoff_dt:
+                        continue
+                capture_id = str(r["capture_id"])
+                source_kind = str(r["source_kind"] or "upload")
+                db.execute("DELETE FROM osint_audit WHERE analysis_id=?", (jid,))
+                db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+                deleted_ids.append(jid)
+                ref_count = int(db.execute("SELECT COUNT(*) FROM jobs WHERE capture_id=?", (capture_id,)).fetchone()[0])
+                if ref_count == 0:
+                    db.execute("DELETE FROM captures WHERE id=?", (capture_id,))
+                    captures_deleted += 1
+                    if source_kind != "local":
+                        unlink_targets.append(capture_id)
+            remaining_count = int(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+        for cid in unlink_targets:
+            for ext in ("pcap", "csv", "part"):
+                try:
+                    self.capture_path(cid, ext).unlink(missing_ok=True)
+                except StoreError:
+                    pass
+        return {
+            "deleted_count": len(deleted_ids),
+            "deleted_ids": deleted_ids,
+            "captures_deleted": captures_deleted,
+            "remaining_count": remaining_count,
+        }
 
     @staticmethod
     def _public(row) -> dict:
@@ -1839,7 +1938,10 @@ class Store:
                 denied = ("api_key_expired", 401)
             else:
                 scopes = set(json.loads(row["scopes"]))
-                if not any(req in scopes for req in required_options) and "admin:keys" not in scopes:
+                is_admin_keys_endpoint = "admin:keys" in scopes and (
+                    endpoint == "/api/v1/auth/keys" or endpoint.startswith("/api/v1/auth/keys/")
+                )
+                if not any(req in scopes for req in required_options) and not is_admin_keys_endpoint:
                     first_req = required_options[0] if required_options else ""
                     db.execute(
                         "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",

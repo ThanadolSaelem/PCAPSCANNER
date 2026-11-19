@@ -159,6 +159,7 @@ const NAV_GROUPS: { group: string; items: { id: Screen; label: string; icon: Ico
 ];
 
 const ACTIVE_STATES = new Set<JobSummary["state"]>(["queued", "parsing", "awaiting_ai", "generating"]);
+const JOBS_PAGE_SIZE = 20;
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   return (
@@ -289,8 +290,12 @@ function App() {
   const [aiModels, setAiModels] = useState<AIModelsResponse | null>(null);
   const [localBrowse, setLocalBrowse] = useState<LocalBrowseResponse | null>(null);
   const [jobs, setJobs] = useState<JobSummary[]>([]);
+  const [jobsTotal, setJobsTotal] = useState(0);
+  const [jobsPage, setJobsPage] = useState(0);
+  const [jobsMutating, setJobsMutating] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isPickingPath, setIsPickingPath] = useState(false);
+  const [privacyMode, setPrivacyMode] = useState(false);
 
   // Active report is empty until a real backend or local CSV analysis is selected.
   const [activeReport, setActiveReport] = useState<WorkspaceReport>(() => emptyWorkspaceReport());
@@ -336,7 +341,8 @@ function App() {
   const pauseRequestedRef = useRef(false);
   const autoLoadedJobRef = useRef<string | null>(null);
   const userSetResourceModeRef = useRef(false);
-  const userToggledAiRef = useRef(false);
+  const jobsPageRef = useRef(0);
+  jobsPageRef.current = jobsPage;
   const workspaceRefreshGenerationRef = useRef(0);
   const toastSeqRef = useRef(0);
   const toastTimersRef = useRef<Map<number, number>>(new Map());
@@ -344,6 +350,11 @@ function App() {
   const api = useMemo(() => new PcapApiClient(backendUrl, bearerToken), [backendUrl, bearerToken]);
   const workspaceApiRef = useRef(api);
   const consentPolicyRef = useRef<string | null>(null);
+  const redactor = useMemo(() => new PrivacyRedactor(privacyMode), [privacyMode]);
+  const displayReport = useMemo(
+    () => (privacyMode ? redactor.redactReport(activeReport) : activeReport),
+    [activeReport, privacyMode, redactor],
+  );
 
   useEffect(() => {
     const nextPolicy = aiConfig?.policy_hash ?? null;
@@ -355,13 +366,12 @@ function App() {
   }, [aiConfig?.policy_hash]);
 
   useEffect(() => {
-    if (!aiConfig || userToggledAiRef.current) return;
+    if (!aiConfig) return;
     const ready = Boolean(aiConfig.configuration.enabled && aiConfig.configuration.model);
-    setAiEnabled(ready);
     if (!ready) setAiConsent(false);
   }, [aiConfig]);
 
-  const activeFindingList = activeReport.findings;
+  const activeFindingList = displayReport.findings;
   const selectedFinding: WorkspaceFinding | null =
     activeFindingList.find((f) => f.id === selectedFindingId) ?? activeFindingList[0] ?? null;
 
@@ -456,7 +466,7 @@ function App() {
           api.getWorkspaceConfig(),
           api.getAiConfig(),
           api.browseLocalCaptures(),
-          api.listJobs(50),
+          api.listJobsPage(JOBS_PAGE_SIZE, jobsPageRef.current * JOBS_PAGE_SIZE),
         ]);
         if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
 
@@ -487,7 +497,23 @@ function App() {
         if (wsRes.status === "fulfilled") setWorkspaceConfig(wsRes.value);
         if (cfgRes.status === "fulfilled") setAiConfig(cfgRes.value);
         if (browseRes.status === "fulfilled") setLocalBrowse(browseRes.value);
-        setJobs(jobsRes.value);
+        const pageData = jobsRes.value;
+        const maxPage = Math.max(0, Math.ceil(pageData.total / JOBS_PAGE_SIZE) - 1);
+        if (jobsPageRef.current > maxPage) {
+          try {
+            const clamped = await api.listJobsPage(JOBS_PAGE_SIZE, maxPage * JOBS_PAGE_SIZE);
+            if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
+            setJobs(clamped.items);
+            setJobsTotal(clamped.total);
+            setJobsPage(maxPage);
+          } catch {
+            setJobs(pageData.items);
+            setJobsTotal(pageData.total);
+          }
+        } else {
+          setJobs(pageData.items);
+          setJobsTotal(pageData.total);
+        }
         if (!quiet) pushToast("เชื่อมต่อ FastAPI backend สำเร็จ", "success");
 
         void api
@@ -522,23 +548,47 @@ function App() {
     void refreshWorkspace(true);
   }, [refreshWorkspace]);
 
+  const loadJobsPage = useCallback(
+    async (targetPage: number) => {
+      if (connectionStatus !== "connected") return;
+      const safePage = Math.max(0, Math.trunc(targetPage));
+      try {
+        let res = await api.listJobsPage(JOBS_PAGE_SIZE, safePage * JOBS_PAGE_SIZE);
+        const maxPage = Math.max(0, Math.ceil(res.total / JOBS_PAGE_SIZE) - 1);
+        if (safePage > maxPage) {
+          res = await api.listJobsPage(JOBS_PAGE_SIZE, maxPage * JOBS_PAGE_SIZE);
+          setJobsPage(maxPage);
+        } else {
+          setJobsPage(safePage);
+        }
+        setJobs(res.items);
+        setJobsTotal(res.total);
+      } catch (err) {
+        pushToast("โหลดคิวงานไม่สำเร็จ", "error", safeFormatError(err));
+      }
+    },
+    [api, connectionStatus, pushToast],
+  );
+
   const loadBackendReport = useCallback(
     async (analysisId: string, targetScreen?: Screen) => {
       try {
         const raw = await api.getReport(analysisId);
         const adapted = adaptBackendReport(raw);
+        autoLoadedJobRef.current = analysisId;
         setActiveReport(adapted);
         setActiveJobId(analysisId);
         setSelectedFindingId(adapted.findings[0]?.id ?? "");
         setProtocolFilter("All protocols");
         setPacketSearch("");
-        pushToast(`โหลดผลวิเคราะห์ ${adapted.fileName}`, "success", `${adapted.findings.length} deterministic findings`);
+        const displayName = privacyMode ? redactor.redactFilename(adapted.fileName) : adapted.fileName;
+        pushToast(`โหลดผลวิเคราะห์ ${displayName}`, "success", `${adapted.findings.length} deterministic findings`);
         if (targetScreen) navigate(targetScreen);
       } catch (err) {
         pushToast("โหลดรายงานไม่สำเร็จ", "error", safeFormatError(err));
       }
     },
-    [api, navigate, pushToast],
+    [api, navigate, privacyMode, pushToast, redactor],
   );
 
   // Poll live job queue while any job is running
@@ -547,10 +597,18 @@ function App() {
     if (connectionStatus !== "connected" || !hasRunningJobs) return;
     const timer = window.setInterval(async () => {
       try {
-        const updated = await api.listJobs(50);
-        setJobs(updated);
+        const updatedPage = await api.listJobsPage(JOBS_PAGE_SIZE, jobsPageRef.current * JOBS_PAGE_SIZE);
+        setJobs(updatedPage.items);
+        setJobsTotal(updatedPage.total);
         if (activeJobId && autoLoadedJobRef.current !== activeJobId) {
-          const target = updated.find((j) => j.id === activeJobId);
+          let target = updatedPage.items.find((j) => j.id === activeJobId);
+          if (!target) {
+            try {
+              target = await api.getJob(activeJobId);
+            } catch {
+              target = undefined;
+            }
+          }
           if (target && target.evidence_available && !ACTIVE_STATES.has(target.state)) {
             autoLoadedJobRef.current = activeJobId;
             await loadBackendReport(activeJobId);
@@ -565,7 +623,14 @@ function App() {
 
   // Select the first completed backend job automatically from the empty workspace state.
   useEffect(() => {
-    if (connectionStatus !== "connected" || jobs.length === 0 || activeReport.origin !== "empty") return;
+    if (
+      connectionStatus !== "connected" ||
+      jobs.length === 0 ||
+      activeReport.origin !== "empty" ||
+      autoLoadedJobRef.current === "__manual_clear__"
+    ) {
+      return;
+    }
     const readyJob = jobs.find((j) => j.evidence_available);
     if (readyJob && autoLoadedJobRef.current !== readyJob.id) {
       autoLoadedJobRef.current = readyJob.id;
@@ -611,28 +676,37 @@ function App() {
     }
   };
 
-  const handleUploadAndAnalyze = async () => {
+  const handleUploadAndAnalyze = async (options: { forceOffline?: boolean } = {}) => {
     if (!selectedFile || isSubmitting) return;
     if (connectionStatus !== "connected") {
       openConnectionModal("connection");
       pushToast("เชื่อมต่อ Backend API ก่อนอัปโหลดไฟล์ไบนารี", "warn", "หรือใช้โหมด Local CSV ในเบราว์เซอร์");
       return;
     }
-    if (aiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
+    const effectiveAiEnabled = options.forceOffline ? false : aiEnabled;
+    const effectiveAiConsent = options.forceOffline ? false : aiConsent;
+    const effectiveTriageEndpointConsent = options.forceOffline ? false : triageEndpointConsent;
+    if (options.forceOffline) {
+      setAiEnabled(false);
+      setAiConsent(false);
+      setTriageEndpointConsent(false);
+    }
+
+    if (effectiveAiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
       setConsentPromptNonce((n) => n + 1);
       pushToast(
         "Layer-2 AI ยังไม่พร้อมใช้งาน",
         "warn",
-        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'ปิด LLM (ใช้ Offline ทันที)' เพื่อวิเคราะห์ทันที",
+        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'วิเคราะห์แบบ Offline ทันที'",
       );
       return;
     }
-    if (aiEnabled && !aiConsent) {
+    if (effectiveAiEnabled && !effectiveAiConsent) {
       setConsentPromptNonce((n) => n + 1);
       pushToast(
         "กรุณาติ๊กยืนยัน Consent สำหรับ AI Narrative",
         "warn",
-        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'ไม่ใช้ LLM รอบนี้' เพื่อวิเคราะห์ Offline ทันที",
+        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'วิเคราะห์แบบ Offline ทันที'",
       );
       return;
     }
@@ -665,20 +739,22 @@ function App() {
       setResumeOffset(0);
       const job = await api.startAnalysis({
         captureId: receipt.capture_id,
-        aiEnabled,
-        aiConsent,
+        aiEnabled: effectiveAiEnabled,
+        aiConsent: effectiveAiConsent,
         resourceMode,
         triageEnabled,
-        triageEndpointConsent,
+        triageEndpointConsent: effectiveTriageEndpointConsent,
       });
       autoLoadedJobRef.current = null;
       setActiveJobId(job.id);
-      const updated = await api.listJobs(50);
-      setJobs(updated);
+      setJobsPage(0);
+      const pageRes = await api.listJobsPage(JOBS_PAGE_SIZE, 0);
+      setJobs(pageRes.items);
+      setJobsTotal(pageRes.total);
       pushToast(
         `ส่งงานวิเคราะห์แล้ว (${job.id.slice(0, 8)})`,
         "success",
-        aiEnabled ? "รัน Layer-1 Tier-1 + Layer-2 AI Narrator" : "รัน Deterministic + Layer-1 Tier-1/ET-BERT",
+        effectiveAiEnabled ? "รัน Layer-1 Tier-1 + Layer-2 AI Narrator" : "รัน Deterministic + Layer-1 Tier-1/ET-BERT (Offline)",
       );
       navigate("jobs");
     } catch (err) {
@@ -720,7 +796,7 @@ function App() {
     pushToast("ล้างไฟล์ชั่วคราวที่อัปโหลดค้างไว้แล้ว", "info");
   };
 
-  const handleRegisterLocalCapture = async () => {
+  const handleRegisterLocalCapture = async (options: { forceOffline?: boolean } = {}) => {
     const clean = localPathInput.trim();
     if ((!clean && !localFileGrantToken) || isSubmitting) return;
     if (connectionStatus !== "connected") {
@@ -728,21 +804,30 @@ function App() {
       pushToast("เชื่อมต่อ Backend API ก่อนลงทะเบียน Local Capture", "warn");
       return;
     }
-    if (aiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
+    const effectiveAiEnabled = options.forceOffline ? false : aiEnabled;
+    const effectiveAiConsent = options.forceOffline ? false : aiConsent;
+    const effectiveTriageEndpointConsent = options.forceOffline ? false : triageEndpointConsent;
+    if (options.forceOffline) {
+      setAiEnabled(false);
+      setAiConsent(false);
+      setTriageEndpointConsent(false);
+    }
+
+    if (effectiveAiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
       setConsentPromptNonce((n) => n + 1);
       pushToast(
         "Layer-2 AI ยังไม่พร้อมใช้งาน",
         "warn",
-        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'ปิด LLM (ใช้ Offline ทันที)' เพื่อวิเคราะห์ทันที",
+        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'วิเคราะห์แบบ Offline ทันที'",
       );
       return;
     }
-    if (aiEnabled && !aiConsent) {
+    if (effectiveAiEnabled && !effectiveAiConsent) {
       setConsentPromptNonce((n) => n + 1);
       pushToast(
         "กรุณาติ๊กยืนยัน Consent สำหรับ AI Narrative",
         "warn",
-        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'ไม่ใช้ LLM รอบนี้' เพื่อวิเคราะห์ Offline ทันที",
+        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'วิเคราะห์แบบ Offline ทันที'",
       );
       return;
     }
@@ -755,16 +840,18 @@ function App() {
       if (fileGrantToken) setLocalFileGrantToken(null);
       const job = await api.startAnalysis({
         captureId: receipt.capture_id,
-        aiEnabled,
-        aiConsent,
+        aiEnabled: effectiveAiEnabled,
+        aiConsent: effectiveAiConsent,
         resourceMode,
         triageEnabled,
-        triageEndpointConsent,
+        triageEndpointConsent: effectiveTriageEndpointConsent,
       });
       autoLoadedJobRef.current = null;
       setActiveJobId(job.id);
-      const updated = await api.listJobs(50);
-      setJobs(updated);
+      setJobsPage(0);
+      const pageRes = await api.listJobsPage(JOBS_PAGE_SIZE, 0);
+      setJobs(pageRes.items);
+      setJobsTotal(pageRes.total);
       pushToast(`ลงทะเบียน local capture (${formatBytes(receipt.size_bytes)}) และเข้าคิวงานแล้ว`, "success");
       navigate("jobs");
     } catch (err) {
@@ -782,6 +869,66 @@ function App() {
       pushToast(`ส่งคำขอยกเลิกงาน ${jobId.slice(0, 8)} แล้ว`, "info");
     } catch (err) {
       pushToast("ยกเลิกงานไม่สำเร็จ", "error", safeFormatError(err));
+    }
+  };
+
+  const handleDeleteJob = async (jobId: string) => {
+    if (jobsMutating) return;
+    const target = jobs.find((j) => j.id === jobId);
+    const rawName = target?.capture_filename ?? `capture-${jobId.slice(0, 8)}`;
+    const displayName = privacyMode ? redactor.redactFilename(rawName) : rawName;
+    if (!window.confirm(`ลบงานวิเคราะห์ ${displayName} (${jobId.slice(0, 8)}) ออกจากฐานข้อมูลหรือไม่?`)) {
+      return;
+    }
+    setJobsMutating(true);
+    try {
+      await api.deleteJob(jobId);
+      if (activeJobId === jobId || (activeReport.origin === "live" && activeReport.analysisId === jobId)) {
+        autoLoadedJobRef.current = "__manual_clear__";
+        setActiveJobId(null);
+        setActiveReport(emptyWorkspaceReport());
+        setSelectedFindingId("");
+      }
+      await loadJobsPage(jobsPageRef.current);
+      pushToast(`ลบงาน ${jobId.slice(0, 8)} แล้ว`, "info");
+    } catch (err) {
+      pushToast("ลบงานไม่สำเร็จ", "error", safeFormatError(err));
+    } finally {
+      setJobsMutating(false);
+    }
+  };
+
+  const handlePruneJobs = async () => {
+    if (jobsMutating || connectionStatus !== "connected") return;
+    if (
+      !window.confirm(
+        `ล้างงานเก่าที่จบแล้วโดยเก็บ ${JOBS_PAGE_SIZE} งานล่าสุด (งานที่กำลังรันและงานที่ผูกกับ Investigation Case จะไม่ถูกลบ) หรือไม่?`,
+      )
+    ) {
+      return;
+    }
+    setJobsMutating(true);
+    try {
+      const res = await api.pruneJobs({ keep_latest: JOBS_PAGE_SIZE });
+      if (
+        (activeJobId && res.deleted_ids.includes(activeJobId)) ||
+        (activeReport.origin === "live" && res.deleted_ids.includes(activeReport.analysisId))
+      ) {
+        autoLoadedJobRef.current = "__manual_clear__";
+        setActiveJobId(null);
+        setActiveReport(emptyWorkspaceReport());
+        setSelectedFindingId("");
+      }
+      await loadJobsPage(0);
+      pushToast(
+        res.deleted_count > 0 ? `ล้างงานเก่า ${res.deleted_count} รายการแล้ว` : "ไม่มีงานเก่าที่เข้าเกณฑ์ล้าง",
+        "info",
+        `คงเหลือ ${res.remaining_count} รายการในฐานข้อมูล`,
+      );
+    } catch (err) {
+      pushToast("ล้างงานเก่าไม่สำเร็จ", "error", safeFormatError(err));
+    } finally {
+      setJobsMutating(false);
     }
   };
 
@@ -805,13 +952,14 @@ function App() {
       return;
     }
     const slug = activeReport.caseId.toLowerCase();
+    const exportOptions = { redact: privacyMode, redactor };
     if (kind === "json") {
-      downloadTextFile(`${slug}-report.json`, exportReportJson(activeReport), "application/json");
+      downloadTextFile(`${slug}-report.json`, exportReportJson(activeReport, exportOptions), "application/json");
       pushToast(`ดาวน์โหลด ${slug}-report.json แล้ว`, "success");
       return;
     }
     if (kind === "markdown") {
-      downloadTextFile(`${slug}-report.md`, exportReportMarkdown(activeReport), "text/markdown");
+      downloadTextFile(`${slug}-report.md`, exportReportMarkdown(activeReport, exportOptions), "text/markdown");
       pushToast(`ดาวน์โหลด ${slug}-report.md แล้ว`, "success");
       return;
     }
@@ -822,23 +970,23 @@ function App() {
       }
       try {
         if (kind === "stix") {
-          const stix = await api.getStixJson(activeReport.analysisId);
+          const stix = await api.getStixJson(activeReport.analysisId, { redact: privacyMode });
           downloadTextFile(`${slug}-stix-2.1.json`, stix, "application/stix+json");
           pushToast(`ดาวน์โหลด ${slug}-stix-2.1.json แล้ว`, "success");
         } else if (kind === "csv") {
-          const csv = await api.getExportCsv(activeReport.analysisId);
+          const csv = await api.getExportCsv(activeReport.analysisId, { redact: privacyMode });
           downloadTextFile(`${slug}-export.csv`, csv, "text/csv");
           pushToast(`ดาวน์โหลด ${slug}-export.csv แล้ว`, "success");
         } else if (kind === "cef") {
-          const cef = await api.getExportCef(activeReport.analysisId);
+          const cef = await api.getExportCef(activeReport.analysisId, { redact: privacyMode });
           downloadTextFile(`${slug}-findings.cef`, cef, "text/plain");
           pushToast(`ดาวน์โหลด ${slug}-findings.cef แล้ว`, "success");
         } else if (kind === "navigator") {
-          const nav = await api.getExportNavigatorJson(activeReport.analysisId);
+          const nav = await api.getExportNavigatorJson(activeReport.analysisId, { redact: privacyMode });
           downloadTextFile(`${slug}-attack-navigator.json`, nav, "application/json");
           pushToast(`ดาวน์โหลด ${slug}-attack-navigator.json แล้ว`, "success");
         } else if (kind === "pdf") {
-          const blob = await api.getExportPdfBlob(activeReport.analysisId);
+          const blob = await api.getExportPdfBlob(activeReport.analysisId, { redact: privacyMode });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
@@ -854,7 +1002,7 @@ function App() {
       }
       return;
     }
-    if (activeReport.origin === "live" && connectionStatus === "connected") {
+    if (activeReport.origin === "live" && connectionStatus === "connected" && !privacyMode) {
       try {
         const jsonl = await api.getTriageJsonl(activeReport.analysisId);
         downloadTextFile(`${slug}-triage.jsonl`, jsonl, "application/x-ndjson");
@@ -864,8 +1012,15 @@ function App() {
         pushToast("ใช้ JSONL fallback ชั่วคราว", "warn", safeFormatError(err));
       }
     }
-    downloadTextFile(`${slug}-triage.jsonl`, exportTriageJsonlFallback(activeReport), "application/x-ndjson");
-    pushToast(`ดาวน์โหลด ${slug}-triage.jsonl แล้ว`, "success");
+    downloadTextFile(
+      `${slug}-triage.jsonl`,
+      exportTriageJsonlFallback(activeReport, exportOptions),
+      "application/x-ndjson",
+    );
+    pushToast(
+      privacyMode ? `ดาวน์โหลด ${slug}-triage.jsonl (Redacted) แล้ว` : `ดาวน์โหลด ${slug}-triage.jsonl แล้ว`,
+      "success",
+    );
   };
 
   const saveConnectionSettings = async (nextUrl: string, nextToken: string) => {
@@ -885,6 +1040,8 @@ function App() {
     sessionStorage.removeItem(SESSION_TOKEN_KEY);
     setBearerToken("");
     setJobs([]);
+    setJobsTotal(0);
+    setJobsPage(0);
     setCapabilities(null);
     setWorkspaceConfig(null);
     setAiConfig(null);
@@ -1100,10 +1257,10 @@ function App() {
             aria-expanded={caseDropdownOpen}
             onClick={() => setCaseDropdownOpen((v) => !v)}
           >
-            <div className="case-avatar">{activeReport.origin === "live" ? "LV" : activeReport.origin === "local-csv" ? "CS" : "—"}</div>
+            <div className="case-avatar">{displayReport.origin === "live" ? "LV" : displayReport.origin === "local-csv" ? "CS" : "—"}</div>
             <div className="case-meta">
-              <span>{activeReport.origin === "live" ? "LIVE CASE" : activeReport.origin === "local-csv" ? "LOCAL CSV CASE" : "NO ACTIVE CASE"}</span>
-              <strong>{activeReport.caseId}</strong>
+              <span>{displayReport.origin === "live" ? "LIVE CASE" : displayReport.origin === "local-csv" ? "LOCAL CSV CASE" : "NO ACTIVE CASE"}</span>
+              <strong>{displayReport.caseId}</strong>
             </div>
             <Icon name="chevron" size={15} />
           </button>
@@ -1115,13 +1272,13 @@ function App() {
                 <button
                   type="button"
                   key={j.id}
-                  className={`case-option ${activeReport.analysisId === j.id ? "case-option-active" : ""}`}
+                  className={`case-option ${displayReport.analysisId === j.id ? "case-option-active" : ""}`}
                   onClick={() => {
                     setCaseDropdownOpen(false);
                     void loadBackendReport(j.id);
                   }}
                 >
-                  <strong>{j.capture_filename ?? `capture-${j.id.slice(0, 8)}`}</strong>
+                  <strong>{redactor.redactFilename(j.capture_filename ?? `capture-${j.id.slice(0, 8)}`)}</strong>
                   <small className="mono">
                     {j.finding_count ?? 0} findings · {j.capture_size_bytes ? formatBytes(j.capture_size_bytes) : j.resource_mode}
                   </small>
@@ -1130,14 +1287,14 @@ function App() {
               {lastLocalCsvReport && (
                 <button
                   type="button"
-                  className={`case-option ${activeReport.analysisId === lastLocalCsvReport.analysisId ? "case-option-active" : ""}`}
+                  className={`case-option ${displayReport.analysisId === lastLocalCsvReport.analysisId ? "case-option-active" : ""}`}
                   onClick={() => {
                     setCaseDropdownOpen(false);
                     setActiveReport(lastLocalCsvReport);
                     setSelectedFindingId(lastLocalCsvReport.findings[0]?.id ?? "");
                   }}
                 >
-                  <strong>{lastLocalCsvReport.fileName} (Browser CSV)</strong>
+                  <strong>{redactor.redactFilename(lastLocalCsvReport.fileName)} (Browser CSV)</strong>
                   <small className="mono">
                     {lastLocalCsvReport.findings.length} findings · {lastLocalCsvReport.sizeLabel}
                   </small>
@@ -1157,9 +1314,9 @@ function App() {
               {group.items.map((item) => {
                 const badge =
                   item.id === "jobs"
-                    ? String(activeJobCount > 0 ? activeJobCount : jobs.length)
+                    ? String(activeJobCount > 0 ? activeJobCount : jobsTotal || jobs.length)
                     : item.id === "findings"
-                      ? String(activeReport.findings.length)
+                      ? String(displayReport.findings.length)
                       : undefined;
                 return (
                   <button
@@ -1196,7 +1353,13 @@ function App() {
             <div className="profile-avatar">OP</div>
             <span>
               <b>Analyst workspace</b>
-              <small>{connectionStatus === "connected" ? backendUrl || "Same-origin /api" : "No server session"}</small>
+              <small>
+                {connectionStatus === "connected"
+                  ? backendUrl
+                    ? redactor.redactEndpoint(backendUrl)
+                    : "Same-origin /api"
+                  : "No server session"}
+              </small>
             </span>
             <button
               className="icon-button tiny"
@@ -1226,6 +1389,16 @@ function App() {
           <div className="topbar-right">
             <button
               type="button"
+              className={`privacy-pill ${privacyMode ? "privacy-pill-on" : ""}`}
+              aria-pressed={privacyMode}
+              title="Pseudonymize IPs, domains, hashes, paths, and filenames across the entire workbench and exports"
+              onClick={() => setPrivacyMode((prev) => !prev)}
+            >
+              <Icon name="shield" size={13} />
+              <span>{privacyMode ? "Privacy ON" : "Privacy OFF"}</span>
+            </button>
+            <button
+              type="button"
               className={pillClass}
               title="เปิด Workspace Settings (AI Models, Storage & Connection)"
               onClick={() => openConnectionModal()}
@@ -1246,7 +1419,7 @@ function App() {
         </header>
 
         <main className="main-content">
-          {activeReport.origin === "empty" ? (
+          {displayReport.origin === "empty" ? (
             <div className="capture-context-bar">
               <button
                 type="button"
@@ -1264,15 +1437,15 @@ function App() {
                   เลือกไฟล์วิเคราะห์ <Icon name="arrow" size={13} />
                 </span>
               </button>
-              {jobs.length > 0 && (
+              {(jobsTotal > 0 || jobs.length > 0) && (
                 <div className="capture-context-quick">
                   <button type="button" className="context-chip-btn" onClick={() => navigate("jobs")}>
-                    คิวงาน ({jobs.length})
+                    คิวงาน ({jobsTotal || jobs.length})
                   </button>
                 </div>
               )}
             </div>
-          ) : activeReport.origin === "local-csv" ? (
+          ) : displayReport.origin === "local-csv" ? (
             <div className="capture-context-bar capture-context-local">
               <button
                 type="button"
@@ -1283,11 +1456,11 @@ function App() {
                   <Icon name="shield" size={12} /> LOCAL CSV
                 </span>
                 <div className="capture-context-main">
-                  <strong>{activeReport.fileName}</strong>
+                  <strong>{displayReport.fileName}</strong>
                   <div className="capture-context-chips mono">
-                    <span>{activeReport.sizeLabel}</span>
-                    <span>{formatCompactCount(activeReport.packetsAnalyzed)} pkts</span>
-                    <span>{activeReport.findings.length} findings</span>
+                    <span>{displayReport.sizeLabel}</span>
+                    <span>{formatCompactCount(displayReport.packetsAnalyzed)} pkts</span>
+                    <span>{displayReport.findings.length} findings</span>
                     <span>Browser Offline</span>
                   </div>
                 </div>
@@ -1315,12 +1488,12 @@ function App() {
                   <Icon name="check" size={12} /> LIVE CASE
                 </span>
                 <div className="capture-context-main">
-                  <strong>{activeReport.fileName}</strong>
+                  <strong>{displayReport.fileName}</strong>
                   <div className="capture-context-chips mono">
-                    <span>{activeReport.sizeLabel}</span>
-                    <span>{formatCompactCount(activeReport.packetsAnalyzed)} pkts</span>
-                    <span>{activeReport.parsedPct} coverage</span>
-                    <span>{activeReport.findings.length} findings</span>
+                    <span>{displayReport.sizeLabel}</span>
+                    <span>{formatCompactCount(displayReport.packetsAnalyzed)} pkts</span>
+                    <span>{displayReport.parsedPct} coverage</span>
+                    <span>{displayReport.findings.length} findings</span>
                   </div>
                 </div>
                 <span className="capture-context-cta">
@@ -1329,7 +1502,7 @@ function App() {
               </button>
               <div className="capture-context-quick">
                 <button type="button" className="context-chip-btn" onClick={() => navigate("findings")}>
-                  Findings ({activeReport.findings.length})
+                  Findings ({displayReport.findings.length})
                 </button>
                 <button type="button" className="context-chip-btn" onClick={() => navigate("traffic")}>
                   Packets
@@ -1343,7 +1516,8 @@ function App() {
 
           {screen === "overview" && (
             <OverviewPage
-              report={activeReport}
+              report={displayReport}
+              privacyRedactor={redactor}
               onNavigate={navigate}
               onSelectFinding={openEvidence}
               onFilterByIp={(ip) => {
@@ -1354,8 +1528,8 @@ function App() {
               onFilterByProtocol={(proto) => {
                 const upper = proto.toUpperCase();
                 const matched =
-                  activeReport.packets.find((p) => p.protocol.toUpperCase() === upper)?.protocol ??
-                  activeReport.flows.find((f) => f.protocol.toUpperCase() === upper)?.protocol ??
+                  displayReport.packets.find((p) => p.protocol.toUpperCase() === upper)?.protocol ??
+                  displayReport.flows.find((f) => f.protocol.toUpperCase() === upper)?.protocol ??
                   proto;
                 setProtocolFilter(matched);
                 navigate("traffic");
@@ -1398,7 +1572,6 @@ function App() {
               setTriageEndpointConsent={setTriageEndpointConsent}
               aiEnabled={aiEnabled}
               setAiEnabled={(val) => {
-                userToggledAiRef.current = true;
                 setAiEnabled(val);
                 if (!val) setAiConsent(false);
               }}
@@ -1411,12 +1584,14 @@ function App() {
               isPickingPath={isPickingPath}
               resumeUploadId={resumeUploadId}
               localCsvProgress={localCsvProgress}
+              privacyRedactor={redactor}
               onUploadAndAnalyze={handleUploadAndAnalyze}
               onPauseUpload={handlePauseUpload}
               onAbortUpload={handleAbortUpload}
               onQuickCsvAnalyze={handleQuickCsvAnalyze}
               onRegisterLocalCapture={handleRegisterLocalCapture}
               onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
+              onClearModelPath={() => void handleClearModelPath()}
               onRemoveLocalRoot={(root) => void handleRemoveLocalRoot(root)}
               onSaveAiConfig={handleSaveAiConfig}
               onProbeAiModels={handleProbeAiModels}
@@ -1433,11 +1608,19 @@ function App() {
               connectionStatus={connectionStatus}
               capabilities={capabilities}
               jobs={jobs}
+              jobsTotal={jobsTotal}
+              jobsPage={jobsPage}
+              jobsPageSize={JOBS_PAGE_SIZE}
+              jobsMutating={jobsMutating}
               activeJobId={activeJobId}
-              report={activeReport}
+              report={displayReport}
               aiEnabled={aiEnabled}
+              privacyRedactor={redactor}
               onNavigate={navigate}
               onCancelJob={handleCancelJob}
+              onDeleteJob={handleDeleteJob}
+              onPruneJobs={handlePruneJobs}
+              onChangeJobsPage={(p) => void loadJobsPage(p)}
               onOpenJobReport={(id, target) => void loadBackendReport(id, target)}
               onRefreshJobs={() => void refreshWorkspace(false)}
             />
@@ -1445,20 +1628,25 @@ function App() {
 
           {screen === "findings" && (
             <FindingsPage
-              report={activeReport}
+              report={displayReport}
+              rawReport={activeReport}
               severityFilter={severityFilter}
               setSeverityFilter={setSeverityFilter}
               protocolFilter={protocolFilter}
+              setProtocolFilter={setProtocolFilter}
               packetSearch={packetSearch}
+              setPacketSearch={setPacketSearch}
               selectedFinding={selectedFinding}
               setSelectedFinding={setSelectedFindingId}
+              privacyRedactor={redactor}
               onOpenEvidence={openEvidence}
             />
           )}
 
           {screen === "traffic" && (
             <TrafficPage
-              report={activeReport}
+              report={displayReport}
+              rawReport={activeReport}
               severityFilter={severityFilter}
               setSeverityFilter={setSeverityFilter}
               protocolFilter={protocolFilter}
@@ -1468,17 +1656,21 @@ function App() {
               selectedFinding={selectedFinding}
               trafficView={trafficView}
               setTrafficView={setTrafficView}
+              privacyRedactor={redactor}
               onOpenEvidence={openEvidence}
             />
           )}
 
           {screen === "reports" && (
             <ReportsPage
-              report={activeReport}
+              report={displayReport}
               apiClient={api}
               connected={connectionStatus === "connected"}
               aiConfig={aiConfig}
               aiModels={aiModels}
+              privacyMode={privacyMode}
+              onTogglePrivacyMode={() => setPrivacyMode((prev) => !prev)}
+              privacyRedactor={redactor}
               onSaveAiConfig={handleSaveAiConfig}
               onProbeAiModels={handleProbeAiModels}
               onExport={(kind) => void handleExport(kind)}
@@ -1499,6 +1691,7 @@ function App() {
               apiClient={api}
               connected={connectionStatus === "connected"}
               jobs={jobs}
+              privacyRedactor={redactor}
               onOpenAnalysis={(id) => void loadBackendReport(id, "reports")}
             />
           )}
@@ -2565,12 +2758,14 @@ function Receipt({ label, value, mono = false }: { label: string; value: string;
 
 function OverviewPage({
   report,
+  privacyRedactor,
   onNavigate,
   onSelectFinding,
   onFilterByIp,
   onFilterByProtocol,
 }: {
   report: WorkspaceReport;
+  privacyRedactor?: PrivacyRedactor;
   onNavigate: (screen: Screen) => void;
   onSelectFinding: (finding: WorkspaceFinding) => void;
   onFilterByIp?: (ip: string) => void;
@@ -2863,6 +3058,7 @@ function OverviewPage({
           <AnalyticsVisuals
             analytics={report.rawBundle.flow_analytics}
             protocolCounts={report.rawBundle.telemetry?.protocol_counts}
+            privacyRedactor={privacyRedactor}
             onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
             onSelectProtocolFilter={(proto) => (onFilterByProtocol ? onFilterByProtocol(proto) : onNavigate("traffic"))}
           />
@@ -2873,6 +3069,7 @@ function OverviewPage({
         <section className="panel geomap-section-panel panel-enter">
           <WorldFlowMap
             geoip={report.rawBundle.geoip}
+            privacyRedactor={privacyRedactor}
             onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
           />
         </section>
@@ -2915,12 +3112,14 @@ function AnalyzePage({
   isPickingPath,
   resumeUploadId,
   localCsvProgress,
+  privacyRedactor,
   onUploadAndAnalyze,
   onPauseUpload,
   onAbortUpload,
   onQuickCsvAnalyze,
   onRegisterLocalCapture,
   onPickNativePath,
+  onClearModelPath,
   onRemoveLocalRoot,
   onSaveAiConfig,
   onProbeAiModels,
@@ -2963,12 +3162,14 @@ function AnalyzePage({
   isPickingPath: boolean;
   resumeUploadId: string | null;
   localCsvProgress: number | null;
-  onUploadAndAnalyze: () => void;
+  privacyRedactor?: PrivacyRedactor;
+  onUploadAndAnalyze: (options?: { forceOffline?: boolean }) => void;
   onPauseUpload: () => void;
   onAbortUpload: () => void;
   onQuickCsvAnalyze: (file: File) => void;
-  onRegisterLocalCapture: () => void;
+  onRegisterLocalCapture: (options?: { forceOffline?: boolean }) => void;
   onPickNativePath: (purpose: NativePickPurpose) => void;
+  onClearModelPath: () => void;
   onRemoveLocalRoot: (root: string) => void;
   onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
   onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
@@ -2983,6 +3184,11 @@ function AnalyzePage({
   const [dragging, setDragging] = useState(false);
   const [quickAiBusy, setQuickAiBusy] = useState(false);
   const [consentHighlighted, setConsentHighlighted] = useState(false);
+  const [localPathFocused, setLocalPathFocused] = useState(false);
+
+  const maskFilename = (value: string) => (privacyRedactor ? privacyRedactor.redactFilename(value) : value);
+  const maskPath = (value: string) => (privacyRedactor ? privacyRedactor.redactPath(value) : value);
+  const maskEndpoint = (value: string) => (privacyRedactor ? privacyRedactor.redactEndpoint(value) : value);
 
   useEffect(() => {
     if (consentPromptNonce === 0) return;
@@ -3048,10 +3254,21 @@ function AnalyzePage({
       capabilities?.triage.etbert_endpoint_configured,
   );
   const triageEndpointTargets = [
-    aiConfig?.triage?.endpoint_url ? `OpenJev ${safeEndpointOrigin(aiConfig.triage.endpoint_url) ?? "configured endpoint"}` : null,
-    aiConfig?.triage?.etbert_endpoint_url ? `ET-BERT ${safeEndpointOrigin(aiConfig.triage.etbert_endpoint_url) ?? "configured endpoint"}` : null,
+    aiConfig?.triage?.endpoint_url
+      ? `OpenJev ${maskEndpoint(safeEndpointOrigin(aiConfig.triage.endpoint_url) ?? "configured endpoint")}`
+      : null,
+    aiConfig?.triage?.etbert_endpoint_url
+      ? `ET-BERT ${maskEndpoint(safeEndpointOrigin(aiConfig.triage.etbert_endpoint_url) ?? "configured endpoint")}`
+      : null,
   ].filter((value): value is string => Boolean(value));
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
+  const displayDataDir = resolvedDataDir ? maskPath(resolvedDataDir) : "";
+  const displayLocalPathInput =
+    !localPathFocused && privacyRedactor?.isEnabled() && localPathInput.trim()
+      ? hasLocalFileGrant
+        ? maskFilename(localPathInput)
+        : maskPath(localPathInput)
+      : localPathInput;
   const nativePickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? false;
 
   const consentState = resolveRunConsentState({
@@ -3249,9 +3466,9 @@ function AnalyzePage({
               : "เชื่อมต่อ API เพื่ออ่าน upload limits"}
           </strong>
           <small className="hw-subline">
-            <span className="mono" title={resolvedDataDir || undefined}>
-              {resolvedDataDir
-                ? `Data: ${resolvedDataDir} · Chunk ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`
+            <span className="mono" title={displayDataDir || undefined}>
+              {displayDataDir
+                ? `Data: ${displayDataDir} · Chunk ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`
                 : `Chunk: ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`}
             </span>
             {connectionStatus === "connected" && nativePickerAvailable && (
@@ -3347,7 +3564,7 @@ function AnalyzePage({
                   </div>
                   <strong>
                     {selectedFile
-                      ? `${selectedFile.name} (${formatBytes(selectedFile.size)})`
+                      ? `${maskFilename(selectedFile.name)} (${formatBytes(selectedFile.size)})`
                       : "ลากไฟล์ .pcap / .pcapng / .cap / .csv / .tsv มาวาง หรือคลิกเลือก"}
                   </strong>
                   <span>
@@ -3374,24 +3591,6 @@ function AnalyzePage({
                       >
                         <Icon name="play" size={15} />{" "}
                         {localCsvProgress !== null ? `กำลังสแกน CSV ${localCsvProgress}%` : "สแกน CSV ในเบราว์เซอร์ทันที"}
-                      </button>
-                    )}
-
-                    {selectedFile && (
-                      <button
-                        type="button"
-                        className={
-                          isCsvSelected
-                            ? "secondary-button"
-                            : consentState.submitBlockedReason !== "none"
-                              ? "primary-button btn-needs-consent"
-                              : "primary-button"
-                        }
-                        disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
-                        onClick={onUploadAndAnalyze}
-                      >
-                        <Icon name="upload" size={15} />{" "}
-                        {uploadPaused ? "Resume Upload & Analyze" : isSubmitting ? "กำลังอัปโหลด..." : "Upload & Run Full Pipeline"}
                       </button>
                     )}
                   </div>
@@ -3442,7 +3641,7 @@ function AnalyzePage({
                           </button>
                         )}
                         {uploadPaused && (
-                          <button type="button" className="primary-button tiny-btn" onClick={onUploadAndAnalyze}>
+                          <button type="button" className="primary-button tiny-btn" onClick={() => onUploadAndAnalyze()}>
                             Resume
                           </button>
                         )}
@@ -3499,18 +3698,12 @@ function AnalyzePage({
                         <div className="local-path-row">
                           <input
                             type="text"
-                            value={localPathInput}
+                            value={displayLocalPathInput}
+                            onFocus={() => setLocalPathFocused(true)}
+                            onBlur={() => setLocalPathFocused(false)}
                             onChange={(e) => setLocalPathInput(e.target.value)}
                             placeholder={hasLocalFileGrant ? "ไฟล์ที่เลือกผ่าน native picker" : "เลือกไฟล์ผ่าน Popup หรือเพิ่ม allowlisted folder ก่อนกรอก path"}
                           />
-                          <button
-                            type="button"
-                            className={consentState.submitBlockedReason !== "none" ? "primary-button btn-needs-consent" : "primary-button"}
-                            disabled={(!hasLocalFileGrant && !localPathInput.trim()) || isSubmitting}
-                            onClick={onRegisterLocalCapture}
-                          >
-                            <Icon name="play" size={15} /> Register &amp; Analyze
-                          </button>
                         </div>
                         {!nativePickerAvailable && (
                           <code>export PCAP_LOCAL_INGEST_ROOTS="/data/pcaps,/home/user/captures"</code>
@@ -3522,11 +3715,11 @@ function AnalyzePage({
                           <span>Allowed roots:</span>
                           {localBrowse.roots.map((r) => (
                             <b key={r} className="root-chip">
-                              <span>{r}</span>
+                              <span>{maskPath(r)}</span>
                               <button
                                 type="button"
                                 className="root-remove-btn"
-                                aria-label={`ลบโฟลเดอร์ ${r}`}
+                                aria-label={`ลบโฟลเดอร์ ${maskPath(r)}`}
                                 onClick={() => onRemoveLocalRoot(r)}
                               >
                                 ×
@@ -3537,18 +3730,12 @@ function AnalyzePage({
                         <div className="local-path-row">
                           <input
                             type="text"
-                            value={localPathInput}
+                            value={displayLocalPathInput}
+                            onFocus={() => setLocalPathFocused(true)}
+                            onBlur={() => setLocalPathFocused(false)}
                             onChange={(e) => setLocalPathInput(e.target.value)}
                             placeholder="เลือกจาก Popup ด้านบน หรือวาง path ไฟล์ PCAP/PCAPNG/CSV บนเครื่อง"
                           />
-                          <button
-                            type="button"
-                            className={consentState.submitBlockedReason !== "none" ? "primary-button btn-needs-consent" : "primary-button"}
-                            disabled={(!hasLocalFileGrant && !localPathInput.trim()) || isSubmitting}
-                            onClick={onRegisterLocalCapture}
-                          >
-                            <Icon name="play" size={15} /> Register &amp; Analyze
-                          </button>
                         </div>
                         <div className="local-file-list">
                           {localBrowse.files.length === 0 ? (
@@ -3565,8 +3752,8 @@ function AnalyzePage({
                               >
                                 <Icon name="file" size={15} />
                                 <div>
-                                  <strong>{item.name}</strong>
-                                  <small className="mono">{item.path}</small>
+                                  <strong>{maskFilename(item.name)}</strong>
+                                  <small className="mono">{maskPath(item.path)}</small>
                                 </div>
                                 <span className="mono">{formatBytes(item.size_bytes)}</span>
                               </button>
@@ -3586,6 +3773,7 @@ function AnalyzePage({
                 maxFiles={batchMaxFiles}
                 maxTotalBytes={batchMaxTotalBytes}
                 maxFileBytes={batchMaxFileBytes}
+                privacyRedactor={privacyRedactor}
                 onOpenJob={onOpenBatchJob}
               />
             )}
@@ -3658,6 +3846,35 @@ function AnalyzePage({
                     </span>
                   </div>
                   <small>{layer1Status.analyzeCardDetail}</small>
+                  <div className="layer1-quick-actions">
+                    {connectionStatus === "connected" && nativePickerAvailable && (
+                      <button
+                        type="button"
+                        className="hw-action-btn"
+                        disabled={isPickingPath}
+                        onClick={() => onPickNativePath("model_file")}
+                      >
+                        {isPickingPath ? "รอเลือก..." : "เลือก .bin (Popup)"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="hw-action-btn"
+                      onClick={() => onOpenConnectionModal("storage")}
+                    >
+                      ตั้งค่า ET-BERT
+                    </button>
+                    {connectionStatus === "connected" && layer1Status.binBound && (
+                      <button
+                        type="button"
+                        className="hw-action-btn"
+                        onClick={onClearModelPath}
+                      >
+                        Unbind .bin
+                      </button>
+                    )}
+                    <span className="layer1-offline-pill">100% Offline</span>
+                  </div>
                 </div>
                 <div className="ai-layer-card">
                   <div className="ai-layer-card-head">
@@ -3945,15 +4162,54 @@ function AnalyzePage({
             <div className="empty-state">ส่งไฟล์ได้โดยตรงในแท็บ Batch Intake ด้านซ้าย</div>
           ) : sourceTab === "upload" && selectedFile ? (
             isCsvSelected ? (
-              <button
-                type="button"
-                className="primary-button full-button"
-                disabled={localCsvProgress !== null}
-                onClick={() => onQuickCsvAnalyze(selectedFile)}
-              >
-                <Icon name="play" size={15} /> Scan CSV Now
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="primary-button full-button"
+                  disabled={localCsvProgress !== null}
+                  onClick={() => onQuickCsvAnalyze(selectedFile)}
+                >
+                  <Icon name="play" size={15} /> Scan CSV Now
+                </button>
+                {connectionStatus === "connected" && (
+                  <button
+                    type="button"
+                    className="secondary-button full-button offline-run-button"
+                    disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
+                    onClick={() => onUploadAndAnalyze({ forceOffline: true })}
+                  >
+                    <Icon name="upload" size={14} /> Upload CSV ไปยัง Backend Pipeline
+                  </button>
+                )}
+              </>
             ) : (
+              <>
+                <button
+                  type="button"
+                  className={
+                    consentState.submitBlockedReason !== "none"
+                      ? "primary-button full-button btn-needs-consent"
+                      : "primary-button full-button"
+                  }
+                  disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
+                  onClick={() => onUploadAndAnalyze()}
+                >
+                  <Icon name="upload" size={15} /> {binarySubmitLabel}
+                </button>
+                {(consentState.hasAnyConsentPrompt || aiEnabled || triageEndpointConsent) && (
+                  <button
+                    type="button"
+                    className="secondary-button full-button offline-run-button"
+                    disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
+                    onClick={() => onUploadAndAnalyze({ forceOffline: true })}
+                  >
+                    <Icon name="shield" size={14} /> วิเคราะห์แบบ Offline ทันที (ไม่ใช้ LLM / Sidecar)
+                  </button>
+                )}
+              </>
+            )
+          ) : sourceTab === "local" && (localPathInput.trim() || hasLocalFileGrant) ? (
+            <>
               <button
                 type="button"
                 className={
@@ -3961,25 +4217,22 @@ function AnalyzePage({
                     ? "primary-button full-button btn-needs-consent"
                     : "primary-button full-button"
                 }
-                disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
-                onClick={onUploadAndAnalyze}
+                disabled={isSubmitting}
+                onClick={() => onRegisterLocalCapture()}
               >
-                <Icon name="upload" size={15} /> {binarySubmitLabel}
+                <Icon name="play" size={15} /> {localSubmitLabel}
               </button>
-            )
-          ) : sourceTab === "local" && (localPathInput.trim() || hasLocalFileGrant) ? (
-            <button
-              type="button"
-              className={
-                consentState.submitBlockedReason !== "none"
-                  ? "primary-button full-button btn-needs-consent"
-                  : "primary-button full-button"
-              }
-              disabled={isSubmitting}
-              onClick={onRegisterLocalCapture}
-            >
-              <Icon name="play" size={15} /> {localSubmitLabel}
-            </button>
+              {(consentState.hasAnyConsentPrompt || aiEnabled || triageEndpointConsent) && (
+                <button
+                  type="button"
+                  className="secondary-button full-button offline-run-button"
+                  disabled={isSubmitting}
+                  onClick={() => onRegisterLocalCapture({ forceOffline: true })}
+                >
+                  <Icon name="shield" size={14} /> วิเคราะห์แบบ Offline ทันที (ไม่ใช้ LLM / Sidecar)
+                </button>
+              )}
+            </>
           ) : (
             <div className="empty-state">เลือก capture จริงก่อนเริ่มวิเคราะห์</div>
           )}
@@ -3993,27 +4246,46 @@ function JobsPage({
   connectionStatus,
   capabilities,
   jobs,
+  jobsTotal,
+  jobsPage,
+  jobsPageSize,
+  jobsMutating,
   activeJobId,
   report,
   aiEnabled,
+  privacyRedactor,
   onNavigate,
   onCancelJob,
+  onDeleteJob,
+  onPruneJobs,
+  onChangeJobsPage,
   onOpenJobReport,
   onRefreshJobs,
 }: {
   connectionStatus: ConnectionStatus;
   capabilities: SystemCapabilities | null;
   jobs: JobSummary[];
+  jobsTotal: number;
+  jobsPage: number;
+  jobsPageSize: number;
+  jobsMutating: boolean;
   activeJobId: string | null;
   report: WorkspaceReport;
   aiEnabled: boolean;
+  privacyRedactor?: PrivacyRedactor;
   onNavigate: (screen: Screen) => void;
   onCancelJob: (id: string) => Promise<void>;
+  onDeleteJob: (id: string) => Promise<void>;
+  onPruneJobs: () => Promise<void>;
+  onChangeJobsPage: (page: number) => void;
   onOpenJobReport: (id: string, target: Screen) => void;
   onRefreshJobs: () => void;
 }) {
+  const maskFilename = (value: string) => (privacyRedactor ? privacyRedactor.redactFilename(value) : value);
   const activeCount = jobs.filter((j) => ACTIVE_STATES.has(j.state)).length;
   const completedCount = jobs.filter((j) => j.state === "completed" || j.state === "partial").length;
+  const totalCount = jobsTotal || jobs.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / jobsPageSize));
 
   const focusedJob = jobs.find((j) => j.id === activeJobId) ?? jobs[0] ?? null;
 
@@ -4052,6 +4324,16 @@ function JobsPage({
                 Refresh Queue
               </button>
             )}
+            {connectionStatus === "connected" && totalCount > jobsPageSize && (
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={jobsMutating}
+                onClick={() => void onPruneJobs()}
+              >
+                ล้างงานเก่า (&gt;{jobsPageSize})
+              </button>
+            )}
             <button className="primary-button" onClick={() => onNavigate("analyze")}>
               <Icon name="upload" size={16} /> วิเคราะห์ capture ใหม่
             </button>
@@ -4068,7 +4350,7 @@ function JobsPage({
         <div className="queue-stat">
           <span>COMPLETED / PARTIAL</span>
           <strong>{String(completedCount).padStart(2, "0")}</strong>
-          <small>{jobs.length} total persisted in SQLite</small>
+          <small>{totalCount} total persisted in SQLite</small>
         </div>
         <div className="queue-stat queue-capacity">
           <span>FREE DISK HEADROOM</span>
@@ -4087,7 +4369,7 @@ function JobsPage({
             <span className="section-kicker">ASYNC JOB LIFECYCLE</span>
             <h2>
               {focusedJob
-                ? `${focusedJob.capture_filename ?? focusedJob.id.slice(0, 8)} (${focusedJob.resource_mode ?? "auto"})`
+                ? `${maskFilename(focusedJob.capture_filename ?? focusedJob.id.slice(0, 8))} (${focusedJob.resource_mode ?? "auto"})`
                 : report.origin === "empty" ? "ยังไม่มี active job" : report.fileName}
             </h2>
           </div>
@@ -4126,13 +4408,13 @@ function JobsPage({
 
       <section className="panel job-panel">
         <PanelTitle
-          title={jobs.length > 0 ? "Analysis job history (Live SQLite)" : "Analysis job history"}
+          title={totalCount > 0 ? "Analysis job history (Live SQLite)" : "Analysis job history"}
           detail={
-            jobs.length > 0
+            totalCount > 0
               ? "คลิก Open เพื่อโหลดรายงานและ packet explorer ของงานนั้น"
               : "ยังไม่มีงานจาก backend — กด Analyze Capture หรือสแกน CSV ได้ทันที"
           }
-          action={<span className="table-caption">{jobs.length} JOBS</span>}
+          action={<span className="table-caption">{totalCount} JOBS</span>}
         />
         <div className="job-table-wrap">
           <table className="data-table job-table">
@@ -4170,7 +4452,7 @@ function JobsPage({
                             <Icon name="file" size={17} />
                           </div>
                           <span>
-                            <strong>{job.capture_filename ?? `capture-${job.capture_id.slice(0, 8)}`}</strong>
+                            <strong>{maskFilename(job.capture_filename ?? `capture-${job.capture_id.slice(0, 8)}`)}</strong>
                             <small className="mono">
                               {job.id.slice(0, 8)} ·{" "}
                               {job.capture_size_bytes ? formatBytes(job.capture_size_bytes) : "capture"}
@@ -4218,6 +4500,16 @@ function JobsPage({
                               Open
                             </button>
                           )}
+                          {!active && (
+                            <button
+                              type="button"
+                              className="secondary-button tiny-btn"
+                              disabled={jobsMutating}
+                              onClick={() => void onDeleteJob(job.id)}
+                            >
+                              Delete
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -4227,6 +4519,30 @@ function JobsPage({
             </tbody>
           </table>
         </div>
+        {totalCount > jobsPageSize && (
+          <div className="jobs-pagination">
+            <button
+              type="button"
+              className="secondary-button tiny-btn"
+              disabled={jobsPage <= 0 || jobsMutating}
+              onClick={() => onChangeJobsPage(jobsPage - 1)}
+            >
+              ← ก่อนหน้า
+            </button>
+            <span className="jobs-pagination-info mono">
+              หน้า {jobsPage + 1} / {totalPages} · แสดง {jobsPage * jobsPageSize + 1}–
+              {Math.min(totalCount, jobsPage * jobsPageSize + jobs.length)} จาก {totalCount}
+            </span>
+            <button
+              type="button"
+              className="secondary-button tiny-btn"
+              disabled={jobsPage + 1 >= totalPages || jobsMutating}
+              onClick={() => onChangeJobsPage(jobsPage + 1)}
+            >
+              ถัดไป →
+            </button>
+          </div>
+        )}
       </section>
 
       <section className="panel stage-monitor">
@@ -4258,21 +4574,29 @@ function JobsPage({
 
 function FindingsPage({
   report,
+  rawReport,
   severityFilter,
   setSeverityFilter,
   protocolFilter,
+  setProtocolFilter,
   packetSearch,
+  setPacketSearch,
   selectedFinding,
   setSelectedFinding,
+  privacyRedactor,
   onOpenEvidence,
 }: {
   report: WorkspaceReport;
+  rawReport: WorkspaceReport;
   severityFilter: "all" | Severity;
   setSeverityFilter: (value: "all" | Severity) => void;
   protocolFilter: string;
+  setProtocolFilter: (value: string) => void;
   packetSearch: string;
+  setPacketSearch: (value: string) => void;
   selectedFinding: WorkspaceFinding | null;
   setSelectedFinding: (id: string) => void;
+  privacyRedactor?: PrivacyRedactor;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
 }) {
   const highCount = report.findings.filter((f) => f.severity === "high" || f.severity === "critical").length;
@@ -4280,15 +4604,45 @@ function FindingsPage({
   const lowCount = report.findings.filter((f) => f.severity === "low").length;
   const doneStages = report.stages.filter((s) => s.status === "done").length;
 
-  const evidenceById = new Map((report.rawBundle?.evidence ?? []).map((item) => [item.evidence_id, item]));
-  const query = packetSearch.trim().toLowerCase();
+  const rawFindingById = useMemo(
+    () => new Map(rawReport.findings.map((item) => [item.id, item])),
+    [rawReport.findings],
+  );
+  const evidenceById = useMemo(
+    () => new Map((report.rawBundle?.evidence ?? []).map((item) => [item.evidence_id, item])),
+    [report.rawBundle?.evidence],
+  );
+  const rawEvidenceById = useMemo(
+    () => new Map((rawReport.rawBundle?.evidence ?? []).map((item) => [item.evidence_id, item])),
+    [rawReport.rawBundle?.evidence],
+  );
+  const maskedPacketSearch = privacyRedactor ? privacyRedactor.redactFreeText(packetSearch) : packetSearch;
+  const rawQuery = packetSearch.trim().toLowerCase();
+  const maskedQuery = maskedPacketSearch.trim().toLowerCase();
+  const hasActiveFilters = severityFilter !== "all" || protocolFilter !== "All protocols" || Boolean(rawQuery);
+
   const filtered = report.findings.filter((finding) => {
     if (severityFilter !== "all" && finding.severity !== severityFilter) return false;
     const cited = finding.evidence.map((id) => evidenceById.get(id)).filter((item) => item !== undefined);
-    if (protocolFilter !== "All protocols" && !cited.some((item) => String(item.attributes.protocol ?? "").toLowerCase() === protocolFilter.toLowerCase())) return false;
-    if (query) {
-      const text = `${finding.id} ${finding.title} ${finding.category} ${finding.destination} ${finding.summary} ${finding.why} ${finding.evidence.join(" ")} ${cited.map((item) => item.summary).join(" ")}`.toLowerCase();
-      if (!text.includes(query)) return false;
+    if (
+      protocolFilter !== "All protocols" &&
+      !cited.some((item) => String(item.attributes.protocol ?? "").toLowerCase() === protocolFilter.toLowerCase())
+    ) {
+      return false;
+    }
+    if (rawQuery || maskedQuery) {
+      const displayText = `${finding.id} ${finding.title} ${finding.category} ${finding.destination} ${finding.summary} ${finding.why} ${finding.evidence.join(" ")} ${cited.map((item) => item.summary).join(" ")}`.toLowerCase();
+      const rawFinding = rawFindingById.get(finding.id);
+      const rawCited = (rawFinding?.evidence ?? finding.evidence)
+        .map((id) => rawEvidenceById.get(id))
+        .filter((item) => item !== undefined);
+      const rawText = rawFinding
+        ? `${rawFinding.id} ${rawFinding.title} ${rawFinding.category} ${rawFinding.destination} ${rawFinding.summary} ${rawFinding.why} ${rawFinding.evidence.join(" ")} ${rawCited.map((item) => item.summary).join(" ")}`.toLowerCase()
+        : "";
+      const matched =
+        (rawQuery && (displayText.includes(rawQuery) || rawText.includes(rawQuery))) ||
+        (maskedQuery && (displayText.includes(maskedQuery) || rawText.includes(maskedQuery)));
+      if (!matched) return false;
     }
     return true;
   });
@@ -4375,40 +4729,74 @@ function FindingsPage({
                 </select>
               </div>
             </div>
-            <div className="finding-rows">
-              {filtered.map((finding) => (
+            {hasActiveFilters && (
+              <div className="active-filter-chips" role="region" aria-label="ตัวกรองที่ใช้งานอยู่">
+                {severityFilter !== "all" && (
+                  <button type="button" className="filter-chip" onClick={() => setSeverityFilter("all")}>
+                    Severity: {severityFilter} ×
+                  </button>
+                )}
+                {protocolFilter !== "All protocols" && (
+                  <button type="button" className="filter-chip" onClick={() => setProtocolFilter("All protocols")}>
+                    Protocol: {protocolFilter} ×
+                  </button>
+                )}
+                {rawQuery && (
+                  <button type="button" className="filter-chip" onClick={() => setPacketSearch("")}>
+                    Search: {maskedPacketSearch} ×
+                  </button>
+                )}
                 <button
-                  key={finding.id}
-                  onClick={() => setSelectedFinding(finding.id)}
-                  className={`finding-row ${selectedFinding?.id === finding.id ? "finding-selected" : ""}`}
+                  type="button"
+                  className="filter-chip-clear"
+                  onClick={() => {
+                    setSeverityFilter("all");
+                    setProtocolFilter("All protocols");
+                    setPacketSearch("");
+                  }}
                 >
-                  <span className={`finding-mark mark-${finding.severity}`}>
-                    <Icon name={finding.severity === "high" ? "activity" : "alert"} size={16} />
-                  </span>
-                  <span className="finding-row-copy">
-                    <span>
-                      <strong>{finding.title}</strong>
-                      <small className="mono">
-                        {finding.id} · {finding.category}
+                  ล้างตัวกรอง
+                </button>
+              </div>
+            )}
+            <div className="finding-rows">
+              {filtered.length === 0 ? (
+                <div className="empty-state">ไม่พบ finding ที่ตรงกับตัวกรองปัจจุบัน</div>
+              ) : (
+                filtered.map((finding) => (
+                  <button
+                    key={finding.id}
+                    onClick={() => setSelectedFinding(finding.id)}
+                    className={`finding-row ${selectedFinding?.id === finding.id ? "finding-selected" : ""}`}
+                  >
+                    <span className={`finding-mark mark-${finding.severity}`}>
+                      <Icon name={finding.severity === "high" ? "activity" : "alert"} size={16} />
+                    </span>
+                    <span className="finding-row-copy">
+                      <span>
+                        <strong>{finding.title}</strong>
+                        <small className="mono">
+                          {finding.id} · {finding.category}
+                        </small>
+                      </span>
+                      <small>
+                        {finding.destination} <i>·</i> {finding.timestamp}
                       </small>
                     </span>
-                    <small>
-                      {finding.destination} <i>·</i> {finding.timestamp}
-                    </small>
-                  </span>
-                  <span className="finding-row-meta">
-                    <SeverityPill severity={finding.severity} />
-                    <Confidence
-                      value={
-                        finding.triageConfidence !== undefined
-                          ? `${finding.confidence} (${Math.round(finding.triageConfidence * 100)}%)`
-                          : finding.confidence
-                      }
-                    />
-                    <span className="evidence-count">{finding.evidence.length} evidence</span>
-                  </span>
-                </button>
-              ))}
+                    <span className="finding-row-meta">
+                      <SeverityPill severity={finding.severity} />
+                      <Confidence
+                        value={
+                          finding.triageConfidence !== undefined
+                            ? `${finding.confidence} (${Math.round(finding.triageConfidence * 100)}%)`
+                            : finding.confidence
+                        }
+                      />
+                      <span className="evidence-count">{finding.evidence.length} evidence</span>
+                    </span>
+                  </button>
+                ))
+              )}
             </div>
             <div className="finding-disclaimer">
               <Icon name="info" size={15} />
@@ -4485,6 +4873,7 @@ function FindingsPage({
 
 function TrafficPage({
   report,
+  rawReport,
   severityFilter,
   setSeverityFilter,
   protocolFilter,
@@ -4494,9 +4883,11 @@ function TrafficPage({
   selectedFinding,
   trafficView,
   setTrafficView,
+  privacyRedactor,
   onOpenEvidence,
 }: {
   report: WorkspaceReport;
+  rawReport: WorkspaceReport;
   severityFilter: "all" | Severity;
   setSeverityFilter: (value: "all" | Severity) => void;
   protocolFilter: string;
@@ -4506,10 +4897,17 @@ function TrafficPage({
   selectedFinding: WorkspaceFinding | null;
   trafficView: "packets" | "flows";
   setTrafficView: (value: "packets" | "flows") => void;
+  privacyRedactor?: PrivacyRedactor;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
 }) {
   const [selectedPacketNo, setSelectedPacketNo] = useState<number | null>(() => report.packets[0]?.no ?? null);
   const [selectedFlowId, setSelectedFlowId] = useState<string>(() => report.flows[0]?.id ?? "");
+  const [searchFocused, setSearchFocused] = useState(false);
+
+  const maskedPacketSearch = privacyRedactor ? privacyRedactor.redactFreeText(packetSearch) : packetSearch;
+  const rawQuery = packetSearch.trim().toLowerCase();
+  const maskedQuery = maskedPacketSearch.trim().toLowerCase();
+  const hasActiveFilters = severityFilter !== "all" || protocolFilter !== "All protocols" || Boolean(rawQuery);
 
   useEffect(() => {
     const query = packetSearch.trim().toLowerCase();
@@ -4543,33 +4941,45 @@ function TrafficPage({
 
   const visiblePackets = useMemo(() => {
     const normalizedProto = protocolFilter.toUpperCase();
-    return report.packets.filter((packet) => {
+    return report.packets.filter((packet, index) => {
       if (severityEvidence && (!packet.evidence || !severityEvidence.has(packet.evidence))) return false;
       const matchesProtocol = protocolFilter === "All protocols" || packet.protocol.toUpperCase() === normalizedProto;
-      const query = packetSearch.toLowerCase().trim();
-      const matchesSearch =
-        !query ||
-        `${packet.no} ${packet.time} ${packet.source} ${packet.destination} ${packet.protocol} ${packet.info} ${packet.evidence ?? ""} ${packet.triageLabel ?? ""}`
-          .toLowerCase()
-          .includes(query);
-      return matchesProtocol && matchesSearch;
+      if (!matchesProtocol) return false;
+      if (!rawQuery && !maskedQuery) return true;
+      const displayHaystack =
+        `${packet.no} ${packet.time} ${packet.source} ${packet.destination} ${packet.protocol} ${packet.info} ${packet.evidence ?? ""} ${packet.triageLabel ?? ""}`.toLowerCase();
+      const rawPkt = rawReport.packets[index];
+      const rawHaystack =
+        rawPkt && rawPkt.no === packet.no
+          ? `${rawPkt.no} ${rawPkt.time} ${rawPkt.source} ${rawPkt.destination} ${rawPkt.protocol} ${rawPkt.info} ${rawPkt.evidence ?? ""} ${rawPkt.triageLabel ?? ""}`.toLowerCase()
+          : "";
+      return (
+        (Boolean(rawQuery) && (displayHaystack.includes(rawQuery) || rawHaystack.includes(rawQuery))) ||
+        (Boolean(maskedQuery) && (displayHaystack.includes(maskedQuery) || rawHaystack.includes(maskedQuery)))
+      );
     });
-  }, [report.packets, protocolFilter, packetSearch, severityEvidence]);
+  }, [report.packets, rawReport.packets, protocolFilter, rawQuery, maskedQuery, severityEvidence]);
 
   const visibleFlows = useMemo(() => {
     const normalizedProto = protocolFilter.toUpperCase();
-    return report.flows.filter((flow) => {
+    return report.flows.filter((flow, index) => {
       if (severityEvidence && !severityEvidence.has(flow.evidence)) return false;
       const matchesProtocol = protocolFilter === "All protocols" || flow.protocol.toUpperCase() === normalizedProto;
-      const query = packetSearch.toLowerCase().trim();
-      const matchesSearch =
-        !query ||
-        `${flow.id} ${flow.firstSeen} ${flow.source} ${flow.destination} ${flow.protocol} ${flow.evidence} ${flow.note}`
-          .toLowerCase()
-          .includes(query);
-      return matchesProtocol && matchesSearch;
+      if (!matchesProtocol) return false;
+      if (!rawQuery && !maskedQuery) return true;
+      const displayHaystack =
+        `${flow.id} ${flow.firstSeen} ${flow.source} ${flow.destination} ${flow.protocol} ${flow.evidence} ${flow.note}`.toLowerCase();
+      const rawFlow = rawReport.flows[index];
+      const rawHaystack =
+        rawFlow && rawFlow.id === flow.id
+          ? `${rawFlow.id} ${rawFlow.firstSeen} ${rawFlow.source} ${rawFlow.destination} ${rawFlow.protocol} ${rawFlow.evidence} ${rawFlow.note}`.toLowerCase()
+          : "";
+      return (
+        (Boolean(rawQuery) && (displayHaystack.includes(rawQuery) || rawHaystack.includes(rawQuery))) ||
+        (Boolean(maskedQuery) && (displayHaystack.includes(maskedQuery) || rawHaystack.includes(maskedQuery)))
+      );
     });
-  }, [report.flows, protocolFilter, packetSearch, severityEvidence]);
+  }, [report.flows, rawReport.flows, protocolFilter, rawQuery, maskedQuery, severityEvidence]);
 
   const selectedPacket: WorkspacePacket | null =
     visiblePackets.find((p) => p.no === selectedPacketNo) ?? visiblePackets[0] ?? report.packets[0] ?? null;
@@ -4588,6 +4998,7 @@ function TrafficPage({
             onClick={() => {
               setPacketSearch("");
               setProtocolFilter("All protocols");
+              setSeverityFilter("all");
             }}
           >
             <Icon name="filter" size={15} /> ล้างตัวกรอง
@@ -4668,7 +5079,9 @@ function TrafficPage({
             <div className="search-field">
               <Icon name="search" size={15} />
               <input
-                value={packetSearch}
+                value={searchFocused ? packetSearch : maskedPacketSearch}
+                onFocus={() => setSearchFocused(true)}
+                onBlur={() => setSearchFocused(false)}
                 onChange={(event) => setPacketSearch(event.target.value)}
                 placeholder={trafficView === "packets" ? "ค้นหา packet, IP, evidence ID" : "ค้นหา flow, IP, evidence ID"}
                 aria-label={trafficView === "packets" ? "ค้นหา packet" : "ค้นหา flow"}
@@ -4690,6 +5103,36 @@ function TrafficPage({
             </select>
           </div>
         </div>
+        {hasActiveFilters && (
+          <div className="active-filter-chips" role="region" aria-label="ตัวกรองที่ใช้งานอยู่">
+            {severityFilter !== "all" && (
+              <button type="button" className="filter-chip" onClick={() => setSeverityFilter("all")}>
+                Severity: {severityFilter} ×
+              </button>
+            )}
+            {protocolFilter !== "All protocols" && (
+              <button type="button" className="filter-chip" onClick={() => setProtocolFilter("All protocols")}>
+                Protocol: {protocolFilter} ×
+              </button>
+            )}
+            {rawQuery && (
+              <button type="button" className="filter-chip" onClick={() => setPacketSearch("")}>
+                Search: {maskedPacketSearch} ×
+              </button>
+            )}
+            <button
+              type="button"
+              className="filter-chip-clear"
+              onClick={() => {
+                setSeverityFilter("all");
+                setProtocolFilter("All protocols");
+                setPacketSearch("");
+              }}
+            >
+              ล้างตัวกรอง
+            </button>
+          </div>
+        )}
 
         {trafficView === "packets" ? (
           <>
@@ -4903,6 +5346,9 @@ function ReportsPage({
   connected,
   aiConfig,
   aiModels,
+  privacyMode,
+  onTogglePrivacyMode,
+  privacyRedactor,
   onSaveAiConfig,
   onProbeAiModels,
   onExport,
@@ -4916,6 +5362,9 @@ function ReportsPage({
   connected: boolean;
   aiConfig: AIConfigResponse | null;
   aiModels: AIModelsResponse | null;
+  privacyMode: boolean;
+  onTogglePrivacyMode: () => void;
+  privacyRedactor: PrivacyRedactor;
   onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
   onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
   onExport: (
@@ -4931,8 +5380,7 @@ function ReportsPage({
   const aiBackendEnabled = Boolean(aiConfig?.configuration.enabled);
   const aiBackendModel = aiConfig?.configuration.model ?? null;
   const aiBackendReady = Boolean(aiBackendEnabled && aiBackendModel);
-  const [privacyMode, setPrivacyMode] = useState(false);
-  const redactor = useMemo(() => new PrivacyRedactor(privacyMode), [privacyMode]);
+  const redactor = privacyRedactor;
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const [chatQuestion, setChatQuestion] = useState("");
@@ -5066,7 +5514,7 @@ function ReportsPage({
             <button
               type="button"
               className="secondary-button"
-              onClick={() => setPrivacyMode((prev) => !prev)}
+              onClick={onTogglePrivacyMode}
               title="Pseudonymize IPs, domains, and hashes for documentation screenshots without exporting reverse maps"
             >
               <Icon name="shield" size={15} /> {privacyMode ? "Privacy Redaction: ON" : "Privacy Redaction: OFF"}
@@ -5519,6 +5967,7 @@ function ReportsPage({
             analysisId={report.analysisId}
             live={report.origin === "live"}
             connected={connected}
+            privacyRedactor={redactor}
             initialResult={report.osint}
             onOpenEvidence={(evidenceId) => onOpenEvidence(null, evidenceId)}
           />
@@ -5528,7 +5977,7 @@ function ReportsPage({
             <h3>สิ่งที่ควรทราบก่อนสรุป</h3>
             <ul>
               {report.warnings.map((w, idx) => (
-                <li key={idx}>{w}</li>
+                <li key={idx}>{redactor.redactFreeText(w)}</li>
               ))}
               <li>SHA-256: <code className="mono">{redactor.redactHash(report.fullSha)}</code></li>
             </ul>

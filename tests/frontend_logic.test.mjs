@@ -20,6 +20,7 @@ import {
   inspectCaptureHeaderBytes,
   parseCsvRow,
 } from "../src/utils/localAnalyzer.ts";
+import { PrivacyRedactor } from "../src/utils/privacy.ts";
 
 test("batch upload uses repeated multipart file parts and stable request headers", async () => {
   const previousFetch = globalThis.fetch;
@@ -695,4 +696,203 @@ test("resolveRunConsentState surfaces AI setup, AI consent, and Tier-1 sidecar c
   assert.equal(csvLocal.submitBlockedReason, "none");
   assert.equal(csvLocal.stage05Label, "LOCAL CSV");
 });
+
+test("PrivacyRedactor deterministically redacts identifiers, preserves rule/model suffixes, is idempotent, and redacts exports", () => {
+  const redactor = new PrivacyRedactor(true);
+  const sample = [
+    "IPv4 203.0.113.45 and IPv6 2001:db8::1",
+    "URL https://beacon.evilcorp.net/c2?id=7 email ops@secretcorp.org",
+    "MAC aa:bb:cc:dd:ee:ff secret api_key=sk_live_SUPERSECRET12345678",
+    "Paths /Users/alice/captures/payroll.pcapng and C:\\Users\\alice\\dump.pcap",
+    "Keep rules.yar and model.bin untouched while masking capture_dump.pcapng",
+  ].join(" | ");
+
+  const once = redactor.redactFreeText(sample);
+  const twice = redactor.redactFreeText(once);
+  assert.equal(twice, once, "redactFreeText must be idempotent");
+
+  for (const leaked of [
+    "203.0.113.45",
+    "2001:db8::1",
+    "beacon.evilcorp.net",
+    "ops@secretcorp.org",
+    "aa:bb:cc:dd:ee:ff",
+    "sk_live_SUPERSECRET12345678",
+    "/Users/alice/captures",
+    "C:\\Users\\alice",
+    "payroll.pcapng",
+    "capture_dump.pcapng",
+  ]) {
+    assert.equal(once.includes(leaked), false, `Expected redaction of ${leaked} in: ${once}`);
+  }
+  assert.ok(once.includes("rules.yar"), "Non-domain .yar filename should be preserved");
+  assert.ok(once.includes("model.bin"), "Non-domain .bin filename should be preserved");
+
+  // Full report redaction including flow_analytics, geoip, osint, warnings, and export helpers.
+  const raw = adaptBackendReport({
+    analysis_id: "abcdef0123456789abcdef0123456789",
+    status: "completed",
+    capture_filename: "payroll-export.pcapng",
+    capture_size_bytes: 4096,
+    capture_format: "pcapng",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "f".repeat(64),
+      created_at: "2026-11-18T00:00:00Z",
+      coverage: {
+        packets_seen: 12,
+        packets_analyzed: 12,
+        truncated: false,
+        parser: "tshark",
+        warnings: ["Loaded from /Users/alice/captures/payroll-export.pcapng"],
+        stages: [{ name: "tshark", state: "completed", detail: "Parsed 203.0.113.45" }],
+      },
+      evidence: [
+        {
+          evidence_id: "EV-000001",
+          kind: "http",
+          summary: "HTTP POST https://beacon.evilcorp.net/c2 from 203.0.113.45 by ops@secretcorp.org",
+          packet_refs: [1, 2],
+          attributes: {
+            protocol: "HTTP",
+            src: "203.0.113.45",
+            dst: "2001:db8::1",
+            query: "beacon.evilcorp.net",
+            src_mac: "aa:bb:cc:dd:ee:ff",
+            packets: 6,
+            bytes: 1200,
+          },
+        },
+      ],
+      findings: [
+        {
+          finding_id: "FD-000001",
+          detector: "http_beacon",
+          title: "Beacon to beacon.evilcorp.net from 203.0.113.45",
+          severity: "high",
+          confidence: "high",
+          evidence_ids: ["EV-000001"],
+          limitations: ["Seen in payroll-export.pcapng using rules.yar"],
+        },
+      ],
+      flow_analytics: {
+        top_talkers: [{ ip: "203.0.113.45", packets: 6, bytes: 1200, flows: 1 }],
+        top_public_dst_ips: [{ ip: "198.51.100.99", count: 4 }],
+        top_domains: [{ domain: "beacon.evilcorp.net", count: 3 }],
+        network_graph: {
+          nodes: [{ id: "203.0.113.45", role: "source", packets: 6, bytes: 1200, findings: 1 }],
+          edges: [{ source: "203.0.113.45", target: "2001:db8::1", protocol: "HTTP", packets: 6, bytes: 1200, label: "203.0.113.45 -> beacon.evilcorp.net" }],
+        },
+      },
+      geoip: {
+        points: [{ ip: "198.51.100.99", lat: 37.7, lon: -122.4, country: "US", ptr: "beacon.evilcorp.net", packets: 6, bytes: 1200 }],
+        arcs: [{ src_ip: "203.0.113.45", dst_ip: "198.51.100.99", protocol: "HTTP", packets: 6, bytes: 1200 }],
+      },
+    },
+    osint: {
+      state: "completed",
+      results: [
+        {
+          candidate_id: "IOC-1",
+          provider: "virustotal",
+          state: "completed",
+          summary: { indicator: "beacon.evilcorp.net", note: "Contacted by 203.0.113.45" },
+        },
+      ],
+    },
+    ai: { state: "disabled" },
+    disclaimer: "Candidates only.",
+  });
+
+  const masked = redactor.redactReport(raw);
+  assert.notEqual(masked.fileName, "payroll-export.pcapng");
+  assert.match(masked.fileName, /^capture-\d{2}\.pcapng$/);
+  assert.equal(masked.warnings[0].includes("payroll-export.pcapng"), false);
+  assert.equal(masked.rawBundle?.flow_analytics?.top_public_dst_ips?.[0]?.ip, redactor.redactIp("198.51.100.99"));
+  assert.equal(masked.rawBundle?.flow_analytics?.top_domains?.[0]?.domain, redactor.redactDomain("beacon.evilcorp.net"));
+  assert.equal(masked.rawBundle?.geoip?.points?.[0]?.ptr?.includes("evilcorp.net"), false);
+  assert.equal(JSON.stringify(masked.osint).includes("evilcorp.net"), false);
+
+  const jsonExport = exportReportJson(raw, { redact: true, redactor });
+  const mdExport = exportReportMarkdown(raw, { redact: true, redactor });
+  const jsonlExport = exportTriageJsonlFallback(raw, { redact: true, redactor });
+
+  for (const out of [jsonExport, mdExport, jsonlExport]) {
+    for (const secret of ["203.0.113.45", "2001:db8::1", "beacon.evilcorp.net", "ops@secretcorp.org", "payroll-export.pcapng"]) {
+      assert.equal(out.includes(secret), false, `Export leaked ${secret}`);
+    }
+  }
+  assert.ok(jsonExport.includes("FD-000001"));
+  assert.ok(jsonlExport.includes("EV-000001"));
+});
+
+test("PcapApiClient sends pagination, delete, prune, and ?redact=true export requests accurately", async () => {
+  const previousFetch = globalThis.fetch;
+  const client = new PcapApiClient("http://127.0.0.1:8000/", "op-token-99");
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ url, method: init.method ?? "GET", headers: init.headers, body: init.body });
+    if (url.includes("/export.pdf")) {
+      return new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]), {
+        status: 200,
+        headers: { "Content-Type": "application/pdf" },
+      });
+    }
+    if (url.includes("/export.")) {
+      return new Response("ok-export", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+    if (url.includes("/api/v1/analyses/prune")) {
+      return new Response(
+        JSON.stringify({ deleted_count: 2, deleted_ids: ["a", "b"], captures_deleted: 2, remaining_count: 20 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (init.method === "DELETE") {
+      return new Response(
+        JSON.stringify({ deleted: true, analysis_id: "job123", capture_deleted: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({ items: [], total: 42, limit: 20, offset: 40 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  try {
+    const page = await client.listJobsPage(20, 40);
+    assert.equal(page.total, 42);
+    assert.equal(page.offset, 40);
+
+    const del = await client.deleteJob("job123");
+    assert.equal(del.deleted, true);
+
+    const pruned = await client.pruneJobs({ keep_latest: 20 });
+    assert.equal(pruned.deleted_count, 2);
+
+    await client.getStixJson("job123", { redact: true });
+    await client.getExportCsv("job123", { redact: true });
+    await client.getExportCef("job123", { redact: true });
+    await client.getExportNavigatorJson("job123", { redact: true });
+    const pdfBlob = await client.getExportPdfBlob("job123", { redact: true });
+    assert.equal(pdfBlob.size, 5);
+
+    assert.equal(calls[0].url, "http://127.0.0.1:8000/api/v1/analyses?limit=20&offset=40");
+    assert.equal(calls[1].url, "http://127.0.0.1:8000/api/v1/analyses/job123");
+    assert.equal(calls[1].method, "DELETE");
+    assert.equal(calls[2].url, "http://127.0.0.1:8000/api/v1/analyses/prune");
+    assert.equal(calls[2].method, "POST");
+    assert.deepEqual(JSON.parse(calls[2].body), { keep_latest: 20 });
+    assert.equal(calls[3].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.stix.json?redact=true");
+    assert.equal(calls[4].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.csv?redact=true");
+    assert.equal(calls[5].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.cef?redact=true");
+    assert.equal(calls[6].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.navigator.json?redact=true");
+    assert.equal(calls[7].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.pdf?redact=true");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 

@@ -18,10 +18,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 from typing import Any, Callable, Sequence
+from urllib.parse import urlsplit
 from .http_transport import post_json_bounded
+from .picker import is_loopback_client
 
 DATA_BEARING_KINDS = frozenset({"flow", "tls", "http", "dns", "packet"})
 NON_L7_KINDS = frozenset({"arp", "icmp", "wlan"})
@@ -234,6 +237,13 @@ def build_etbert_request_items(
     return items, evidence_ids
 
 
+def _loopback_tier1_token(endpoint_url: str) -> str | None:
+    if not endpoint_url or not is_loopback_client(urlsplit(endpoint_url).hostname):
+        return None
+    token = (os.environ.get("PCAP_TIER1_API_TOKEN") or os.environ.get("TIER1_API_TOKEN") or "").strip()
+    return token or None
+
+
 def score_with_etbert_http(
     evidence_list: Sequence[Any],
     *,
@@ -258,12 +268,18 @@ def score_with_etbert_http(
         return {}
 
     try:
+        call_kwargs: dict[str, Any] = {
+            "timeout_seconds": max(1.0, float(timeout_seconds)),
+            "deadline_monotonic": deadline_monotonic,
+            "cancellation_check": cancellation_check,
+        }
+        bearer_token = _loopback_tier1_token(endpoint_url)
+        if bearer_token:
+            call_kwargs["bearer_token"] = bearer_token
         parsed = post_json_bounded(
             endpoint_url,
             {"model": model_name, "items": items},
-            timeout_seconds=max(1.0, float(timeout_seconds)),
-            deadline_monotonic=deadline_monotonic,
-            cancellation_check=cancellation_check,
+            **call_kwargs,
         )
         if not isinstance(parsed, (dict, list)):
             return {}
