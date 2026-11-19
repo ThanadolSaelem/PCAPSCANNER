@@ -527,3 +527,110 @@ async def test_output_reserve_prevents_context_overflow():
         return httpx.Response(200, json={})
     result = await generate_summary(bundle(), settings(context_window_tokens=2048, max_output_tokens=2048), transport=httpx.MockTransport(handler))
     assert result.state == "budget_exceeded" and not called
+
+
+@pytest.mark.asyncio
+async def test_manus_v2_probe_summary_and_chat_lifecycle(monkeypatch: pytest.MonkeyPatch):
+    from backend.app.llm import clear_runtime_api_key, probe_models, set_runtime_api_key
+
+    monkeypatch.delenv("MANUS_API_URL", raising=False)
+    monkeypatch.delenv("MANUS_API_KEY", raising=False)
+    set_runtime_api_key("manus", "sk-manus-v2-key-123456")
+
+    seen: list[tuple[str, str, dict]] = []
+    detail_polls = 0
+    chat_answer = {"claims": [{"claim": "Observed suspicious TCP flow.", "evidence_ids": ["EV-000001"]}]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_polls
+        assert request.headers.get("x-manus-api-key") == "sk-manus-v2-key-123456"
+        assert "authorization" not in request.headers
+        body = json.loads(request.content) if request.content else {}
+        seen.append((request.method, f"{request.url.path}?{request.url.query.decode()}" if request.url.query else request.url.path, body))
+
+        if request.url.path == "/v2/task.list":
+            return httpx.Response(200, json={"ok": True, "data": [], "has_more": False})
+        if request.url.path == "/v2/task.create":
+            # Verify Manus v2 strict schema rules: no unsupported keywords like pattern/minLength/maxItems/title
+            schema_text = json.dumps(body.get("structured_output_schema", {}))
+            for forbidden in ('"pattern"', '"minLength"', '"maxLength"', '"minItems"', '"maxItems"', '"title"'):
+                assert forbidden not in schema_text
+            assert body.get("hide_in_task_list") is True
+            assert body.get("interactive_mode") is False
+            assert body.get("clear_connectors") is True
+            task_id = "task_chat_01" if "Return one evidence-cited claim" in body["message"]["content"] else "task_sum_01"
+            return httpx.Response(200, json={"ok": True, "task_id": task_id})
+        if request.url.path == "/v2/task.detail":
+            task_id = request.url.params.get("task_id")
+            if task_id == "task_sum_01" and detail_polls == 0:
+                detail_polls += 1
+                return httpx.Response(200, json={"ok": True, "task": {"id": task_id, "status": "running"}})
+            return httpx.Response(200, json={"ok": True, "task": {"id": task_id, "status": "stopped"}})
+        if request.url.path == "/v2/task.listMessages":
+            task_id = request.url.params.get("task_id")
+            if task_id == "task_sum_01":
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "task_id": task_id,
+                        "messages": [
+                            {"id": "m1", "type": "assistant_message", "assistant_message": {"content": "Summary ready."}},
+                            {
+                                "id": "m2",
+                                "type": "structured_output_result",
+                                "structured_output_result": {"success": True, "value": summary_payload()},
+                            },
+                        ],
+                        "has_more": False,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "task_id": task_id,
+                    "messages": [
+                        {
+                            "id": "m3",
+                            "type": "assistant_message",
+                            "assistant_message": {"content": f"Here is the grounded answer:\n```json\n{json.dumps(chat_answer)}\n```"},
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(404, json={"ok": False})
+
+    try:
+        # Note: user can paste https://api.manus.ai/v2/task.create or https://api.manus.ai, and omit model!
+        manus_cfg = AIConfig(
+            enabled=True,
+            provider="manus",
+            base_url="https://api.manus.ai/v2/task.create",
+            allowed_origins=["https://api.manus.ai"],
+            data_boundary="remote",
+            model=None,
+            timeout_seconds=5,
+        )
+        items, warning = await probe_models(manus_cfg, transport=httpx.MockTransport(handler))
+        assert warning is None
+        assert any(item["id"] == "standard" for item in items)
+        assert any(item["id"] == "max" for item in items)
+
+        manus_settings = AppSettings(ai=manus_cfg)
+        result = await generate_summary(bundle(), manus_settings, transport=httpx.MockTransport(handler))
+        assert result.state == "completed", result
+        assert result.model == "standard"
+        assert result.report is not None
+        assert result.report.assessments[0].finding_id == "F-0001"
+
+        raw_chat = await generate_chat_completion(
+            "Return one evidence-cited claim.",
+            manus_settings,
+            transport=httpx.MockTransport(handler),
+        )
+        assert json.loads(raw_chat) == chat_answer
+    finally:
+        clear_runtime_api_key("manus")
+

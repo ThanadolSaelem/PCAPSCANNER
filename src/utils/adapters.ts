@@ -869,7 +869,7 @@ export function resolveLayer2DraftStatus({
         missingModel: false,
       };
     }
-    if (!draft.model.trim()) {
+    if (!draft.model.trim() && draft.provider !== "manus") {
       return {
         pillTone: "warn",
         badgeLabel: "ยังไม่เลือก Model Name",
@@ -889,12 +889,13 @@ export function resolveLayer2DraftStatus({
     };
   }
 
-  const savedModel = (cfg.model ?? "").trim();
-  const savedActive = Boolean(cfg.enabled && savedModel);
-  const draftModel = draft.model.trim();
+  const savedProvider = cfg.provider || "openai_compatible";
+  const savedModel = (cfg.model ?? "").trim() || (savedProvider === "manus" ? "standard" : "");
+  const savedActive = Boolean(cfg.enabled && (savedModel || savedProvider === "manus"));
+  const draftModel = draft.model.trim() || (draft.provider === "manus" ? "standard" : "");
   const hasUnsavedChanges =
     draft.enabled !== Boolean(cfg.enabled) ||
-    draft.provider !== (cfg.provider || "openai_compatible") ||
+    draft.provider !== savedProvider ||
     draft.data_boundary !== (cfg.data_boundary || "local") ||
     normalizeUrlForCompare(draft.base_url) !== normalizeUrlForCompare(cfg.base_url) ||
     draftModel !== savedModel ||
@@ -959,7 +960,7 @@ export function resolveLayer2DraftStatus({
   if (savedActive) {
     return {
       pillTone: "ok",
-      badgeLabel: `Active: ${cfg.provider}/${savedModel}`,
+      badgeLabel: `Active: ${savedProvider}/${savedModel || "standard"}`,
       helperText: "บันทึกค่าบน Backend แล้ว — พร้อมสร้างสรุปรายงาน Layer-2",
       hasUnsavedChanges: false,
       savedActive: true,

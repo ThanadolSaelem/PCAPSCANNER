@@ -1640,11 +1640,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         rt_status = runtime_api_key_status()
         cur_provider = cfg_now.ai.provider.value if hasattr(cfg_now.ai.provider, "value") else str(cfg_now.ai.provider)
         cur_rt = rt_status.get(cur_provider, {"configured": False, "key_fingerprint": None})
-        manus_env_set = bool(os.environ.get("MANUS_API_URL") and os.environ.get("MANUS_API_KEY"))
-        manus_ready = bool(
-            (cfg_now.ai.base_url or os.environ.get("MANUS_API_URL"))
-            and (rt_status.get("manus", {}).get("configured") or os.environ.get("MANUS_API_KEY"))
-        )
+        manus_env_set = bool(os.environ.get("MANUS_API_KEY"))
+        manus_ready = bool(rt_status.get("manus", {}).get("configured") or os.environ.get("MANUS_API_KEY"))
         return {
             "configuration": cfg_now.ai.model_dump(mode="json"),
             "triage": cfg_now.triage.model_dump(mode="json"),
@@ -1710,6 +1707,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         ):
             next_ai_data["data_boundary"] = "local"
             next_ai_data["allowed_origins"] = ["http://127.0.0.1:11434"]
+        if str(next_ai_data.get("provider")) == "manus":
+            if next_ai_data.get("base_url") is None and not next_ai_data.get("allowed_origins"):
+                next_ai_data["base_url"] = "https://api.manus.ai"
+                next_ai_data["data_boundary"] = "remote"
+                next_ai_data["allowed_origins"] = ["https://api.manus.ai"]
+            if not next_ai_data.get("model"):
+                next_ai_data["model"] = "standard"
+            if "timeout_seconds" not in body.model_fields_set and int(next_ai_data.get("timeout_seconds") or 30) < 90:
+                next_ai_data["timeout_seconds"] = 120
         try:
             updated_ai = AIConfig.model_validate(next_ai_data)
         except ValidationError:
@@ -1763,6 +1769,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if field_name in {"base_url", "api_key_env"} and isinstance(val, str):
                 val = val.strip() or None
             probe_data[field_name] = val
+        if str(probe_data.get("provider")) == "manus":
+            if probe_data.get("base_url") is None and not probe_data.get("allowed_origins"):
+                probe_data["base_url"] = "https://api.manus.ai"
+                probe_data["data_boundary"] = "remote"
+                probe_data["allowed_origins"] = ["https://api.manus.ai"]
         probe_data["enabled"] = False
         try:
             probe_cfg = AIConfig.model_validate(probe_data)

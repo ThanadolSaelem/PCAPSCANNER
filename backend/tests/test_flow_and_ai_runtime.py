@@ -459,29 +459,33 @@ def test_ai_runtime_credentials_are_memory_only_loopback_and_wired_to_provider(t
         # Secret must NEVER be echoed back in response or written to workspace.json
         assert secret not in put_res.text
 
-        # Configure Manus HTTPS base_url + allowed_origins via non-secret /api/v1/ai/config
+        # Configure Manus via non-secret /api/v1/ai/config without needing an explicit model name
         cfg_res = client.put(
             "/api/v1/ai/config",
             json={
                 "enabled": True,
                 "provider": "manus",
-                "base_url": "https://api.manus.im",
-                "allowed_origins": ["https://api.manus.im"],
+                "base_url": "https://api.manus.ai",
+                "allowed_origins": ["https://api.manus.ai"],
                 "data_boundary": "remote",
-                "model": "manus-1",
             },
         )
         assert cfg_res.status_code == 200, cfg_res.text
         cfg_body = cfg_res.json()
         assert cfg_body["manus_ready"] is True
         assert cfg_body["runtime_key_set"] is True
+        assert cfg_body["configuration"]["model"] == "standard"
+        assert cfg_body["configuration"]["timeout_seconds"] == 120
         assert secret not in cfg_res.text
         assert not ws_file.exists() or secret not in ws_file.read_text(encoding="utf-8")
 
-        # Provider runtime resolves configured base_url and RAM key cleanly
+        # Provider runtime resolves Manus API v2 task.create + x-manus-api-key (no Authorization header)
         rt = llm_providers._runtime(app.state.settings)
-        assert rt.endpoint == "https://api.manus.im/v1/chat/completions"
-        assert rt.headers["authorization"] == f"Bearer {secret}"
+        assert rt.route == "manus_v2"
+        assert rt.endpoint == "https://api.manus.ai/v2/task.create"
+        assert rt.headers["x-manus-api-key"] == secret
+        assert "authorization" not in rt.headers
+        assert rt.model == "standard"
 
         # Clear key removes it from RAM cleanly
         del_res = client.delete("/api/v1/ai/credentials", params={"provider": "manus"})

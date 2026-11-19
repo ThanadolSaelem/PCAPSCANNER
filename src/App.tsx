@@ -1923,6 +1923,17 @@ function normalizeOriginToken(raw: string): string | null {
   }
 }
 
+const MANUS_DEFAULT_BASE_URL = "https://api.manus.ai";
+const MANUS_AGENT_PROFILES: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "standard", label: "standard (ค่าเริ่มต้น — แนะนำ)" },
+  { id: "lite", label: "lite (เร็ว / แพ็กเกจฟรี)" },
+  { id: "max", label: "max (วิเคราะห์ลึก)" },
+  { id: "max-medium", label: "max-medium" },
+  { id: "max-high", label: "max-high" },
+  { id: "max-extra", label: "max-extra" },
+  { id: "max-ultra", label: "max-ultra (ลึกที่สุด)" },
+];
+
 function buildAllowedOriginsList(
   rawOrigins: string,
   baseUrlDraft: string,
@@ -1940,6 +1951,8 @@ function buildAllowedOriginsList(
     if (baseOrigin) origins.add(baseOrigin);
   } else if (provider === "openai_compatible" && dataBoundary === "local") {
     origins.add("http://127.0.0.1:11434");
+  } else if (provider === "manus") {
+    origins.add(MANUS_DEFAULT_BASE_URL);
   }
   return Array.from(origins);
 }
@@ -2126,6 +2139,23 @@ function ConnectionModal({
     });
   };
 
+  const applyManusPreset = () => {
+    setAiDraftEnabled(true);
+    setAiDraftProvider("manus");
+    setAiDraftBoundary("remote");
+    setAiDraftBaseUrl(MANUS_DEFAULT_BASE_URL);
+    setAiDraftAllowedOrigins(MANUS_DEFAULT_BASE_URL);
+    setAiDraftApiKeyEnv("");
+    if (!MANUS_AGENT_PROFILES.some((item) => item.id === aiDraftModel.trim())) {
+      setAiDraftModel("standard");
+    }
+    setAiFeedback({
+      tone: "info",
+      message:
+        "เติมค่า Manus API v2 (https://api.manus.ai · profile: standard) แล้ว — วาง Manus API Key แล้วกดทดสอบการเชื่อมต่อหรือ Save AI Config ได้เลย",
+    });
+  };
+
   const handleSaveApiKeyClick = async () => {
     if (savingApiKey) return;
     const trimmed = aiDraftApiKey.trim();
@@ -2142,7 +2172,10 @@ function ConnectionModal({
       const fp = updated.runtime_key_fingerprints?.[aiDraftProvider] ?? updated.runtime_key_fingerprint;
       setAiFeedback({
         tone: "ok",
-        message: `บันทึก API Key ของ ${aiDraftProvider} ใน RAM ของ Backend แล้ว${fp ? ` (fp: ${fp})` : ""} — กด Probe / Discover Models หรือ Save AI Config ต่อได้เลย`,
+        message:
+          aiDraftProvider === "manus"
+            ? `บันทึก Manus API Key ใน RAM ของ Backend แล้ว${fp ? ` (fp: ${fp})` : ""} — กดทดสอบการเชื่อมต่อ Manus หรือ Save AI Config ได้เลย`
+            : `บันทึก API Key ของ ${aiDraftProvider} ใน RAM ของ Backend แล้ว${fp ? ` (fp: ${fp})` : ""} — กด Probe / Discover Models หรือ Save AI Config ต่อได้เลย`,
       });
     } catch (err) {
       setAiFeedback({ tone: "crit", message: safeFormatError(err) });
@@ -2180,13 +2213,14 @@ function ConnectionModal({
       return null;
     }
 
-    const cleanUrl = aiDraftBaseUrl.trim().replace(/\/+$/, "");
+    const rawUrl = aiDraftBaseUrl.trim().replace(/\/+$/, "");
+    const cleanUrl = rawUrl || (aiDraftProvider === "manus" ? MANUS_DEFAULT_BASE_URL : "");
     if (cleanUrl) {
       let parsed: URL;
       try {
         parsed = new URL(cleanUrl);
       } catch {
-        setAiFeedback({ tone: "crit", message: "Base URL ไม่ถูกต้องตามรูปแบบ URL (เช่น http://127.0.0.1:11434 หรือ https://api.openai.com)" });
+        setAiFeedback({ tone: "crit", message: "Base URL ไม่ถูกต้องตามรูปแบบ URL (เช่น http://127.0.0.1:11434 หรือ https://api.manus.ai)" });
         return null;
       }
       if (effectiveBoundary === "remote" && parsed.protocol !== "https:") {
@@ -2214,7 +2248,7 @@ function ConnectionModal({
         setAiFeedback({ tone: "warn", message: `กรุณาระบุ Base URL สำหรับ provider "${aiDraftProvider}"` });
         return null;
       }
-      if (!aiDraftModel.trim()) {
+      if (aiDraftProvider !== "manus" && !aiDraftModel.trim()) {
         setAiFeedback({ tone: "warn", message: "กรุณากด Probe / Discover Models หรือระบุชื่อ Model ก่อนเปิดใช้งาน Layer-2 AI" });
         return null;
       }
@@ -2248,16 +2282,25 @@ function ConnectionModal({
         data_boundary: aiDraftProvider === "manus" ? "remote" : aiDraftBoundary,
       });
       setAiDraftAllowedOrigins(validated.origins.join(", "));
+      if (aiDraftProvider === "manus" && !aiDraftBaseUrl.trim() && validated.cleanBaseUrl) {
+        setAiDraftBaseUrl(validated.cleanBaseUrl);
+      }
       if (res.items.length > 0) {
         if (!aiDraftModel.trim()) setAiDraftModel(res.items[0].id);
         setAiFeedback({
           tone: "ok",
-          message: `เชื่อมต่อสำเร็จ: พบ ${res.items.length} โมเดล (${res.items.slice(0, 4).map((m) => m.id).join(", ")}) — กด Save AI Config เพื่อบันทึก`,
+          message:
+            aiDraftProvider === "manus"
+              ? `ยืนยัน Manus API v2 สำเร็จ (x-manus-api-key ใช้งานได้) · เลือก Agent Profile เช่น ${res.items.slice(0, 3).map((m) => m.id).join(", ")} แล้วกด Save AI Config`
+              : `เชื่อมต่อสำเร็จ: พบ ${res.items.length} โมเดล (${res.items.slice(0, 4).map((m) => m.id).join(", ")}) — กด Save AI Config เพื่อบันทึก`,
         });
       } else {
         setAiFeedback({
           tone: "warn",
-          message: `ไม่พบรายการโมเดลจาก endpoint (${res.warning ?? "empty_catalog"}) — ตรวจสอบว่า Base URL/API Key ถูกต้องหรือพิมพ์ชื่อโมเดลเองได้`,
+          message:
+            aiDraftProvider === "manus"
+              ? `เชื่อมต่อ Manus API v2 ไม่สำเร็จ (${res.warning ?? "verify_failed"}) — ตรวจสอบว่าวาง Manus API Key ถูกต้อง และ Base URL เป็น https://api.manus.ai`
+              : `ไม่พบรายการโมเดลจาก endpoint (${res.warning ?? "empty_catalog"}) — ตรวจสอบว่า Base URL/API Key ถูกต้องหรือพิมพ์ชื่อโมเดลเองได้`,
         });
       }
     } catch (err) {
@@ -2280,20 +2323,27 @@ function ConnectionModal({
         setAiDraftApiKey("");
         setShowApiKey(false);
       }
+      const effectiveModel =
+        aiDraftProvider === "manus" ? aiDraftModel.trim() || "standard" : aiDraftModel.trim() || null;
       const updated = await onSaveAiConfig({
         enabled: aiDraftEnabled,
         provider: aiDraftProvider,
         base_url: validated.cleanBaseUrl,
         allowed_origins: validated.origins,
-        model: aiDraftModel.trim() || null,
+        model: effectiveModel,
         api_key_env: validated.cleanApiKeyEnv,
         data_boundary: aiDraftProvider === "manus" ? "remote" : aiDraftBoundary,
       });
       setAiDraftAllowedOrigins((updated.configuration.allowed_origins ?? []).join(", "));
+      if (updated.configuration.base_url) setAiDraftBaseUrl(updated.configuration.base_url);
+      if (updated.configuration.model) setAiDraftModel(updated.configuration.model);
+      const activeReady = Boolean(
+        updated.configuration.enabled && (updated.configuration.model || updated.configuration.provider === "manus"),
+      );
       setAiFeedback({
-        tone: updated.configuration.enabled && updated.configuration.model ? "ok" : "info",
-        message: updated.configuration.enabled && updated.configuration.model
-          ? `บันทึกเรียบร้อย · Layer-2 LLM พร้อมใช้งาน (${updated.configuration.provider}: ${updated.configuration.model})`
+        tone: activeReady ? "ok" : "info",
+        message: activeReady
+          ? `บันทึกเรียบร้อย · Layer-2 LLM พร้อมใช้งาน (${updated.configuration.provider}: ${updated.configuration.model || "standard"})`
           : "บันทึกสถานะ Disabled / Standby แล้ว — Layer-1 ยังทำงานอัตโนมัติ",
       });
     } catch (err) {
@@ -2305,7 +2355,10 @@ function ConnectionModal({
 
   const cleanEnvTrimmed = aiDraftApiKeyEnv.trim();
   const savedEnvMatches = cleanEnvTrimmed !== "" && cleanEnvTrimmed === (aiConfig?.configuration.api_key_env ?? "");
-  const aiTabWarn = status !== "connected" || (aiDraftEnabled && !aiDraftModel.trim()) || layer2Status.hasUnsavedChanges;
+  const aiTabWarn =
+    status !== "connected" ||
+    (aiDraftEnabled && aiDraftProvider !== "manus" && !aiDraftModel.trim()) ||
+    layer2Status.hasUnsavedChanges;
   const storageTabWarn = status !== "connected" || layer1Status.binMissing || dataDirDirty || modelPathDirty;
 
   return (
@@ -2427,13 +2480,22 @@ function ConnectionModal({
                       </label>
                       <span>เปิดใช้งาน Layer-2 LLM Narrator บน Backend</span>
                     </label>
-                    <button
-                      type="button"
-                      className="secondary-button tiny-btn"
-                      onClick={applyLocalOllamaPreset}
-                    >
-                      <Icon name="spark" size={13} /> 1-Click Local Ollama Preset
-                    </button>
+                    <div className="layer-head-actions">
+                      <button
+                        type="button"
+                        className="secondary-button tiny-btn"
+                        onClick={applyLocalOllamaPreset}
+                      >
+                        <Icon name="spark" size={13} /> Local Ollama
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button tiny-btn"
+                        onClick={applyManusPreset}
+                      >
+                        <Icon name="spark" size={13} /> Manus API v2
+                      </button>
+                    </div>
                   </div>
 
                   <div className="ai-field-grid">
@@ -2446,9 +2508,16 @@ function ConnectionModal({
                           setAiDraftProvider(next);
                           if (next === "manus") {
                             setAiDraftBoundary("remote");
-                            if (aiDraftBaseUrl === "http://127.0.0.1:11434") {
-                              setAiDraftBaseUrl("");
-                              setAiDraftAllowedOrigins("");
+                            if (
+                              !aiDraftBaseUrl.trim() ||
+                              aiDraftBaseUrl === "http://127.0.0.1:11434" ||
+                              aiDraftBaseUrl === "https://api.anthropic.com"
+                            ) {
+                              setAiDraftBaseUrl(MANUS_DEFAULT_BASE_URL);
+                              setAiDraftAllowedOrigins(MANUS_DEFAULT_BASE_URL);
+                            }
+                            if (!MANUS_AGENT_PROFILES.some((item) => item.id === aiDraftModel.trim())) {
+                              setAiDraftModel("standard");
                             }
                             setAiDraftApiKeyEnv("");
                           } else if (next === "anthropic" && aiDraftBoundary === "local") {
@@ -2463,7 +2532,7 @@ function ConnectionModal({
                       >
                         <option value="openai_compatible">openai_compatible (Ollama / OpenAI / OpenRouter / vLLM)</option>
                         <option value="anthropic">anthropic (Claude Messages API)</option>
-                        <option value="manus">manus (Manus API / Custom HTTPS)</option>
+                        <option value="manus">manus (Manus API v2 · x-manus-api-key)</option>
                       </select>
                     </label>
 
@@ -2497,7 +2566,7 @@ function ConnectionModal({
                         }}
                         placeholder={
                           aiDraftProvider === "manus"
-                            ? "เช่น https://api.manus.im (หรือเว้นว่างเพื่อใช้ MANUS_API_URL)"
+                            ? "https://api.manus.ai (ค่าเริ่มต้น Manus API v2)"
                             : aiDraftBoundary === "local"
                               ? "เช่น http://127.0.0.1:11434 (ว่าง = ค่า Ollama เริ่มต้น)"
                               : "เช่น https://api.openai.com"
@@ -2511,14 +2580,16 @@ function ConnectionModal({
                         type="text"
                         value={aiDraftAllowedOrigins}
                         onChange={(e) => setAiDraftAllowedOrigins(e.target.value)}
-                        placeholder={aiDraftProvider === "manus" ? "เช่น https://api.manus.im" : "เช่น http://127.0.0.1:11434"}
+                        placeholder={aiDraftProvider === "manus" ? "https://api.manus.ai" : "เช่น http://127.0.0.1:11434"}
                       />
                     </label>
                   </div>
 
                   <div className="api-key-box">
                     <div className="api-key-head">
-                      <span>API Key ({aiDraftProvider})</span>
+                      <span>
+                        API Key ({aiDraftProvider === "manus" ? "x-manus-api-key" : aiDraftProvider})
+                      </span>
                       <small>เก็บเฉพาะใน RAM ของ Backend (loopback) · ไม่บันทึกลงดิสก์และไม่ส่งกลับ UI</small>
                     </div>
                     <div className="api-key-row">
@@ -2533,7 +2604,7 @@ function ConnectionModal({
                             runtimeKeyActive
                               ? "มี Key อยู่ใน RAM แล้ว — วาง Key ใหม่เพื่ออัปเดต หรือกดล้าง Key"
                               : aiDraftProvider === "manus"
-                                ? "วาง Manus API Key ที่นี่ (หรือตั้ง MANUS_API_KEY ใน shell)"
+                                ? "วาง Manus API Key ที่นี่ (ส่งผ่าน header x-manus-api-key)"
                                 : aiDraftProvider === "anthropic"
                                   ? "วาง Anthropic API Key (sk-ant-...)"
                                   : "วาง API Key (เช่น sk-... หรือเว้นว่างสำหรับ Local Ollama)"
@@ -2576,8 +2647,8 @@ function ConnectionModal({
                       ) : aiDraftProvider === "manus" ? (
                         <span className={`ai-env-pill ${aiConfig?.manus_env_set ? "env-ok" : "env-missing"}`}>
                           {aiConfig?.manus_env_set
-                            ? "ENV READY: MANUS_API_URL + MANUS_API_KEY พร้อมใช้จาก Backend ENV"
-                            : "ยังไม่ได้ใส่ API Key — วาง Key ด้านบนได้เลย หรือตั้ง MANUS_API_URL / MANUS_API_KEY ใน shell"}
+                            ? "ENV READY: พบ $MANUS_API_KEY ใน Backend ENV พร้อมใช้งานกับ https://api.manus.ai"
+                            : "ยังไม่ได้ใส่ API Key — วาง Manus API Key ด้านบนได้เลย หรือตั้ง MANUS_API_KEY ใน shell"}
                         </span>
                       ) : cleanEnvTrimmed ? (
                         <span className={`ai-env-pill ${savedEnvMatches && aiConfig?.api_key_env_set ? "env-ok" : "env-missing"}`}>
@@ -2611,32 +2682,54 @@ function ConnectionModal({
                   </div>
 
                   <div className="model-probe-row">
-                    <label className="modal-field">
-                      <span>Model Name (เลือกจากผล Probe หรือพิมพ์ชื่อโมเดลจริง)</span>
-                      <input
-                        type="text"
-                        value={aiDraftModel}
-                        onChange={(e) => setAiDraftModel(e.target.value)}
-                        placeholder="ยังไม่ได้ตั้ง — พิมพ์ เช่น qwen2.5:7b หรือกด Probe →"
-                      />
-                    </label>
-                    {discoveredModels.length > 0 && (
+                    {aiDraftProvider === "manus" ? (
                       <label className="modal-field">
-                        <span>Discovered Catalog ({discoveredModels.length})</span>
+                        <span>Agent Profile (Manus v2 ไม่ต้องใส่ชื่อโมเดล — ค่าเริ่มต้นคือ standard)</span>
                         <select
-                          value={discoveredModels.some((m) => m.id === aiDraftModel) ? aiDraftModel : ""}
-                          onChange={(e) => {
-                            if (e.target.value) setAiDraftModel(e.target.value);
-                          }}
+                          value={
+                            MANUS_AGENT_PROFILES.some((p) => p.id === aiDraftModel.trim())
+                              ? aiDraftModel.trim()
+                              : "standard"
+                          }
+                          onChange={(e) => setAiDraftModel(e.target.value)}
                         >
-                          <option value="">-- เลือกโมเดลที่พบ --</option>
-                          {discoveredModels.map((item) => (
-                            <option key={item.id} value={item.id}>
-                              {item.display_name ?? item.id}
+                          {MANUS_AGENT_PROFILES.map((profile) => (
+                            <option key={profile.id} value={profile.id}>
+                              {profile.label}
                             </option>
                           ))}
                         </select>
                       </label>
+                    ) : (
+                      <>
+                        <label className="modal-field">
+                          <span>Model Name (เลือกจากผล Probe หรือพิมพ์ชื่อโมเดลจริง)</span>
+                          <input
+                            type="text"
+                            value={aiDraftModel}
+                            onChange={(e) => setAiDraftModel(e.target.value)}
+                            placeholder="ยังไม่ได้ตั้ง — พิมพ์ เช่น qwen2.5:7b หรือกด Probe →"
+                          />
+                        </label>
+                        {discoveredModels.length > 0 && (
+                          <label className="modal-field">
+                            <span>Discovered Catalog ({discoveredModels.length})</span>
+                            <select
+                              value={discoveredModels.some((m) => m.id === aiDraftModel) ? aiDraftModel : ""}
+                              onChange={(e) => {
+                                if (e.target.value) setAiDraftModel(e.target.value);
+                              }}
+                            >
+                              <option value="">-- เลือกโมเดลที่พบ --</option>
+                              {discoveredModels.map((item) => (
+                                <option key={item.id} value={item.id}>
+                                  {item.display_name ?? item.id}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                      </>
                     )}
                     <button
                       type="button"
@@ -2645,7 +2738,11 @@ function ConnectionModal({
                       onClick={() => void handleProbeClick()}
                     >
                       <Icon name="search" size={13} />{" "}
-                      {probingAiModels ? "Probing..." : "Probe / Discover Models"}
+                      {probingAiModels
+                        ? "กำลังตรวจสอบ..."
+                        : aiDraftProvider === "manus"
+                          ? "ทดสอบการเชื่อมต่อ Manus"
+                          : "Probe / Discover Models"}
                     </button>
                   </div>
 
@@ -3535,7 +3632,10 @@ function AnalyzePage({
   const activeProfile = profiles?.[resourceMode] ?? null;
   const isCsvSelected = fileInspection?.detectedFormat === "csv" || fileInspection?.detectedFormat === "tsv";
   const effectiveChunkSize = activeProfile?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes ?? null;
-  const canStartBackendAi = Boolean(aiConfig?.configuration.enabled && aiConfig?.configuration.model);
+  const canStartBackendAi = Boolean(
+    aiConfig?.configuration.enabled &&
+      (aiConfig?.configuration.model || aiConfig?.configuration.provider === "manus"),
+  );
   const layer1Status = resolveLayer1Status({ capabilities, workspaceConfig, aiConfig });
   const triageEndpointConfigured = Boolean(
     aiConfig?.triage?.endpoint_configured ||
@@ -3785,7 +3885,9 @@ function AnalyzePage({
               {layer1Status.hardwareBadgeLabel}
             </span>
             <span className={canStartBackendAi ? "hw-badge-ok" : "muted"}>
-              {canStartBackendAi ? `LLM Ready (${aiConfig?.configuration.model})` : "LLM Standby"}
+              {canStartBackendAi
+                ? `LLM Ready (${aiConfig?.configuration.model || "standard"})`
+                : "LLM Standby"}
             </span>
           </small>
         </div>

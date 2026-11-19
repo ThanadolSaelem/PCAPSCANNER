@@ -1289,3 +1289,41 @@ test("PcapApiClient setAiCredentials and clearAiCredentials call loopback /api/v
     globalThis.fetch = origFetch;
   }
 });
+
+test("resolveLayer2DraftStatus treats Manus default standard profile as ready without requiring a model name", () => {
+  const status = resolveLayer2DraftStatus({
+    aiConfig: {
+      configuration: {
+        schema_version: "1.0",
+        enabled: true,
+        provider: "manus",
+        base_url: "https://api.manus.ai",
+        allowed_origins: ["https://api.manus.ai"],
+        model: null,
+        api_key_env: null,
+        data_boundary: "remote",
+        timeout_seconds: 120,
+        input_max_bytes: 100000,
+        max_output_tokens: 2048,
+        context_window_tokens: 16384,
+      },
+      policy_hash: "h2",
+      editable: "loopback_nonsecret_runtime_and_env",
+      manus_ready: true,
+    },
+    draft: {
+      enabled: true,
+      provider: "manus",
+      data_boundary: "remote",
+      base_url: "https://api.manus.ai",
+      allowed_origins: "https://api.manus.ai",
+      model: "",
+      api_key_env: "",
+    },
+  });
+  assert.equal(status.missingModel, false);
+  assert.equal(status.savedActive, true);
+  assert.equal(status.pillTone, "ok");
+  assert.match(status.badgeLabel, /manus\/standard/);
+});
+
