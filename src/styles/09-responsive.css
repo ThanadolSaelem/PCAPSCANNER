@@ -139,9 +139,9 @@
   .hardware-strip { grid-template-columns: 1fr; }
   .hw-item { padding-left: 0; border-left: 0; padding-top: 8px; border-top: 1px solid var(--line); }
   .hw-item:first-child { padding-top: 0; border-top: 0; }
-  .profile-grid, .ai-layer-status-grid, .ai-field-grid { grid-template-columns: 1fr; }
+  .profile-grid, .ai-layer-status-grid { grid-template-columns: 1fr; }
   .av-grid-3 { grid-template-columns: 1fr; }
-  .local-path-row, .model-probe-row { flex-direction: column; align-items: stretch; }
+  .local-path-row { flex-direction: column; align-items: stretch; }
   .workspace-picker-head { flex-direction: column; }
   .triage-class-row { grid-template-columns: 110px minmax(0, 1fr) 72px; }
   .batch-panel { padding: 12px; }

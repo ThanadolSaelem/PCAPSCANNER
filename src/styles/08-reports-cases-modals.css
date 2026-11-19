@@ -368,14 +368,6 @@
 .layer1-subblock > small { color: #8499a8; font-size: 9px; line-height: 1.55; }
 .layer1-subblock code { color: #8ad3de; font: 9px var(--mono); }
 
-.ai-runtime-card {
-  display: grid;
-  gap: 14px;
-  padding: 16px 18px;
-  border: 1px solid rgba(183, 160, 235, .28);
-  border-radius: 10px;
-  background: rgba(17, 23, 36, .82);
-}
 .ai-status-note {
   padding: 10px 12px;
   border: 1px solid rgba(229, 184, 92, .3);
@@ -394,30 +386,6 @@
   border-color: rgba(91, 158, 232, .25);
   color: #9ec3e6;
   background: rgba(91, 158, 232, .06);
-}
-.ai-preset-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 11px 14px;
-  border: 1px solid rgba(50, 189, 209, .2);
-  border-radius: 8px;
-  background: rgba(13, 22, 31, .65);
-}
-.ai-toggle-line {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: var(--ink);
-  font-size: 10.5px;
-  font-weight: 600;
-}
-.ai-field-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
 }
 .api-key-box {
   display: grid;
@@ -521,13 +489,6 @@
 .ai-advanced-details .modal-field {
   margin-top: 10px;
 }
-.model-probe-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 10px;
-}
-.model-probe-row .modal-field { flex: 1 1 240px; }
 .ai-env-pill {
   display: inline-flex;
   align-items: center;
@@ -545,21 +506,6 @@
 .ai-env-pill.env-missing { border-color: var(--warn-border); color: var(--warn-tone); background: var(--warn-bg); }
 .ai-env-pill.env-info { border-color: rgba(50, 189, 209, .34); color: #8be0ec; background: rgba(50, 189, 209, .09); }
 .ai-env-pill.env-neutral { border-color: #364957; color: #96aab8; background: rgba(126, 145, 158, .08); }
-.ai-runtime-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid rgba(53, 73, 90, .45);
-  border-radius: 8px;
-  background: rgba(10, 16, 24, .55);
-}
-.ai-runtime-actions.actions-dirty {
-  border-color: rgba(229, 184, 92, .38);
-  background: rgba(229, 184, 92, .06);
-}
 
 /* Tabbed ConnectionModal & compact Reports Export Menu */
 .modal-tabs {
