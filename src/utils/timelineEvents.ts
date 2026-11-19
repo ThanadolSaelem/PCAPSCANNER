@@ -31,16 +31,20 @@ export interface TimelineBucketDetail {
   targetEvidenceId: string | null;
 }
 
-const FRAME_REF_RE = /frame\s*#?(\d+)/i;
+const FRAME_REF_RE = /^(?:frame\s*)?#(\d+)$/i;
 const CLOCK_TIME_RE = /(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))?/;
 const NUMERIC_TIME_RE = /^[\s+]*(-?\d+(?:\.\d+)?)\s*(?:s|sec|ms)?$/i;
 
+export type TimeScale = "relative" | "epoch" | "clock";
+
 /**
- * Parse a packet/flow time string into a comparable numeric value.
+ * Parse a packet/flow time string into a comparable numeric value and scale.
  * Supports relative seconds ("0.125", "+4.2s"), epoch timestamps, ISO/clock
- * timestamps ("12:34:56.789"), and falls back cleanly when unparseable.
+ * timestamps ("12:34:56.789"), and frame references ("#420", "frame #420").
  */
-export function parseComparableTime(raw: string | null | undefined): { kind: "seconds" | "frame" | "none"; value: number } {
+export function parseComparableTime(
+  raw: string | null | undefined,
+): { kind: "seconds" | "frame" | "none"; value: number; scale?: TimeScale } {
   if (!raw) return { kind: "none", value: 0 };
   const trimmed = raw.trim();
   if (!trimmed) return { kind: "none", value: 0 };
@@ -50,7 +54,8 @@ export function parseComparableTime(raw: string | null | undefined): { kind: "se
     const val = Number(numMatch[1]);
     if (Number.isFinite(val)) {
       const isMs = /ms$/i.test(trimmed);
-      return { kind: "seconds", value: isMs ? val / 1000 : val };
+      const seconds = isMs ? val / 1000 : val;
+      return { kind: "seconds", value: seconds, scale: seconds >= 1e8 ? "epoch" : "relative" };
     }
   }
 
@@ -58,7 +63,7 @@ export function parseComparableTime(raw: string | null | undefined): { kind: "se
   if (trimmed.includes("-") && (trimmed.includes("T") || trimmed.includes(" "))) {
     const parsed = Date.parse(trimmed);
     if (Number.isFinite(parsed)) {
-      return { kind: "seconds", value: parsed / 1000 };
+      return { kind: "seconds", value: parsed / 1000, scale: "epoch" };
     }
   }
 
@@ -69,7 +74,7 @@ export function parseComparableTime(raw: string | null | undefined): { kind: "se
     const mins = Number(clockMatch[2]);
     const secs = Number(clockMatch[3]);
     const frac = clockMatch[4] ? Number(`0.${clockMatch[4]}`) : 0;
-    return { kind: "seconds", value: hrs * 3600 + mins * 60 + secs + frac };
+    return { kind: "seconds", value: hrs * 3600 + mins * 60 + secs + frac, scale: "clock" };
   }
 
   const frameMatch = FRAME_REF_RE.exec(trimmed);
@@ -81,9 +86,22 @@ export function parseComparableTime(raw: string | null | undefined): { kind: "se
   return { kind: "none", value: 0 };
 }
 
-function clampBucket(index: number, count: number): number {
+function ratioToBucketIndex(ratio: number, count: number): number {
   if (count <= 1) return 0;
-  return Math.max(0, Math.min(count - 1, Math.floor(index)));
+  const clampedRatio = Math.max(0, Math.min(1, ratio));
+  return Math.max(0, Math.min(count - 1, Math.round(clampedRatio * (count - 1))));
+}
+
+function epochToUtcClockSeconds(epochSeconds: number): number {
+  const mod = epochSeconds % 86400;
+  return mod < 0 ? mod + 86400 : mod;
+}
+
+function unwrapClockValue(clockSec: number, winStart: number, winEnd: number): number {
+  if (winEnd > 86400 && clockSec < winStart - 1) {
+    return clockSec + 86400;
+  }
+  return clockSec;
 }
 
 function formatFallbackBucketLabel(index: number, total: number, durationSeconds: number, timelineLabels: string[]): string {
@@ -122,6 +140,75 @@ function severityRank(severity: WorkspaceFinding["severity"]): number {
   }
 }
 
+interface TimeWindow {
+  scale: TimeScale | null;
+  start: number;
+  end: number;
+  span: number;
+}
+
+function resolveTimeWindow(
+  items: { parsed: { kind: "seconds" | "frame" | "none"; value: number; scale?: TimeScale } }[],
+  rawBuckets: TimelineBucket[],
+  startEpoch: number | null,
+  endEpoch: number | null,
+  durationSeconds: number,
+): TimeWindow {
+  const secItems = items.filter((item) => item.parsed.kind === "seconds" && item.parsed.scale);
+  if (secItems.length === 0) {
+    return { scale: null, start: 0, end: 0, span: 0 };
+  }
+
+  // Pick dominant scale among parsed timestamps
+  const scaleCounts: Record<TimeScale, number> = { relative: 0, epoch: 0, clock: 0 };
+  for (const item of secItems) {
+    if (item.parsed.scale) scaleCounts[item.parsed.scale] += 1;
+  }
+  const scale: TimeScale =
+    scaleCounts.clock >= scaleCounts.epoch && scaleCounts.clock >= scaleCounts.relative
+      ? "clock"
+      : scaleCounts.epoch >= scaleCounts.relative
+        ? "epoch"
+        : "relative";
+
+  const sameScaleValues = secItems.filter((item) => item.parsed.scale === scale).map((item) => item.parsed.value);
+  const rawMin = Math.min(...sameScaleValues);
+  const rawMax = Math.max(...sameScaleValues);
+
+  if (scale === "clock") {
+    if (startEpoch !== null && endEpoch !== null && endEpoch > startEpoch) {
+      const start = epochToUtcClockSeconds(startEpoch);
+      const end = start + (endEpoch - startEpoch);
+      return { scale, start, end, span: Math.max(0, end - start) };
+    }
+    // Check if raw timeline bucket labels themselves carry clock times (from backend _format_utc_time)
+    const firstBucket = rawBuckets.length > 0 ? parseComparableTime(rawBuckets[0].label) : null;
+    const lastBucket = rawBuckets.length > 1 ? parseComparableTime(rawBuckets[rawBuckets.length - 1].label) : null;
+    if (firstBucket?.scale === "clock" && lastBucket?.scale === "clock") {
+      const start = firstBucket.value;
+      const end = lastBucket.value >= start ? lastBucket.value : lastBucket.value + 86400;
+      if (end > start) {
+        return { scale, start, end, span: end - start };
+      }
+    }
+    // Fall back to observed clock range + capture duration (NEVER clamp clock seconds to 0!)
+    const start = rawMin;
+    const end = Math.max(rawMax, durationSeconds > 0 ? rawMin + durationSeconds : rawMax);
+    return { scale, start, end, span: Math.max(0, end - start) };
+  }
+
+  if (scale === "epoch") {
+    const start = startEpoch !== null ? Math.min(rawMin, startEpoch) : rawMin;
+    const end = endEpoch !== null ? Math.max(rawMax, endEpoch) : rawMax;
+    return { scale, start, end, span: Math.max(0, end - start) };
+  }
+
+  // Relative capture offsets (+0.00s .. +duration)
+  const start = durationSeconds > 0 ? Math.min(rawMin, 0) : rawMin;
+  const end = durationSeconds > 0 ? Math.max(rawMax, durationSeconds) : rawMax;
+  return { scale, start, end, span: Math.max(0, end - start) };
+}
+
 /**
  * Derive rich per-bar hover event previews and click-to-evidence jump targets
  * exclusively from `report` (already privacy-redacted when Privacy Mode is on)
@@ -136,7 +223,19 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
   const startEpoch = report.rawBundle?.telemetry?.start_epoch ?? null;
   const endEpoch = report.rawBundle?.telemetry?.end_epoch ?? null;
 
-  // Map packets to bucket indices
+  // Optional raw evidence lookup (only numeric first_seen / packet_refs — never raw IPs)
+  const evidenceNumericById = new Map<string, { firstSeenEpoch: number | null; firstFrame: number | null }>();
+  for (const ev of report.rawBundle?.evidence ?? []) {
+    const firstSeenRaw = ev.attributes?.first_seen;
+    const firstSeenEpoch =
+      typeof firstSeenRaw === "number" && Number.isFinite(firstSeenRaw) ? firstSeenRaw : null;
+    const firstFrame =
+      Array.isArray(ev.packet_refs) && ev.packet_refs.length > 0 && typeof ev.packet_refs[0] === "number"
+        ? ev.packet_refs[0]
+        : null;
+    evidenceNumericById.set(ev.evidence_id, { firstSeenEpoch, firstFrame });
+  }
+
   const packetsByBucket: WorkspacePacket[][] = Array.from({ length: bucketCount }, () => []);
   const flowsByBucket: WorkspaceFlow[][] = Array.from({ length: bucketCount }, () => []);
 
@@ -144,28 +243,15 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
     packet,
     idx,
     parsed: parseComparableTime(packet.time),
+    normPos: 0, // normalized [0..1] timeline coordinate
   }));
 
-  const secondPackets = parsedPackets.filter((item) => item.parsed.kind === "seconds");
-  const usePacketSeconds = secondPackets.length >= Math.max(1, Math.floor(parsedPackets.length * 0.5));
-
-  let minSec = Number.POSITIVE_INFINITY;
-  let maxSec = Number.NEGATIVE_INFINITY;
-  if (usePacketSeconds) {
-    for (const item of secondPackets) {
-      if (item.parsed.value < minSec) minSec = item.parsed.value;
-      if (item.parsed.value > maxSec) maxSec = item.parsed.value;
-    }
-    // Align with capture epoch or relative capture duration when values are in the same coordinate space
-    if (startEpoch !== null && endEpoch !== null && endEpoch > startEpoch && minSec >= 1e8) {
-      minSec = Math.min(minSec, startEpoch);
-      maxSec = Math.max(maxSec, endEpoch);
-    } else if (durationSeconds > 0 && minSec >= 0 && maxSec < 1e8) {
-      minSec = Math.min(minSec, 0);
-      maxSec = Math.max(maxSec, durationSeconds);
-    }
-  }
-  const secSpan = maxSec > minSec ? maxSec - minSec : 0;
+  const pktWindow = resolveTimeWindow(parsedPackets, rawBuckets, startEpoch, endEpoch, durationSeconds);
+  const usePacketSeconds =
+    pktWindow.scale !== null &&
+    pktWindow.span > 0 &&
+    parsedPackets.filter((item) => item.parsed.scale === pktWindow.scale).length >=
+      Math.max(1, Math.floor(parsedPackets.length * 0.5));
 
   const maxPacketNo = report.packets.reduce((acc, p) => Math.max(acc, p.no), 1);
   const frameUpperBound = Math.max(1, report.packetsAnalyzed, maxPacketNo);
@@ -174,14 +260,21 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
   const packetBucketByEvidence = new Map<string, number>();
 
   for (const item of parsedPackets) {
-    let bucketIndex = 0;
-    if (usePacketSeconds && item.parsed.kind === "seconds" && secSpan > 0) {
-      bucketIndex = clampBucket(((item.parsed.value - minSec) / secSpan) * bucketCount, bucketCount);
+    let ratio = 0;
+    if (usePacketSeconds && item.parsed.scale === pktWindow.scale && pktWindow.span > 0) {
+      const val =
+        pktWindow.scale === "clock"
+          ? unwrapClockValue(item.parsed.value, pktWindow.start, pktWindow.end)
+          : item.parsed.value;
+      ratio = (val - pktWindow.start) / pktWindow.span;
     } else if (frameUpperBound > 1 && item.packet.no > 0) {
-      bucketIndex = clampBucket(((item.packet.no - 1) / frameUpperBound) * bucketCount, bucketCount);
+      ratio = (item.packet.no - 1) / Math.max(1, frameUpperBound - 1);
     } else if (parsedPackets.length > 1) {
-      bucketIndex = clampBucket((item.idx / parsedPackets.length) * bucketCount, bucketCount);
+      ratio = item.idx / (parsedPackets.length - 1);
     }
+    const clampedRatio = Math.max(0, Math.min(1, ratio));
+    item.normPos = clampedRatio;
+    const bucketIndex = ratioToBucketIndex(clampedRatio, bucketCount);
     packetsByBucket[bucketIndex].push(item.packet);
     packetBucketByNo.set(item.packet.no, bucketIndex);
     if (item.packet.evidence && !packetBucketByEvidence.has(item.packet.evidence)) {
@@ -189,40 +282,47 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
     }
   }
 
-  // Map flows to bucket indices using parsed firstSeen, linked packet evidence, or proportional order
+  // Map flows to bucket indices using numeric first_seen epoch, parsed firstSeen, linked packet, or frame ref
   const parsedFlows = report.flows.map((flow, idx) => ({
     flow,
     idx,
     parsed: parseComparableTime(flow.firstSeen),
+    evMeta: evidenceNumericById.get(flow.evidence),
+    normPos: 0,
   }));
-  const secondFlows = parsedFlows.filter((item) => item.parsed.kind === "seconds");
-  let flowMinSec = minSec;
-  let flowMaxSec = maxSec;
-  if (!usePacketSeconds && secondFlows.length > 0) {
-    flowMinSec = Math.min(...secondFlows.map((item) => item.parsed.value));
-    flowMaxSec = Math.max(...secondFlows.map((item) => item.parsed.value));
-    if (durationSeconds > 0 && flowMinSec >= 0 && flowMaxSec < 1e8) {
-      flowMinSec = Math.min(flowMinSec, 0);
-      flowMaxSec = Math.max(flowMaxSec, durationSeconds);
-    }
-  }
-  const flowSecSpan = flowMaxSec > flowMinSec ? flowMaxSec - flowMinSec : 0;
+
+  const flowWindow = resolveTimeWindow(parsedFlows, rawBuckets, startEpoch, endEpoch, durationSeconds);
 
   for (const item of parsedFlows) {
-    let bucketIndex: number | undefined;
-    if (item.flow.evidence && packetBucketByEvidence.has(item.flow.evidence)) {
-      bucketIndex = packetBucketByEvidence.get(item.flow.evidence);
+    let ratio: number | undefined;
+
+    if (
+      item.evMeta?.firstSeenEpoch != null &&
+      startEpoch !== null &&
+      endEpoch !== null &&
+      endEpoch > startEpoch
+    ) {
+      ratio = (item.evMeta.firstSeenEpoch - startEpoch) / (endEpoch - startEpoch);
+    } else if (item.parsed.kind === "seconds" && item.parsed.scale === flowWindow.scale && flowWindow.span > 0) {
+      const val =
+        flowWindow.scale === "clock"
+          ? unwrapClockValue(item.parsed.value, flowWindow.start, flowWindow.end)
+          : item.parsed.value;
+      ratio = (val - flowWindow.start) / flowWindow.span;
+    } else if (item.evMeta?.firstFrame != null && frameUpperBound > 1) {
+      ratio = (item.evMeta.firstFrame - 1) / Math.max(1, frameUpperBound - 1);
+    } else if (item.parsed.kind === "frame" && frameUpperBound > 1) {
+      ratio = (item.parsed.value - 1) / Math.max(1, frameUpperBound - 1);
+    } else if (item.flow.evidence && packetBucketByEvidence.has(item.flow.evidence)) {
+      const bIdx = packetBucketByEvidence.get(item.flow.evidence)!;
+      ratio = bucketCount > 1 ? bIdx / (bucketCount - 1) : 0;
+    } else {
+      ratio = parsedFlows.length > 1 ? item.idx / (parsedFlows.length - 1) : 0;
     }
-    if (bucketIndex === undefined && item.parsed.kind === "seconds" && flowSecSpan > 0) {
-      bucketIndex = clampBucket(((item.parsed.value - flowMinSec) / flowSecSpan) * bucketCount, bucketCount);
-    }
-    if (bucketIndex === undefined && item.parsed.kind === "frame" && frameUpperBound > 1) {
-      bucketIndex = clampBucket(((item.parsed.value - 1) / frameUpperBound) * bucketCount, bucketCount);
-    }
-    if (bucketIndex === undefined) {
-      bucketIndex =
-        parsedFlows.length > 1 ? clampBucket((item.idx / parsedFlows.length) * bucketCount, bucketCount) : 0;
-    }
+
+    const clampedRatio = Math.max(0, Math.min(1, ratio));
+    item.normPos = clampedRatio;
+    const bucketIndex = ratioToBucketIndex(clampedRatio, bucketCount);
     flowsByBucket[bucketIndex].push(item.flow);
   }
 
@@ -247,24 +347,38 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
     report.flows[0]?.protocol ??
     "TRAFFIC";
 
+  // Find the truly closest packet in normalized timeline coordinate [0..1]
   const findNearestPacket = (bucketIdx: number): WorkspacePacket | null => {
-    for (let dist = 1; dist < bucketCount; dist += 1) {
-      const left = bucketIdx - dist;
-      const right = bucketIdx + dist;
-      if (left >= 0 && packetsByBucket[left].length > 0) return packetsByBucket[left][0];
-      if (right < bucketCount && packetsByBucket[right].length > 0) return packetsByBucket[right][0];
+    if (parsedPackets.length === 0) return null;
+    const targetRatio = bucketCount > 1 ? bucketIdx / (bucketCount - 1) : 0;
+    let best = parsedPackets[0];
+    let bestDist = Math.abs(best.normPos - targetRatio);
+    for (let i = 1; i < parsedPackets.length; i += 1) {
+      const cand = parsedPackets[i];
+      const dist = Math.abs(cand.normPos - targetRatio);
+      // Use <= when target is ahead of the sampled window so we pick the latest closest frame instead of row 1
+      if (dist < bestDist - 1e-9 || (Math.abs(dist - bestDist) <= 1e-9 && cand.normPos <= targetRatio)) {
+        best = cand;
+        bestDist = dist;
+      }
     }
-    return report.packets[0] ?? null;
+    return best.packet;
   };
 
   const findNearestFlow = (bucketIdx: number): WorkspaceFlow | null => {
-    for (let dist = 1; dist < bucketCount; dist += 1) {
-      const left = bucketIdx - dist;
-      const right = bucketIdx + dist;
-      if (left >= 0 && flowsByBucket[left].length > 0) return flowsByBucket[left][0];
-      if (right < bucketCount && flowsByBucket[right].length > 0) return flowsByBucket[right][0];
+    if (parsedFlows.length === 0) return null;
+    const targetRatio = bucketCount > 1 ? bucketIdx / (bucketCount - 1) : 0;
+    let best = parsedFlows[0];
+    let bestDist = Math.abs(best.normPos - targetRatio);
+    for (let i = 1; i < parsedFlows.length; i += 1) {
+      const cand = parsedFlows[i];
+      const dist = Math.abs(cand.normPos - targetRatio);
+      if (dist < bestDist - 1e-9 || (Math.abs(dist - bestDist) <= 1e-9 && cand.normPos <= targetRatio)) {
+        best = cand;
+        bestDist = dist;
+      }
     }
-    return report.flows[0] ?? null;
+    return best.flow;
   };
 
   return report.timeline.map((rawIntensity, index) => {
@@ -346,7 +460,9 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
       headline = truncateText(matchingFinding.title, 58);
       subline = directSamplePacket
         ? truncateText(`Frame #${directSamplePacket.no} · ${directSamplePacket.source} → ${directSamplePacket.destination}`, 74)
-        : truncateText(matchingFinding.summary || matchingFinding.destination, 74);
+        : directSampleFlow
+          ? truncateText(`${directSampleFlow.id} · ${directSampleFlow.source} → ${directSampleFlow.destination}`, 74)
+          : truncateText(matchingFinding.summary || matchingFinding.destination, 74);
     } else if (directSamplePacket) {
       headline = truncateText(`${directSamplePacket.source} → ${directSamplePacket.destination}`, 58);
       const triagePrefix = directSamplePacket.triageLabel ? `[${directSamplePacket.triageLabel}] ` : "";
@@ -379,11 +495,19 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
       subline = "ยังไม่มี sampled frame ในช่วงเวลานี้";
     }
 
-    const targetKind: TimelineBucketDetail["targetKind"] = samplePacket
-      ? "packet"
-      : sampleFlow
-        ? "flow"
-        : "none";
+    // Prefer direct in-bucket match (packet first, then flow) before approximate fallback
+    let targetKind: TimelineBucketDetail["targetKind"];
+    if (directSamplePacket) {
+      targetKind = "packet";
+    } else if (directSampleFlow) {
+      targetKind = "flow";
+    } else if (samplePacket) {
+      targetKind = "packet";
+    } else if (sampleFlow) {
+      targetKind = "flow";
+    } else {
+      targetKind = "none";
+    }
 
     return {
       index,
@@ -408,6 +532,7 @@ export function buildTimelineBucketDetails(report: WorkspaceReport): TimelineBuc
       targetFlowId: sampleFlow?.id ?? null,
       targetEvidenceId:
         matchingFinding?.evidence[0] ??
+        (targetKind === "flow" ? sampleFlow?.evidence : samplePacket?.evidence) ??
         samplePacket?.evidence ??
         sampleFlow?.evidence ??
         null,

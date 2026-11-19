@@ -372,6 +372,7 @@ class _Accumulator:
     arp_scan_refs: dict[str, list[int]] = field(default_factory=dict)
     arp_scan_req_count: dict[str, int] = field(default_factory=dict)
     # Timeline coarse observations (bucketed dynamically on finalize)
+    _packets_ingested: int = 0
     _time_samples: list[tuple[float, int, bool]] = field(default_factory=list)
     sample_packets: list[SamplePacket] = field(default_factory=list)
 
@@ -408,6 +409,7 @@ class _Accumulator:
 
     def ingest_packet(self, packet: _Packet, *, is_flagged_hint: bool = False) -> None:
         """Consume one parsed packet metadata object in O(K) bounded memory."""
+        self._packets_ingested += 1
         if packet.frame_len is not None:
             self.total_bytes += packet.frame_len
 
@@ -529,22 +531,43 @@ class _Accumulator:
             or (packet.arp_src_ip and len(self.arp_ip_macs.get(packet.arp_src_ip, ())) > 1)
         )
 
+        seen_count = max(self.rows_analyzed, self._packets_ingested)
+
         # Bounded time series sample reservoir (max 3600 points -> bins into 36 timeline bars cleanly)
         if len(self._time_samples) < 3600:
-            self._time_samples.append((ts if ts is not None else float(self.rows_analyzed), packet.frame_len or 0, anomaly_tick))
-        elif self.rows_analyzed % max(2, self.rows_analyzed // 1800) == 0:
+            self._time_samples.append((ts if ts is not None else float(seen_count), packet.frame_len or 0, anomaly_tick))
+        elif seen_count % max(2, seen_count // 1800) == 0:
             # Replace oldest non-anomaly or downsample proportionally
-            idx = (self.rows_analyzed * 2654435761) % 3600
+            idx = (seen_count * 2654435761) % 3600
             if not self._time_samples[idx][2] or anomaly_tick:
-                self._time_samples[idx] = (ts if ts is not None else float(self.rows_analyzed), packet.frame_len or 0, anomaly_tick)
+                self._time_samples[idx] = (ts if ts is not None else float(seen_count), packet.frame_len or 0, anomaly_tick)
 
-        # Keep up to MAX_SAMPLE_PACKETS representative & flagged rows for Packet Explorer UI
+        # Keep up to MAX_SAMPLE_PACKETS representative & flagged rows across the ENTIRE capture timeline
         if len(self.sample_packets) < MAX_SAMPLE_PACKETS:
-            # Take early frames + spread out samples when huge, always capturing anomalies
-            take = anomaly_tick or len(self.sample_packets) < 60 or (self.rows_analyzed % max(1, self.rows_analyzed // 120) == 0)
-            if take:
-                self.sample_packets.append(
-                    SamplePacket(
+            self.sample_packets.append(
+                SamplePacket(
+                    no=packet.frame,
+                    time=_format_utc_time(ts, packet.frame),
+                    source=packet.src or packet.eth_src or "Unknown",
+                    destination=packet.dst or packet.eth_dst or "Unknown",
+                    protocol=proto_label,
+                    length=packet.frame_len or 0,
+                    info=packet.info_summary or _default_packet_info(packet, proto_label),
+                    triage_label="Flagged" if anomaly_tick else None,
+                )
+            )
+        else:
+            # Deterministic uniform reservoir slot spanning [0..seen_count-1] via 32-bit Murmur3 mix.
+            # Anchor index 0 on the opening frame; reserve up to half the buffer (odd slots) for anomalies
+            # while maintaining even temporal coverage from start to end of the capture.
+            h = ((seen_count ^ 0x9E3779B9) * 0x85EBCA6B) & 0xFFFFFFFF
+            h = ((h ^ (h >> 13)) * 0xC2B2AE35) & 0xFFFFFFFF
+            h ^= h >> 16
+            slot = h % seen_count
+            if 0 < slot < MAX_SAMPLE_PACKETS:
+                existing = self.sample_packets[slot]
+                if anomaly_tick or existing.triage_label is None:
+                    self.sample_packets[slot] = SamplePacket(
                         no=packet.frame,
                         time=_format_utc_time(ts, packet.frame),
                         source=packet.src or packet.eth_src or "Unknown",
@@ -552,13 +575,13 @@ class _Accumulator:
                         protocol=proto_label,
                         length=packet.frame_len or 0,
                         info=packet.info_summary or _default_packet_info(packet, proto_label),
+                        triage_label="Flagged" if anomaly_tick else None,
                     )
-                )
-        elif anomaly_tick:
-            # Ensure critical flagged frames replace an ordinary background sample if buffer is full
-            for idx in range(len(self.sample_packets) - 1, 20, -1):
-                if self.sample_packets[idx].triage_label is None and self.sample_packets[idx].evidence_id is None:
-                    self.sample_packets[idx] = SamplePacket(
+            elif anomaly_tick:
+                # Bounded anomaly replacement on odd slots only so even slots stay uniformly spread
+                anom_slot = 1 + ((h % (MAX_SAMPLE_PACKETS // 2)) * 2)
+                if anom_slot < MAX_SAMPLE_PACKETS and self.sample_packets[anom_slot].triage_label is None:
+                    self.sample_packets[anom_slot] = SamplePacket(
                         no=packet.frame,
                         time=_format_utc_time(ts, packet.frame),
                         source=packet.src or packet.eth_src or "Unknown",
@@ -568,7 +591,6 @@ class _Accumulator:
                         info=packet.info_summary or _default_packet_info(packet, proto_label),
                         triage_label="Flagged",
                     )
-                    break
 
     def _create_flow(
         self,
@@ -2648,13 +2670,14 @@ def _build_bundle(
     if accumulator.first_epoch is not None and accumulator.last_epoch is not None:
         duration_s = max(0.0, accumulator.last_epoch - accumulator.first_epoch)
 
-    # Link sample packets to matching Evidence IDs by packet_ref
+    # Link sample packets to matching Evidence IDs by packet_ref (sorted chronologically by frame no.)
     ref_to_ev: dict[int, str] = {}
     for ev in evidence:
         for ref in ev.packet_refs:
             ref_to_ev.setdefault(ref, ev.evidence_id)
+    sorted_samples = sorted(accumulator.sample_packets[:MAX_SAMPLE_PACKETS], key=lambda sp: sp.no)
     linked_samples: list[SamplePacket] = []
-    for sp in accumulator.sample_packets[:MAX_SAMPLE_PACKETS]:
+    for sp in sorted_samples:
         ev_id = ref_to_ev.get(sp.no)
         linked_samples.append(
             sp.model_copy(update={"evidence_id": ev_id}) if ev_id else sp

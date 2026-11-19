@@ -928,9 +928,11 @@ test("easeInOutQuint delivers monotonic speed-up and slow-down scroll physics", 
 });
 
 test("buildTimelineBucketDetails maps packets, flows, and findings per bucket while honoring Privacy Mode", () => {
-  assert.deepEqual(parseComparableTime("12.5s"), { kind: "seconds", value: 12.5 });
-  assert.deepEqual(parseComparableTime("250ms"), { kind: "seconds", value: 0.25 });
+  assert.deepEqual(parseComparableTime("12.5s"), { kind: "seconds", value: 12.5, scale: "relative" });
+  assert.deepEqual(parseComparableTime("250ms"), { kind: "seconds", value: 0.25, scale: "relative" });
+  assert.deepEqual(parseComparableTime("14:22:01.250"), { kind: "seconds", value: 14 * 3600 + 22 * 60 + 1.25, scale: "clock" });
   assert.deepEqual(parseComparableTime("frame #42"), { kind: "frame", value: 42 });
+  assert.deepEqual(parseComparableTime("#42"), { kind: "frame", value: 42 });
 
   const live = adaptBackendReport({
     analysis_id: "tl-test-0001",
@@ -1109,6 +1111,139 @@ test("describeEtbertExecution truthfully distinguishes neural weights from fallb
   assert.equal(standby.tone, "idle");
   assert.match(standby.badge, /Standby/);
 });
+
+test("buildTimelineBucketDetails maps UTC HH:MM:SS.fff packets, midnight rollover, and #frame flows without collapsing to row 1", () => {
+  // 2026-11-18T14:22:00.000Z .. 2026-11-18T14:23:40.000Z (100 seconds, 36 buckets)
+  const startEpoch = Date.UTC(2026, 10, 18, 14, 22, 0) / 1000;
+  const endEpoch = startEpoch + 100;
+  const timeline = Array.from({ length: 36 }, (_, idx) => {
+    const t = new Date((startEpoch + (100 * idx) / 35) * 1000);
+    const label = t.toISOString().slice(11, 23);
+    return { index: idx, label, packets: 500, bytes: 32000, anomalies: idx === 18 ? 2 : 0 };
+  });
+
+  const live = adaptBackendReport({
+    analysis_id: "utcclock12345678",
+    status: "completed",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "e".repeat(64),
+      coverage: {
+        packets_seen: 18893,
+        packets_analyzed: 18893,
+        flows_analyzed: 4,
+        truncated: false,
+        warnings: [],
+        stages: [{ name: "tshark", state: "completed", detail: "ok" }],
+      },
+      evidence: [
+        {
+          evidence_id: "EV-000001",
+          kind: "flow",
+          summary: "Early burst",
+          packet_refs: [1],
+          attributes: { protocol: "802.11", src: "aa:bb:cc:dd:ee:01", dst: "ff:ff:ff:ff:ff:ff", packets: 120, bytes: 9600, first_seen: startEpoch + 0.5 },
+        },
+        {
+          evidence_id: "EV-000002",
+          kind: "flow",
+          summary: "Mid-capture flow without sampled packet",
+          packet_refs: [9500],
+          attributes: { protocol: "TLS", src: "10.0.0.5", dst: "198.51.100.20", packets: 85, bytes: 42000 },
+        },
+        {
+          evidence_id: "EV-000003",
+          kind: "flow",
+          summary: "Late capture burst",
+          packet_refs: [18890],
+          attributes: { protocol: "DNS", src: "10.0.0.5", dst: "203.0.113.53", packets: 40, bytes: 4800, first_seen: endEpoch - 0.5 },
+        },
+      ],
+      findings: [],
+      telemetry: {
+        duration_seconds: 100,
+        start_epoch: startEpoch,
+        end_epoch: endEpoch,
+        total_bytes: 56400,
+        protocol_counts: { "802.11": 15000, TLS: 3000, DNS: 893 },
+        timeline,
+        sample_packets: [
+          { no: 1, time: "14:22:00.100", source: "aa:bb:cc:dd:ee:01", destination: "ff:ff:ff:ff:ff:ff", protocol: "802.11", length: 64, info: "Deauth", evidence_id: "EV-000001" },
+          { no: 5500, time: "14:22:30.000", source: "10.0.0.5", destination: "198.51.100.10", protocol: "TLS", length: 512, info: "Client Hello", evidence_id: null },
+          { no: 14500, time: "14:23:18.000", source: "10.0.0.5", destination: "198.51.100.30", protocol: "TCP", length: 128, info: "ACK", evidence_id: null },
+          { no: 18890, time: "14:23:39.900", source: "10.0.0.5", destination: "203.0.113.53", protocol: "DNS", length: 88, info: "Query", evidence_id: "EV-000003" },
+        ],
+      },
+    },
+    ai: { state: "disabled" },
+    disclaimer: "test",
+  });
+
+  const buckets = buildTimelineBucketDetails(live);
+  assert.equal(buckets.length, 36);
+
+  // Distinct buckets map to distinct real frames (never stuck on frame #1!)
+  assert.equal(buckets[0].targetPacketNo, 1);
+  assert.equal(buckets[0].isApproximateTarget, false);
+
+  // ~30% into 100s => bucket ~10-11 should match frame 5500
+  const bucket30 = buckets[Math.round(0.3 * 35)];
+  assert.equal(bucket30.targetPacketNo, 5500);
+  assert.equal(bucket30.isApproximateTarget, false);
+
+  // ~50% into capture: EV-000002 has packet_refs=[9500] (rendered as firstSeen "#9500") with no direct packet sample -> targets flow directly!
+  const midFlowBucket = buckets[Math.round(((9500 - 1) / (18893 - 1)) * 35)];
+  assert.equal(midFlowBucket.targetKind, "flow");
+  assert.equal(midFlowBucket.targetFlowId, "FLOW-000002");
+  assert.equal(midFlowBucket.targetEvidenceId, "EV-000002");
+  assert.equal(midFlowBucket.isApproximateTarget, false);
+
+  // ~78% into 100s => bucket ~27 should match frame 14500
+  const bucket78 = buckets[Math.round(0.78 * 35)];
+  assert.equal(bucket78.targetPacketNo, 14500);
+  assert.equal(bucket78.isApproximateTarget, false);
+
+  // Final bucket maps to frame 18890
+  assert.equal(buckets[35].targetPacketNo, 18890);
+  assert.equal(buckets[35].isApproximateTarget, false);
+
+  // Intermediate empty bucket near 90% picks closest chronological frame (14500 or 18890), never Row 1!
+  assert.notEqual(buckets[31].targetPacketNo, 1);
+  assert.ok(buckets[31].targetPacketNo === 14500 || buckets[31].targetPacketNo === 18890);
+
+  // Midnight rollover (23:59:50.000 -> 00:00:20.000) maps cleanly across start & end buckets
+  const midStart = Date.UTC(2026, 10, 18, 23, 59, 50) / 1000;
+  const midEnd = midStart + 30;
+  const rollover = adaptBackendReport({
+    analysis_id: "rollover12345678",
+    status: "completed",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "f".repeat(64),
+      coverage: { packets_seen: 100, packets_analyzed: 100, flows_analyzed: 0, truncated: false, warnings: [], stages: [] },
+      evidence: [],
+      findings: [],
+      telemetry: {
+        duration_seconds: 30,
+        start_epoch: midStart,
+        end_epoch: midEnd,
+        total_bytes: 200,
+        protocol_counts: { TCP: 100 },
+        timeline: Array.from({ length: 6 }, (_, i) => ({ index: i, label: "", packets: 10, bytes: 100, anomalies: 0 })),
+        sample_packets: [
+          { no: 1, time: "23:59:50.000", source: "10.0.0.1", destination: "10.0.0.2", protocol: "TCP", length: 60, info: "SYN" },
+          { no: 100, time: "00:00:20.000", source: "10.0.0.1", destination: "10.0.0.2", protocol: "TCP", length: 60, info: "FIN" },
+        ],
+      },
+    },
+    ai: { state: "disabled" },
+    disclaimer: "test",
+  });
+  const rolloverBuckets = buildTimelineBucketDetails(rollover);
+  assert.equal(rolloverBuckets[0].targetPacketNo, 1);
+  assert.equal(rolloverBuckets[5].targetPacketNo, 100);
+});
+
 
 
 

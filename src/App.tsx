@@ -5022,16 +5022,21 @@ function TrafficPage({
   pendingJump?: TrafficJumpRequest | null;
   onConsumePendingJump?: () => void;
 }) {
-  const [selectedPacketNo, setSelectedPacketNo] = useState<number | null>(() => report.packets[0]?.no ?? null);
-  const [selectedFlowId, setSelectedFlowId] = useState<string>(() => report.flows[0]?.id ?? "");
+  const [selectedPacketNo, setSelectedPacketNo] = useState<number | null>(
+    () => pendingJump?.packetNo ?? report.packets[0]?.no ?? null,
+  );
+  const [selectedFlowId, setSelectedFlowId] = useState<string>(
+    () => pendingJump?.flowId ?? report.flows[0]?.id ?? "",
+  );
   const [searchFocused, setSearchFocused] = useState(false);
-  const [activeBucketIndex, setActiveBucketIndex] = useState<number | null>(null);
+  const [activeBucketIndex, setActiveBucketIndex] = useState<number | null>(() => pendingJump?.bucketIndex ?? null);
   const [jumpFlash, setJumpFlash] = useState<{ key: string; nonce: number } | null>(null);
   const [jumpBanner, setJumpBanner] = useState<{ label: string; detail: string } | null>(null);
 
   const packetPanelRef = useRef<HTMLElement | null>(null);
   const inspectorRef = useRef<HTMLElement | null>(null);
   const pinnedTargetRef = useRef<{ packetNo?: number | null; flowId?: string | null } | null>(null);
+  const lastSelectionContextRef = useRef<string>("");
   const jumpTimerRef = useRef<number | null>(null);
   const flashTimerRef = useRef<number | null>(null);
   const cancelScrollRef = useRef<(() => void) | null>(null);
@@ -5050,9 +5055,11 @@ function TrafficPage({
   }, []);
 
   useEffect(() => {
+    const contextKey = `${report.analysisId}::${selectedFinding?.id ?? ""}::${packetSearch}`;
     if (pinnedTargetRef.current) {
       const pinned = pinnedTargetRef.current;
       pinnedTargetRef.current = null;
+      lastSelectionContextRef.current = contextKey;
       if (pinned.packetNo !== undefined && pinned.packetNo !== null) {
         setSelectedPacketNo(pinned.packetNo);
       }
@@ -5061,19 +5068,45 @@ function TrafficPage({
       }
       return;
     }
+    if (pendingJump) {
+      lastSelectionContextRef.current = contextKey;
+      return;
+    }
+    if (lastSelectionContextRef.current === contextKey) {
+      return;
+    }
+    lastSelectionContextRef.current = contextKey;
+
     const query = packetSearch.trim().toLowerCase();
     const pktMatch =
-      report.packets.find((p) => (p.evidence ?? "").toLowerCase() === query) ??
+      (query
+        ? report.packets.find(
+            (p) =>
+              (p.evidence ?? "").toLowerCase() === query ||
+              `${p.no} ${p.source} ${p.destination} ${p.protocol} ${p.info} ${p.evidence ?? ""}`
+                .toLowerCase()
+                .includes(query),
+          )
+        : undefined) ??
       report.packets.find((p) => selectedFinding && p.evidence === selectedFinding.evidence[0]) ??
       report.packets[0];
     setSelectedPacketNo(pktMatch?.no ?? null);
 
     const flowMatch =
-      report.flows.find((f) => f.evidence.toLowerCase() === query || f.id.toLowerCase() === query) ??
+      (query
+        ? report.flows.find(
+            (f) =>
+              f.evidence.toLowerCase() === query ||
+              f.id.toLowerCase() === query ||
+              `${f.id} ${f.source} ${f.destination} ${f.protocol} ${f.evidence} ${f.note}`
+                .toLowerCase()
+                .includes(query),
+          )
+        : undefined) ??
       report.flows.find((f) => selectedFinding && f.evidence === selectedFinding.evidence[0]) ??
       report.flows[0];
     setSelectedFlowId(flowMatch?.id ?? "");
-  }, [report, selectedFinding, packetSearch]);
+  }, [report.analysisId, report.packets, report.flows, selectedFinding, packetSearch, pendingJump]);
 
   const protocolOptions = useMemo(() => {
     const map = new Map<string, string>();
@@ -5204,19 +5237,26 @@ function TrafficPage({
     (bucket: TimelineBucketDetail) => {
       setActiveBucketIndex(bucket.index);
       const nextView: "packets" | "flows" =
-        bucket.targetPacketNo !== null ? "packets" : bucket.targetFlowId ? "flows" : trafficView;
+        bucket.targetKind === "flow"
+          ? "flows"
+          : bucket.targetKind === "packet"
+            ? "packets"
+            : bucket.targetPacketNo !== null
+              ? "packets"
+              : bucket.targetFlowId
+                ? "flows"
+                : trafficView;
 
       const targetVisible =
         nextView === "packets"
           ? bucket.targetPacketNo !== null && visiblePackets.some((p) => p.no === bucket.targetPacketNo)
           : Boolean(bucket.targetFlowId) && visibleFlows.some((f) => f.id === bucket.targetFlowId);
 
-      pinnedTargetRef.current = {
-        packetNo: bucket.targetPacketNo,
-        flowId: bucket.targetFlowId,
-      };
-
       if (!targetVisible && hasActiveFilters) {
+        pinnedTargetRef.current = {
+          packetNo: bucket.targetPacketNo,
+          flowId: bucket.targetFlowId,
+        };
         setPacketSearch("");
         setProtocolFilter("All protocols");
         setSeverityFilter("all");
@@ -5227,17 +5267,19 @@ function TrafficPage({
       if (bucket.targetFlowId) setSelectedFlowId(bucket.targetFlowId);
 
       const targetTag =
-        bucket.targetPacketNo !== null
-          ? `Frame #${bucket.targetPacketNo}`
-          : bucket.targetFlowId ?? "Evidence";
+        nextView === "flows" && bucket.targetFlowId
+          ? bucket.targetFlowId
+          : bucket.targetPacketNo !== null
+            ? `Frame #${bucket.targetPacketNo}`
+            : bucket.targetFlowId ?? "Evidence";
       setJumpBanner({
         label: `${bucket.label} · ${bucket.dominantProtocol}`,
         detail: `${targetTag} · ${bucket.headline}`,
       });
 
       triggerJumpScroll({
-        packetNo: bucket.targetPacketNo,
-        flowId: bucket.targetFlowId,
+        packetNo: nextView === "packets" ? bucket.targetPacketNo : null,
+        flowId: nextView === "flows" ? bucket.targetFlowId : null,
         view: nextView,
         delayMs: 55,
       });
@@ -5277,6 +5319,10 @@ function TrafficPage({
       pendingJump.preferView ??
       (resolvedPacket ? "packets" : resolvedFlow ? "flows" : trafficView);
 
+    if (targetView !== trafficView) {
+      setTrafficView(targetView);
+    }
+
     if (resolvedPacket || resolvedFlow) {
       pinnedTargetRef.current = {
         packetNo: resolvedPacket?.no ?? null,
@@ -5287,11 +5333,14 @@ function TrafficPage({
     }
 
     if (pendingJump.reasonLabel) {
-      const targetTag = resolvedPacket
-        ? `Frame #${resolvedPacket.no} · ${resolvedPacket.source} → ${resolvedPacket.destination}`
-        : resolvedFlow
+      const targetTag =
+        targetView === "flows" && resolvedFlow
           ? `${resolvedFlow.id} · ${resolvedFlow.source} → ${resolvedFlow.destination}`
-          : "เลื่อนไปยังหลักฐานที่ตรงกัน";
+          : resolvedPacket
+            ? `Frame #${resolvedPacket.no} · ${resolvedPacket.source} → ${resolvedPacket.destination}`
+            : resolvedFlow
+              ? `${resolvedFlow.id} · ${resolvedFlow.source} → ${resolvedFlow.destination}`
+              : "เลื่อนไปยังหลักฐานที่ตรงกัน";
       setJumpBanner({
         label: pendingJump.reasonLabel,
         detail: targetTag,
@@ -5299,13 +5348,13 @@ function TrafficPage({
     }
 
     triggerJumpScroll({
-      packetNo: resolvedPacket?.no ?? null,
-      flowId: resolvedFlow?.id ?? null,
+      packetNo: targetView === "packets" ? (resolvedPacket?.no ?? null) : null,
+      flowId: targetView === "flows" ? (resolvedFlow?.id ?? null) : null,
       view: targetView,
       delayMs: 120,
     });
     onConsumePendingJump?.();
-  }, [pendingJump, report.flows, report.packets, trafficView, triggerJumpScroll, onConsumePendingJump]);
+  }, [pendingJump, report.flows, report.packets, setTrafficView, trafficView, triggerJumpScroll, onConsumePendingJump]);
 
   const inspectorHighlighted = Boolean(jumpFlash);
 

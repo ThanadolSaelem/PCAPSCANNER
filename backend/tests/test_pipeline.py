@@ -794,3 +794,47 @@ def test_zeek_environment_bounds_are_validated() -> None:
     assert config.zeek_memory_mb == 192
     with pytest.raises(ValidationError):
         AppSettings(zeek_max_rows=10_001)
+
+
+def test_sample_packets_cover_full_capture_chronologically() -> None:
+    accumulator = pipeline._Accumulator(packet_limit=5_000, flow_limit=500)
+    total_packets = 2_500
+    base_ts = 1_700_000_000.0
+    for i in range(1, total_packets + 1):
+        accumulator.ingest_packet(
+            pipeline._Packet(
+                frame=i,
+                timestamp=base_ts + i * 0.1,
+                frame_len=128,
+                src="192.0.2.10",
+                dst="198.51.100.20",
+                proto=6,
+                tcp_srcport=50000 + (i % 10),
+                tcp_dstport=443,
+                udp_srcport=None,
+                udp_dstport=None,
+                dns_query=None,
+                dns_rcode=None,
+                tls_type=None,
+                tcp_syn=(i == 1),
+                tcp_rst=(i in (2100, 2300, 2450)),
+            )
+        )
+
+    bundle = pipeline._build_bundle(
+        accumulator,
+        capture_sha256=HASH,
+        parser_state="completed",
+        parser_detail="reservoir sampling regression test",
+        zeek_stage=pipeline._stage("zeek", "skipped", "test"),
+    )
+    samples = bundle.telemetry.sample_packets
+    frame_nos = [s.no for s in samples]
+
+    assert len(samples) == pipeline.MAX_SAMPLE_PACKETS
+    assert frame_nos[0] == 1
+    assert frame_nos == sorted(frame_nos), "sample_packets must be sorted chronologically by frame number"
+    assert any(n <= 100 for n in frame_nos), "must include opening frames"
+    assert any(800 <= n <= 1600 for n in frame_nos), "must sample middle of capture"
+    assert any(n >= 2000 for n in frame_nos), "must sample late frames instead of stopping at frame 200"
+
