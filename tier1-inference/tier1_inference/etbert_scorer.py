@@ -359,7 +359,12 @@ class ETBertDatagramScorer:
 
         dtype = resolve_torch_dtype(self.device)
         self._tokenizer = AutoTokenizer.from_pretrained(str(expanded))
-        self._model = AutoModelForSequenceClassification.from_pretrained(str(expanded), torch_dtype=dtype)
+        try:
+            self._model = AutoModelForSequenceClassification.from_pretrained(str(expanded), dtype=dtype)
+        except TypeError as exc:
+            if "dtype" not in str(exc):
+                raise
+            self._model = AutoModelForSequenceClassification.from_pretrained(str(expanded), torch_dtype=dtype)
         self._model.to(self.device)
         self._model.eval()
         cfg_map = getattr(self._model.config, "id2label", None)
@@ -420,6 +425,8 @@ class ETBertDatagramScorer:
             "confidence": conf,
             "entropy": ent,
             "model": f"{self.model_name}({suffix})",
+            "backend": "feature_fallback",
+            "device": self.device,
         }
 
     def score_batch(
@@ -474,6 +481,8 @@ class ETBertDatagramScorer:
                         "confidence": round(min(1.0, max(0.0, conf)), 4),
                         "entropy": round(max(0.0, ent), 4),
                         "model": self.model_name,
+                        "backend": "neural_hf",
+                        "device": self.device,
                     }
                 )
         return results

@@ -314,16 +314,12 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
   }));
 
   if (bundle.triage?.enabled) {
-    const etbertCount = bundle.triage.etbert_scored_count ?? 0;
-    const etbertNote =
-      etbertCount > 0
-        ? ` · ET-BERT ${etbertCount} L7 scored`
-        : " · ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)";
+    const etInfo = describeEtbertExecution(bundle.triage);
     stages.push({
       name: "TIER-1 CLASSIFIER",
       engine: "triage",
       status: "done",
-      detail: `${bundle.triage.model} · ${bundle.triage.benign_filtered} benign filtered (${Math.round(bundle.triage.reduction_ratio * 100)}% reduction) · ppl ${bundle.triage.mean_ppl.toFixed(2)}${etbertNote}`,
+      detail: `${bundle.triage.model} · ${bundle.triage.benign_filtered} benign filtered (${Math.round(bundle.triage.reduction_ratio * 100)}% reduction) · ppl ${bundle.triage.mean_ppl.toFixed(2)}${etInfo.stageNote}`,
     });
   }
 
@@ -387,6 +383,76 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
   };
 }
 
+export interface EtbertExecutionStatus {
+  tone: "neural" | "fallback" | "idle";
+  badge: string;
+  stageNote: string;
+  reportLine: string;
+  topClassText: string;
+}
+
+export function describeEtbertExecution(triage: Tier1Summary): EtbertExecutionStatus {
+  const count = triage.etbert_scored_count ?? 0;
+  const backend = (triage.etbert_backend ?? "").trim().toLowerCase();
+  const device = (triage.etbert_device ?? "").trim();
+  const topClasses = triage.etbert_top_classes ?? [];
+  const topClassText = topClasses
+    .slice(0, 3)
+    .map((c) => `${c.label} (${c.count})`)
+    .join(", ");
+
+  if (count <= 0) {
+    return {
+      tone: "idle",
+      badge: "ET-BERT Standby (0 L7)",
+      stageNote: " · ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)",
+      reportLine: "ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)",
+      topClassText: "",
+    };
+  }
+
+  if (backend === "neural_hf") {
+    const devSuffix = device ? ` (${device})` : "";
+    const topPart = topClassText ? ` · Top: ${topClassText}` : "";
+    return {
+      tone: "neural",
+      badge: `ET-BERT Neural${devSuffix}`,
+      stageNote: ` · ET-BERT Neural${devSuffix}: ${count} L7 scored${topPart}`,
+      reportLine: `ET-BERT Neural${devSuffix}: ${count} L7 scored${topPart}`,
+      topClassText,
+    };
+  }
+
+  if (backend === "local_bin_fallback") {
+    return {
+      tone: "fallback",
+      badge: "Local .bin Heuristic Fallback",
+      stageNote: ` · Local .bin Heuristic Fallback: ${count} L7 scored (ไม่ใช่ Neural Transformer Weights)`,
+      reportLine: `Local .bin Heuristic Fallback: ${count} L7 scored (ไม่ใช่ Neural Transformer Weights)`,
+      topClassText,
+    };
+  }
+
+  if (backend === "feature_fallback") {
+    return {
+      tone: "fallback",
+      badge: "ET-BERT Feature Fallback",
+      stageNote: ` · ET-BERT Feature Fallback: ${count} L7 scored (sidecar ยังไม่ได้โหลด Neural Weights)`,
+      reportLine: `ET-BERT Feature Fallback: ${count} L7 scored (sidecar ยังไม่ได้โหลด Neural Weights)`,
+      topClassText,
+    };
+  }
+
+  const topPart = topClassText ? ` · Top: ${topClassText}` : "";
+  return {
+    tone: "idle",
+    badge: `ET-BERT (${count} L7)`,
+    stageNote: ` · ET-BERT ${count} L7 scored${topPart}`,
+    reportLine: `ET-BERT L7 scored=${count}${topPart}`,
+    topClassText,
+  };
+}
+
 export interface ExportRedactionOptions {
   redact?: boolean;
   redactor?: PrivacyRedactor;
@@ -440,17 +506,13 @@ export function exportReportMarkdown(report: WorkspaceReport, options?: ExportRe
   ];
 
   if (src.triage) {
-    const etbertCount = src.triage.etbert_scored_count ?? 0;
-    const etbertLine =
-      etbertCount > 0
-        ? `- ET-BERT L7 Scored Flows: **${etbertCount}**`
-        : `- ET-BERT L7 Scored Flows: **0** (L2/control/WLAN records evaluated via Layer-1 heuristics)`;
+    const etInfo = describeEtbertExecution(src.triage);
     lines.push(
       `## Tier-1 Calibrated Triage (${src.triage.model})`,
       `- Evaluated: **${src.triage.total_evaluated}** records`,
       `- High-Confidence Benign Filtered: **${src.triage.benign_filtered}** (${(src.triage.reduction_ratio * 100).toFixed(1)}% noise reduction)`,
       `- Escalated / Uncertain: **${src.triage.escalated_count}** (${src.triage.uncertain_count} uncertain, mean PPL=${src.triage.mean_ppl.toFixed(2)})`,
-      etbertLine,
+      `- ${etInfo.reportLine}`,
       ``,
     );
   }

@@ -182,6 +182,9 @@ def create_app(
         return {
             "model": payload.model or etbert_scorer.model_name,
             "count": len(results),
+            "device": resolved_dev,
+            "etbert_loaded": etbert_scorer.loaded_weights,
+            "etbert_mode": "neural_hf" if etbert_scorer.loaded_weights else "feature_fallback",
             "results": results,
         }
 

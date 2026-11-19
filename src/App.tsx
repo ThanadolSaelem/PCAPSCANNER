@@ -20,9 +20,12 @@ import { AnalyticsVisuals } from "./components/AnalyticsVisuals";
 import ArchitectureExplorer from "./components/ArchitectureExplorer";
 import BatchIntakePanel from "./components/BatchIntakePanel";
 import CasesPage from "./components/CasesPage";
+import { InteractiveTimelineChart } from "./components/InteractiveTimelineChart";
 import OSINTPanel from "./components/OSINTPanel";
 import { WorldFlowMap } from "./components/WorldFlowMap";
 import { PrivacyRedactor } from "./utils/privacy";
+import { animateScrollToElement } from "./utils/smoothScroll";
+import type { TimelineBucketDetail } from "./utils/timelineEvents";
 import type {
   PillTone,
   WorkspaceFinding,
@@ -34,6 +37,7 @@ import type {
 } from "./utils/adapters";
 import {
   adaptBackendReport,
+  describeEtbertExecution,
   emptyWorkspaceReport,
   exportReportJson,
   exportReportMarkdown,
@@ -53,6 +57,16 @@ import { resolveBatchLimits } from "./utils/batchLimits";
 
 type Screen = "overview" | "analyze" | "jobs" | "findings" | "traffic" | "cases" | "reports" | "architecture";
 type ToastTone = "success" | "info" | "warn" | "error";
+
+interface TrafficJumpRequest {
+  nonce: number;
+  packetNo?: number | null;
+  flowId?: string | null;
+  evidenceId?: string | null;
+  bucketIndex?: number | null;
+  preferView?: "packets" | "flows";
+  reasonLabel?: string;
+}
 
 interface ToastItem {
   id: number;
@@ -307,6 +321,8 @@ function App() {
   const [protocolFilter, setProtocolFilter] = useState("All protocols");
   const [packetSearch, setPacketSearch] = useState("");
   const [trafficView, setTrafficView] = useState<"packets" | "flows">("packets");
+  const [trafficJump, setTrafficJump] = useState<TrafficJumpRequest | null>(null);
+  const jumpNonceRef = useRef(0);
 
   // Analyze page state
   const [sourceTab, setSourceTab] = useState<SourceTab>("upload");
@@ -427,13 +443,22 @@ function App() {
     };
   }, []);
 
-  const navigate = useCallback((next: Screen) => {
+  const navigate = useCallback((next: Screen, options?: { scrollMode?: "smooth" | "instant" | "none" }) => {
     const nextPath = PATHS[next];
     if (window.location.pathname !== nextPath) window.history.pushState({}, "", nextPath);
     setScreen(next);
     setSidebarOpen(false);
     setCaseDropdownOpen(false);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    const mode = options?.scrollMode ?? "smooth";
+    if (mode === "smooth") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (mode === "instant") {
+      try {
+        window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+      } catch {
+        window.scrollTo(0, 0);
+      }
+    }
   }, []);
 
   const refreshWorkspace = useCallback(
@@ -932,16 +957,50 @@ function App() {
     }
   };
 
+  const jumpToTrafficEvidence = (
+    target: Omit<TrafficJumpRequest, "nonce">,
+    options?: {
+      search?: string;
+      protocol?: string;
+      clearFilters?: boolean;
+    },
+  ) => {
+    if (options?.clearFilters) {
+      setPacketSearch("");
+      setProtocolFilter("All protocols");
+      setSeverityFilter("all");
+    } else {
+      if (options?.search !== undefined) setPacketSearch(options.search);
+      if (options?.protocol !== undefined) setProtocolFilter(options.protocol);
+    }
+    const nextView =
+      target.preferView ??
+      (target.packetNo != null ? "packets" : target.flowId ? "flows" : "packets");
+    setTrafficView(nextView);
+    setTrafficJump({ ...target, nonce: ++jumpNonceRef.current });
+    if (screen !== "traffic") {
+      navigate("traffic", { scrollMode: "instant" });
+    }
+  };
+
   const openEvidence = (finding: WorkspaceFinding | null, evidenceId?: string) => {
+    const resolvedEv = evidenceId ?? finding?.evidence[0] ?? "";
     if (finding) {
       setSelectedFindingId(finding.id);
-      setPacketSearch(evidenceId ?? finding.evidence[0] ?? "");
+      setPacketSearch(resolvedEv);
     } else if (evidenceId) {
       setPacketSearch(evidenceId);
     }
     setProtocolFilter("All protocols");
+    setSeverityFilter("all");
     setTrafficView("packets");
-    navigate("traffic");
+    setTrafficJump({
+      nonce: ++jumpNonceRef.current,
+      evidenceId: resolvedEv || null,
+      preferView: "packets",
+      reasonLabel: finding ? finding.title : resolvedEv ? `Evidence ${resolvedEv}` : "Packet evidence",
+    });
+    navigate("traffic", { scrollMode: "instant" });
   };
 
   const handleExport = async (
@@ -1520,10 +1579,27 @@ function App() {
               privacyRedactor={redactor}
               onNavigate={navigate}
               onSelectFinding={openEvidence}
+              onSelectTimelineBucket={(bucket) => {
+                jumpToTrafficEvidence(
+                  {
+                    packetNo: bucket.targetPacketNo,
+                    flowId: bucket.targetFlowId,
+                    evidenceId: bucket.targetEvidenceId,
+                    bucketIndex: bucket.index,
+                    preferView: bucket.targetKind === "flow" ? "flows" : "packets",
+                    reasonLabel: `${bucket.label} · ${bucket.dominantProtocol}`,
+                  },
+                  { clearFilters: true },
+                );
+              }}
               onFilterByIp={(ip) => {
-                setPacketSearch(ip);
-                setProtocolFilter("All protocols");
-                navigate("traffic");
+                jumpToTrafficEvidence(
+                  {
+                    preferView: "packets",
+                    reasonLabel: `IP ${redactor.redactIp(ip)}`,
+                  },
+                  { search: ip, protocol: "All protocols" },
+                );
               }}
               onFilterByProtocol={(proto) => {
                 const upper = proto.toUpperCase();
@@ -1531,8 +1607,22 @@ function App() {
                   displayReport.packets.find((p) => p.protocol.toUpperCase() === upper)?.protocol ??
                   displayReport.flows.find((f) => f.protocol.toUpperCase() === upper)?.protocol ??
                   proto;
-                setProtocolFilter(matched);
-                navigate("traffic");
+                jumpToTrafficEvidence(
+                  {
+                    preferView: "packets",
+                    reasonLabel: `Protocol ${matched}`,
+                  },
+                  { search: "", protocol: matched },
+                );
+              }}
+              onFilterBySearch={(query, label) => {
+                jumpToTrafficEvidence(
+                  {
+                    preferView: "packets",
+                    reasonLabel: label ?? (query ? `Search ${query}` : "Traffic evidence"),
+                  },
+                  { search: query, protocol: "All protocols" },
+                );
               }}
             />
           )}
@@ -1658,6 +1748,8 @@ function App() {
               setTrafficView={setTrafficView}
               privacyRedactor={redactor}
               onOpenEvidence={openEvidence}
+              pendingJump={trafficJump}
+              onConsumePendingJump={() => setTrafficJump(null)}
             />
           )}
 
@@ -2761,15 +2853,19 @@ function OverviewPage({
   privacyRedactor,
   onNavigate,
   onSelectFinding,
+  onSelectTimelineBucket,
   onFilterByIp,
   onFilterByProtocol,
+  onFilterBySearch,
 }: {
   report: WorkspaceReport;
   privacyRedactor?: PrivacyRedactor;
   onNavigate: (screen: Screen) => void;
   onSelectFinding: (finding: WorkspaceFinding) => void;
+  onSelectTimelineBucket?: (bucket: TimelineBucketDetail) => void;
   onFilterByIp?: (ip: string) => void;
   onFilterByProtocol?: (proto: string) => void;
+  onFilterBySearch?: (query: string, label?: string) => void;
 }) {
   const highCount = report.findings.filter((f) => f.severity === "high" || f.severity === "critical").length;
   const medCount = report.findings.filter((f) => f.severity === "medium").length;
@@ -2880,45 +2976,72 @@ function OverviewPage({
         />
       </section>
 
-      {report.triage && (
-        <section className="panel triage-panel panel-enter">
-          <div className="triage-panel-head">
-            <div>
-              <div className="section-kicker">TIER-1 CLASSIFIER · EVIDENCE BUDGET</div>
-              <h2>
-                {report.triage.model} <span className="mono">({report.triage.mode})</span>
-              </h2>
-            </div>
-            <div className="triage-kpis mono">
-              <span>Evaluated: {formatCompactCount(report.triage.total_evaluated)}</span>
-              <span>Mean Conf: {(report.triage.mean_confidence * 100).toFixed(1)}%</span>
-              <span>Mean PPL: {report.triage.mean_ppl.toFixed(2)}</span>
-              <span className="triage-kpi-accent">
-                Filtered {Math.round(report.triage.reduction_ratio * 100)}% Benign
-              </span>
-            </div>
-          </div>
-          <div className="triage-bars">
-            {report.triage.top_classes.slice(0, 5).map((cls) => {
-              const pct = report.triage!.total_evaluated > 0 ? Math.max(4, Math.round((cls.count / report.triage!.total_evaluated) * 100)) : 0;
-              return (
-                <div className="triage-class-row" key={cls.label}>
-                  <span className="mono">{cls.label}</span>
-                  <div className="triage-bar-track">
-                    <div
-                      className={`triage-bar-fill ${cls.label === "Benign" ? "triage-benign" : "triage-attack"}`}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                  <small className="mono">
-                    {formatCompactCount(cls.count)} ({Math.round(cls.avg_confidence * 100)}%)
-                  </small>
+      {report.triage && (() => {
+        const etStatus = describeEtbertExecution(report.triage);
+        const etClasses = report.triage.etbert_top_classes ?? [];
+        return (
+          <section className="panel triage-panel panel-enter">
+            <div className="triage-panel-head">
+              <div>
+                <div className="section-kicker">TIER-1 CLASSIFIER · EVIDENCE BUDGET</div>
+                <div className="triage-title-row">
+                  <h2>
+                    {report.triage.model} <span className="mono">({report.triage.mode})</span>
+                  </h2>
+                  <span
+                    className={`triage-engine-pill mono tone-${etStatus.tone}`}
+                    title={etStatus.reportLine}
+                  >
+                    <i /> {etStatus.badge}
+                  </span>
                 </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
+              </div>
+              <div className="triage-kpis mono">
+                <span>Evaluated: {formatCompactCount(report.triage.total_evaluated)}</span>
+                <span>Mean Conf: {(report.triage.mean_confidence * 100).toFixed(1)}%</span>
+                <span>Mean PPL: {report.triage.mean_ppl.toFixed(2)}</span>
+                <span className="triage-kpi-accent">
+                  Filtered {Math.round(report.triage.reduction_ratio * 100)}% Benign
+                </span>
+              </div>
+            </div>
+            <div className="triage-bars">
+              {report.triage.top_classes.slice(0, 5).map((cls) => {
+                const pct = report.triage!.total_evaluated > 0 ? Math.max(4, Math.round((cls.count / report.triage!.total_evaluated) * 100)) : 0;
+                return (
+                  <div className="triage-class-row" key={cls.label}>
+                    <span className="mono">{cls.label}</span>
+                    <div className="triage-bar-track">
+                      <div
+                        className={`triage-bar-fill ${cls.label === "Benign" ? "triage-benign" : "triage-attack"}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <small className="mono">
+                      {formatCompactCount(cls.count)} ({Math.round(cls.avg_confidence * 100)}%)
+                    </small>
+                  </div>
+                );
+              })}
+            </div>
+            {etClasses.length > 0 && (
+              <div className="triage-etbert-strip">
+                <span className="triage-etbert-label mono">
+                  ET-BERT L7 PREDICTIONS ({formatCompactCount(report.triage.etbert_scored_count ?? 0)} SCORED)
+                </span>
+                {etClasses.slice(0, 8).map((cls) => (
+                  <span className="triage-etbert-chip mono" key={`et-${cls.label}`}>
+                    <b>{cls.label}</b>
+                    <small>
+                      {formatCompactCount(cls.count)} · {Math.round(cls.avg_confidence * 100)}%
+                    </small>
+                  </span>
+                ))}
+              </div>
+            )}
+          </section>
+        );
+      })()}
 
       <div className="overview-grid">
         <section className="panel stage-panel panel-enter">
@@ -2989,7 +3112,7 @@ function OverviewPage({
         <section className="panel timeline-panel panel-enter">
           <PanelTitle
             title="Packet activity"
-            detail="ปริมาณ packets ตามเวลาใน capture"
+            detail="ชี้เพื่อดูรายละเอียด event · คลิกเพื่อข้ามไปยัง Packet / Flow"
             action={
               <div className="legend">
                 <i />
@@ -2997,21 +3120,13 @@ function OverviewPage({
               </div>
             }
           />
-          <div className="timeline-chart" role="img" aria-label="กราฟปริมาณ packet ตามเวลา">
-            {report.timeline.map((value, index) => (
-              <div className="timeline-bar-wrap" key={index}>
-                <div
-                  className={`timeline-bar ${value >= 75 ? "timeline-bar-highlight" : ""}`}
-                  style={{ height: `${Math.max(5, Math.min(100, value))}%` }}
-                />
-              </div>
-            ))}
-          </div>
-          <div className="timeline-axis">
-            {report.timelineLabels.map((lbl, idx) => (
-              <span key={idx}>{lbl}</span>
-            ))}
-          </div>
+          <InteractiveTimelineChart
+            report={report}
+            variant="overview"
+            onSelectBucket={(bucket) =>
+              onSelectTimelineBucket ? onSelectTimelineBucket(bucket) : onNavigate("traffic")
+            }
+          />
         </section>
 
         <section className="panel capture-panel panel-enter">
@@ -3061,6 +3176,9 @@ function OverviewPage({
             privacyRedactor={privacyRedactor}
             onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
             onSelectProtocolFilter={(proto) => (onFilterByProtocol ? onFilterByProtocol(proto) : onNavigate("traffic"))}
+            onSelectSearchFilter={(query, label) =>
+              onFilterBySearch ? onFilterBySearch(query, label) : onNavigate("traffic")
+            }
           />
         </section>
       )}
@@ -4885,6 +5003,8 @@ function TrafficPage({
   setTrafficView,
   privacyRedactor,
   onOpenEvidence,
+  pendingJump,
+  onConsumePendingJump,
 }: {
   report: WorkspaceReport;
   rawReport: WorkspaceReport;
@@ -4899,10 +5019,22 @@ function TrafficPage({
   setTrafficView: (value: "packets" | "flows") => void;
   privacyRedactor?: PrivacyRedactor;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
+  pendingJump?: TrafficJumpRequest | null;
+  onConsumePendingJump?: () => void;
 }) {
   const [selectedPacketNo, setSelectedPacketNo] = useState<number | null>(() => report.packets[0]?.no ?? null);
   const [selectedFlowId, setSelectedFlowId] = useState<string>(() => report.flows[0]?.id ?? "");
   const [searchFocused, setSearchFocused] = useState(false);
+  const [activeBucketIndex, setActiveBucketIndex] = useState<number | null>(null);
+  const [jumpFlash, setJumpFlash] = useState<{ key: string; nonce: number } | null>(null);
+  const [jumpBanner, setJumpBanner] = useState<{ label: string; detail: string } | null>(null);
+
+  const packetPanelRef = useRef<HTMLElement | null>(null);
+  const inspectorRef = useRef<HTMLElement | null>(null);
+  const pinnedTargetRef = useRef<{ packetNo?: number | null; flowId?: string | null } | null>(null);
+  const jumpTimerRef = useRef<number | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
+  const cancelScrollRef = useRef<(() => void) | null>(null);
 
   const maskedPacketSearch = privacyRedactor ? privacyRedactor.redactFreeText(packetSearch) : packetSearch;
   const rawQuery = packetSearch.trim().toLowerCase();
@@ -4910,6 +5042,25 @@ function TrafficPage({
   const hasActiveFilters = severityFilter !== "all" || protocolFilter !== "All protocols" || Boolean(rawQuery);
 
   useEffect(() => {
+    return () => {
+      if (jumpTimerRef.current !== null) window.clearTimeout(jumpTimerRef.current);
+      if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+      cancelScrollRef.current?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (pinnedTargetRef.current) {
+      const pinned = pinnedTargetRef.current;
+      pinnedTargetRef.current = null;
+      if (pinned.packetNo !== undefined && pinned.packetNo !== null) {
+        setSelectedPacketNo(pinned.packetNo);
+      }
+      if (pinned.flowId) {
+        setSelectedFlowId(pinned.flowId);
+      }
+      return;
+    }
     const query = packetSearch.trim().toLowerCase();
     const pktMatch =
       report.packets.find((p) => (p.evidence ?? "").toLowerCase() === query) ??
@@ -4986,6 +5137,178 @@ function TrafficPage({
   const selectedFlow: WorkspaceFlow | null =
     visibleFlows.find((f) => f.id === selectedFlowId) ?? visibleFlows[0] ?? report.flows[0] ?? null;
 
+  const triggerJumpScroll = useCallback(
+    (opts: { packetNo?: number | null; flowId?: string | null; view: "packets" | "flows"; delayMs?: number }) => {
+      if (jumpTimerRef.current !== null) {
+        window.clearTimeout(jumpTimerRef.current);
+        jumpTimerRef.current = null;
+      }
+      cancelScrollRef.current?.();
+
+      const delayMs = opts.delayMs ?? 45;
+      jumpTimerRef.current = window.setTimeout(() => {
+        jumpTimerRef.current = null;
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            const panel = packetPanelRef.current;
+            let rowEl: HTMLElement | null = null;
+            let flashKey = "panel";
+
+            if (panel) {
+              if (opts.view === "packets" && opts.packetNo != null) {
+                const targetNo = String(opts.packetNo);
+                rowEl =
+                  Array.from(panel.querySelectorAll<HTMLElement>("tr[data-packet-no]")).find(
+                    (el) => el.dataset.packetNo === targetNo,
+                  ) ?? null;
+                flashKey = `packet-${targetNo}`;
+              } else if (opts.view === "flows" && opts.flowId) {
+                rowEl =
+                  Array.from(panel.querySelectorAll<HTMLElement>("tr[data-flow-id]")).find(
+                    (el) => el.dataset.flowId === opts.flowId,
+                  ) ?? null;
+                flashKey = `flow-${opts.flowId}`;
+              }
+              if (!rowEl) {
+                rowEl = panel.querySelector<HTMLElement>("tr.packet-selected") ?? null;
+                if (rowEl?.dataset.packetNo) flashKey = `packet-${rowEl.dataset.packetNo}`;
+                else if (rowEl?.dataset.flowId) flashKey = `flow-${rowEl.dataset.flowId}`;
+              }
+            }
+
+            const scrollTarget = rowEl ?? panel;
+            if (!scrollTarget) return;
+
+            cancelScrollRef.current = animateScrollToElement(scrollTarget, {
+              offset: 92,
+              align: "center",
+              minDuration: 600,
+              maxDuration: 960,
+              onComplete: () => {
+                if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+                setJumpFlash({ key: flashKey, nonce: Date.now() });
+                flashTimerRef.current = window.setTimeout(() => {
+                  setJumpFlash(null);
+                  flashTimerRef.current = null;
+                }, 1850);
+              },
+            });
+          });
+        });
+      }, delayMs);
+    },
+    [],
+  );
+
+  const handleSelectTimelineBucket = useCallback(
+    (bucket: TimelineBucketDetail) => {
+      setActiveBucketIndex(bucket.index);
+      const nextView: "packets" | "flows" =
+        bucket.targetPacketNo !== null ? "packets" : bucket.targetFlowId ? "flows" : trafficView;
+
+      const targetVisible =
+        nextView === "packets"
+          ? bucket.targetPacketNo !== null && visiblePackets.some((p) => p.no === bucket.targetPacketNo)
+          : Boolean(bucket.targetFlowId) && visibleFlows.some((f) => f.id === bucket.targetFlowId);
+
+      pinnedTargetRef.current = {
+        packetNo: bucket.targetPacketNo,
+        flowId: bucket.targetFlowId,
+      };
+
+      if (!targetVisible && hasActiveFilters) {
+        setPacketSearch("");
+        setProtocolFilter("All protocols");
+        setSeverityFilter("all");
+      }
+
+      if (nextView !== trafficView) setTrafficView(nextView);
+      if (bucket.targetPacketNo !== null) setSelectedPacketNo(bucket.targetPacketNo);
+      if (bucket.targetFlowId) setSelectedFlowId(bucket.targetFlowId);
+
+      const targetTag =
+        bucket.targetPacketNo !== null
+          ? `Frame #${bucket.targetPacketNo}`
+          : bucket.targetFlowId ?? "Evidence";
+      setJumpBanner({
+        label: `${bucket.label} · ${bucket.dominantProtocol}`,
+        detail: `${targetTag} · ${bucket.headline}`,
+      });
+
+      triggerJumpScroll({
+        packetNo: bucket.targetPacketNo,
+        flowId: bucket.targetFlowId,
+        view: nextView,
+        delayMs: 55,
+      });
+    },
+    [
+      hasActiveFilters,
+      setPacketSearch,
+      setProtocolFilter,
+      setSeverityFilter,
+      setTrafficView,
+      trafficView,
+      triggerJumpScroll,
+      visibleFlows,
+      visiblePackets,
+    ],
+  );
+
+  useEffect(() => {
+    if (!pendingJump) return;
+    if (pendingJump.bucketIndex !== undefined) {
+      setActiveBucketIndex(pendingJump.bucketIndex ?? null);
+    }
+
+    const evLower = (pendingJump.evidenceId ?? "").toLowerCase();
+    const resolvedPacket =
+      (pendingJump.packetNo != null
+        ? report.packets.find((p) => p.no === pendingJump.packetNo)
+        : undefined) ??
+      (evLower ? report.packets.find((p) => (p.evidence ?? "").toLowerCase() === evLower) : undefined) ??
+      null;
+    const resolvedFlow =
+      (pendingJump.flowId ? report.flows.find((f) => f.id === pendingJump.flowId) : undefined) ??
+      (evLower ? report.flows.find((f) => f.evidence.toLowerCase() === evLower) : undefined) ??
+      null;
+
+    const targetView: "packets" | "flows" =
+      pendingJump.preferView ??
+      (resolvedPacket ? "packets" : resolvedFlow ? "flows" : trafficView);
+
+    if (resolvedPacket || resolvedFlow) {
+      pinnedTargetRef.current = {
+        packetNo: resolvedPacket?.no ?? null,
+        flowId: resolvedFlow?.id ?? null,
+      };
+      if (resolvedPacket) setSelectedPacketNo(resolvedPacket.no);
+      if (resolvedFlow) setSelectedFlowId(resolvedFlow.id);
+    }
+
+    if (pendingJump.reasonLabel) {
+      const targetTag = resolvedPacket
+        ? `Frame #${resolvedPacket.no} · ${resolvedPacket.source} → ${resolvedPacket.destination}`
+        : resolvedFlow
+          ? `${resolvedFlow.id} · ${resolvedFlow.source} → ${resolvedFlow.destination}`
+          : "เลื่อนไปยังหลักฐานที่ตรงกัน";
+      setJumpBanner({
+        label: pendingJump.reasonLabel,
+        detail: targetTag,
+      });
+    }
+
+    triggerJumpScroll({
+      packetNo: resolvedPacket?.no ?? null,
+      flowId: resolvedFlow?.id ?? null,
+      view: targetView,
+      delayMs: 120,
+    });
+    onConsumePendingJump?.();
+  }, [pendingJump, report.flows, report.packets, trafficView, triggerJumpScroll, onConsumePendingJump]);
+
+  const inspectorHighlighted = Boolean(jumpFlash);
+
   return (
     <>
       <PageHeading
@@ -4999,6 +5322,8 @@ function TrafficPage({
               setPacketSearch("");
               setProtocolFilter("All protocols");
               setSeverityFilter("all");
+              setActiveBucketIndex(null);
+              setJumpBanner(null);
             }}
           >
             <Icon name="filter" size={15} /> ล้างตัวกรอง
@@ -5017,43 +5342,18 @@ function TrafficPage({
             {report.durationLabel} · {formatCompactCount(report.packetsAnalyzed)} pkts
           </div>
         </div>
-        <div className="traffic-chart">
-          <div className="chart-y-labels">
-            <span>Peak</span>
-            <span>50%</span>
-            <span>0</span>
-          </div>
-          <div className="traffic-chart-inner">
-            <div className="chart-gridlines">
-              <i />
-              <i />
-              <i />
-            </div>
-            <div className="traffic-chart-bars">
-              {report.timeline.map((value, index) => (
-                <div key={index} className={`chart-column ${value >= 75 ? "chart-column-active" : ""}`}>
-                  <i style={{ height: `${Math.max(5, Math.min(100, value))}%` }} />
-                </div>
-              ))}
-            </div>
-            <div className="chart-x-labels">
-              {report.timelineLabels.map((lbl, idx) => (
-                <span key={idx}>{lbl}</span>
-              ))}
-            </div>
-          </div>
-        </div>
-        <div className="chart-legend">
-          <span>
-            <i className="legend-tcp" /> Packet activity
-          </span>
-          <span>
-            <i className="legend-marker" /> Peak / anomaly bucket
-          </span>
-        </div>
+        <InteractiveTimelineChart
+          report={report}
+          variant="traffic"
+          activeBucketIndex={activeBucketIndex}
+          onSelectBucket={handleSelectTimelineBucket}
+        />
       </section>
 
-      <section className="panel packet-panel">
+      <section
+        ref={packetPanelRef}
+        className={`panel packet-panel ${jumpFlash?.key === "panel" ? "panel-jump-pulse" : ""}`}
+      >
         <div className="packet-toolbar">
           <div>
             <div className="section-kicker">{trafficView === "packets" ? "SAMPLED PACKET LIST" : "NORMALIZED FLOW LIST"}</div>
@@ -5103,6 +5403,24 @@ function TrafficPage({
             </select>
           </div>
         </div>
+        {jumpBanner && (
+          <div className="jump-context-strip" role="status" aria-live="polite">
+            <span className="jump-context-dot" aria-hidden="true" />
+            <span className="jump-context-label mono">{jumpBanner.label}</span>
+            <span className="jump-context-detail">{jumpBanner.detail}</span>
+            <button
+              type="button"
+              className="jump-context-dismiss"
+              aria-label="ซ่อนแถบตำแหน่งกราฟ"
+              onClick={() => {
+                setJumpBanner(null);
+                setActiveBucketIndex(null);
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {hasActiveFilters && (
           <div className="active-filter-chips" role="region" aria-label="ตัวกรองที่ใช้งานอยู่">
             {severityFilter !== "all" && (
@@ -5153,12 +5471,15 @@ function TrafficPage({
                 <tbody>
                   {visiblePackets.map((packet) => {
                     const pClass = `protocol-${packet.protocol.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
+                    const isSelected = selectedPacket?.no === packet.no;
+                    const isFlashing = jumpFlash?.key === `packet-${packet.no}`;
                     return (
                       <tr
                         key={`${packet.no}-${packet.time}`}
+                        data-packet-no={String(packet.no)}
                         tabIndex={0}
                         aria-label={`เลือก frame ${packet.no}`}
-                        aria-selected={selectedPacket?.no === packet.no}
+                        aria-selected={isSelected}
                         onClick={() => setSelectedPacketNo(packet.no)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
@@ -5166,7 +5487,12 @@ function TrafficPage({
                             setSelectedPacketNo(packet.no);
                           }
                         }}
-                        className={selectedPacket?.no === packet.no ? "packet-selected" : ""}
+                        className={[
+                          isSelected ? "packet-selected" : "",
+                          isFlashing ? "evidence-row-jump-flash" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
                       >
                         <td className="mono packet-number">{packet.no}</td>
                         <td className="mono">{packet.time}</td>
@@ -5214,12 +5540,15 @@ function TrafficPage({
                 <tbody>
                   {visibleFlows.map((flow) => {
                     const pClass = `protocol-${flow.protocol.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
+                    const isSelected = selectedFlow?.id === flow.id;
+                    const isFlashing = jumpFlash?.key === `flow-${flow.id}`;
                     return (
                       <tr
                         key={flow.id}
+                        data-flow-id={flow.id}
                         tabIndex={0}
                         aria-label={`เลือก flow ${flow.id}`}
-                        aria-selected={selectedFlow?.id === flow.id}
+                        aria-selected={isSelected}
                         onClick={() => setSelectedFlowId(flow.id)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
@@ -5227,7 +5556,12 @@ function TrafficPage({
                             setSelectedFlowId(flow.id);
                           }
                         }}
-                        className={selectedFlow?.id === flow.id ? "packet-selected" : ""}
+                        className={[
+                          isSelected ? "packet-selected" : "",
+                          isFlashing ? "evidence-row-jump-flash" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
                       >
                         <td className="mono packet-number">{flow.id}</td>
                         <td className="mono">{flow.firstSeen}</td>
@@ -5257,7 +5591,10 @@ function TrafficPage({
       </section>
 
       {trafficView === "packets" && selectedPacket && (
-        <section className="panel packet-inspector">
+        <section
+          ref={inspectorRef}
+          className={`panel packet-inspector ${inspectorHighlighted ? "inspector-jump-pulse" : ""}`}
+        >
           <div className="inspector-header">
             <div>
               <span className="section-kicker">FRAME INSPECTOR</span>
@@ -5299,7 +5636,10 @@ function TrafficPage({
       )}
 
       {trafficView === "flows" && selectedFlow && (
-        <section className="panel flow-inspector">
+        <section
+          ref={inspectorRef}
+          className={`panel flow-inspector ${inspectorHighlighted ? "inspector-jump-pulse" : ""}`}
+        >
           <div className="inspector-header">
             <div>
               <span className="section-kicker">FLOW INSPECTOR</span>
@@ -5719,24 +6059,25 @@ function ReportsPage({
               </span>
             </div>
 
-            {report.triage && (
-              <div className="triage-report-box mono">
-                <span>
-                  Tier-1 Classifier ({report.triage.model}): evaluated {formatCompactCount(report.triage.total_evaluated)} items · filtered{" "}
-                  {formatCompactCount(report.triage.benign_filtered)} Benign ({Math.round(report.triage.reduction_ratio * 100)}% reduction) ·{" "}
-                  escalated {formatCompactCount(report.triage.escalated_count)} · mean PPL={report.triage.mean_ppl.toFixed(2)}
-                  {(report.triage.etbert_scored_count ?? 0) > 0
-                    ? ` · ET-BERT L7 scored=${report.triage.etbert_scored_count}`
-                    : " · ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)"}
-                </span>
-                {report.ai?.context_reduction && (
+            {report.triage && (() => {
+              const etInfo = describeEtbertExecution(report.triage);
+              return (
+                <div className="triage-report-box mono">
                   <span>
-                    Pre-AI evidence budget: selected {report.ai.context_reduction.sent_evidence_count ?? 0} of{" "}
-                    {report.ai.context_reduction.raw_evidence_count ?? 0} structured records; evidence references are retained
+                    Tier-1 Classifier ({report.triage.model}): evaluated {formatCompactCount(report.triage.total_evaluated)} items · filtered{" "}
+                    {formatCompactCount(report.triage.benign_filtered)} Benign ({Math.round(report.triage.reduction_ratio * 100)}% reduction) ·{" "}
+                    escalated {formatCompactCount(report.triage.escalated_count)} · mean PPL={report.triage.mean_ppl.toFixed(2)}
+                    {etInfo.stageNote}
                   </span>
-                )}
-              </div>
-            )}
+                  {report.ai?.context_reduction && (
+                    <span>
+                      Pre-AI evidence budget: selected {report.ai.context_reduction.sent_evidence_count ?? 0} of{" "}
+                      {report.ai.context_reduction.raw_evidence_count ?? 0} structured records; evidence references are retained
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
 
             {aiActive && report.ai?.report ? (
               <div className="ai-narrative">

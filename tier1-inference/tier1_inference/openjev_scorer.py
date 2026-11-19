@@ -240,6 +240,14 @@ class OpenJevTier1Scorer:
         base_name = self.base_model or tier1_meta.get("base_model")
         dtype = resolve_torch_dtype(self.device)
 
+        def _load_causal_lm(pretrained_ref: str) -> Any:
+            try:
+                return AutoModelForCausalLM.from_pretrained(pretrained_ref, dtype=dtype)
+            except TypeError as exc:
+                if "dtype" not in str(exc):
+                    raise
+                return AutoModelForCausalLM.from_pretrained(pretrained_ref, torch_dtype=dtype)
+
         if is_peft:
             try:
                 from peft import PeftConfig, PeftModel
@@ -256,12 +264,12 @@ class OpenJevTier1Scorer:
                     f"PEFT adapter '{adapter_dir}' does not specify base_model_name_or_path; pass --base-model."
                 )
             self._tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir))
-            base = AutoModelForCausalLM.from_pretrained(resolved_base, torch_dtype=dtype)
+            base = _load_causal_lm(resolved_base)
             self._model = PeftModel.from_pretrained(base, str(adapter_dir))
             self.checkpoint_mode = "neural_lora"
         else:
             self._tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir))
-            self._model = AutoModelForCausalLM.from_pretrained(str(adapter_dir), torch_dtype=dtype)
+            self._model = _load_causal_lm(str(adapter_dir))
             self.checkpoint_mode = "neural_hf"
 
         if self._tokenizer.pad_token is None:

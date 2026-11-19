@@ -161,6 +161,10 @@ class TriageReport:
     escalated_evidence_ids: list[str]
     decisions: list[TriageDecision] = field(default_factory=list)
     etbert_scored_count: int = 0
+    etbert_backend: str | None = None
+    etbert_device: str | None = None
+    etbert_model: str | None = None
+    etbert_top_classes: list[ClassStat] = field(default_factory=list)
 
     def to_summary_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +179,10 @@ class TriageReport:
             "mean_confidence": round(self.mean_confidence, 4),
             "mean_ppl": round(self.mean_ppl, 4),
             "etbert_scored_count": self.etbert_scored_count,
+            "etbert_backend": self.etbert_backend,
+            "etbert_device": self.etbert_device,
+            "etbert_model": self.etbert_model,
+            "etbert_top_classes": [asdict(item) for item in self.etbert_top_classes],
             "top_classes": [asdict(item) for item in self.top_classes],
             "escalated_evidence_ids": list(self.escalated_evidence_ids[:200]),
         }
@@ -1003,6 +1011,45 @@ def classify_bundle(
         for label, rows in sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     ]
 
+    etbert_backend: str | None = "none"
+    etbert_device: str | None = None
+    etbert_model_used: str | None = None
+    etbert_top_classes: list[ClassStat] = []
+    if etbert_scores:
+        dec_by_id = {d.evidence_id: d for d in decisions}
+        backends = [str(row.get("backend") or "").strip() for row in etbert_scores.values() if row.get("backend")]
+        if "neural_hf" in backends:
+            etbert_backend = "neural_hf"
+        elif backends:
+            etbert_backend = backends[0]
+        else:
+            etbert_backend = "feature_fallback"
+        devices = [str(row.get("device") or "").strip() for row in etbert_scores.values() if row.get("device")]
+        etbert_device = devices[0] if devices else None
+        models_seen = [str(row.get("model") or "").strip() for row in etbert_scores.values() if row.get("model")]
+        etbert_model_used = models_seen[0] if models_seen else etbert_model
+
+        et_grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for ev_id, row in etbert_scores.items():
+            lbl = str(row.get("label") or "Benign")[:64]
+            et_grouped.setdefault(lbl, []).append((ev_id, row))
+        etbert_top_classes = [
+            ClassStat(
+                label=lbl,
+                count=len(entries),
+                avg_confidence=round(
+                    sum(float(r.get("confidence", 0.0)) for _, r in entries) / len(entries),
+                    4,
+                ),
+                escalated=sum(
+                    1
+                    for eid, _ in entries
+                    if eid in dec_by_id and dec_by_id[eid].decision != "fast_benign"
+                ),
+            )
+            for lbl, entries in sorted(et_grouped.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:12]
+        ]
+
     return TriageReport(
         enabled=enabled,
         model=model_name,
@@ -1018,6 +1065,10 @@ def classify_bundle(
         escalated_evidence_ids=escalated_ids,
         decisions=decisions,
         etbert_scored_count=len(etbert_scores),
+        etbert_backend=etbert_backend,
+        etbert_device=etbert_device,
+        etbert_model=etbert_model_used,
+        etbert_top_classes=etbert_top_classes,
     )
 
 

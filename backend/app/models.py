@@ -80,6 +80,10 @@ class Tier1Summary(Contract):
     mean_confidence: float = Field(ge=0.0, le=1.0)
     mean_ppl: float = Field(ge=0.0)
     etbert_scored_count: int = Field(default=0, ge=0)
+    etbert_backend: str | None = Field(default=None, max_length=64)
+    etbert_device: str | None = Field(default=None, max_length=32)
+    etbert_model: str | None = Field(default=None, max_length=120)
+    etbert_top_classes: list[Tier1ClassStat] = Field(default_factory=list, max_length=20)
     top_classes: list[Tier1ClassStat] = Field(default_factory=list, max_length=30)
     escalated_evidence_ids: list[EvidenceId] = Field(default_factory=list, max_length=500)
 

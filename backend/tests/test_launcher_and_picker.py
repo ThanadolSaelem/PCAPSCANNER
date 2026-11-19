@@ -325,6 +325,65 @@ class LauncherUnitTests(unittest.TestCase):
                 self.assertEqual(loaded.triage.endpoint_url, f"{origin}/v1/systemone")
                 self.assertEqual(loaded.triage.allowed_origins, [origin])
 
+    def test_probe_tier1_health_and_wire_tier1_env_reuses_running_sidecar(self) -> None:
+        class _Tier1Handler(BaseHTTPRequestHandler):
+            payload: dict[str, object] = {
+                "status": "ok",
+                "service": "pcapscanner-tier1-inference",
+                "device": "mps",
+                "openjev_loaded": False,
+                "openjev_mode": "state_fallback",
+                "etbert_loaded": True,
+                "etbert_mode": "neural_hf",
+                "auth_required": False,
+            }
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(self.payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), _Tier1Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            health = launcher.probe_tier1_health(port)
+            self.assertIsNotNone(health)
+            assert health is not None
+            self.assertEqual(health["device"], "mps")
+            self.assertEqual(health["etbert_mode"], "neural_hf")
+
+            # Unrelated HTTP 200 service is ignored
+            _Tier1Handler.payload = {"status": "ok", "api_version": "1"}
+            self.assertIsNone(launcher.probe_tier1_health(port))
+
+            # Wire env for open-loopback sidecar (no token invented)
+            env: dict[str, str] = {}
+            origin = launcher.wire_tier1_env(env, port=port, token=None)
+            self.assertEqual(origin, f"http://127.0.0.1:{port}")
+            self.assertEqual(env["PCAP_TRIAGE_ENDPOINT_URL"], f"{origin}/v1/systemone")
+            self.assertEqual(env["PCAP_TRIAGE_ETBERT_ENDPOINT_URL"], f"{origin}/etbert/score")
+            self.assertEqual(env["PCAP_TRIAGE_ETBERT_ENABLED"], "1")
+            self.assertEqual(env["PCAP_TRIAGE_ALLOWED_ORIGINS"], origin)
+            self.assertNotIn("PCAP_TIER1_API_TOKEN", env)
+
+            # Wire env with explicit bearer token
+            launcher.wire_tier1_env(env, port=port, token="shared-secret-token")
+            self.assertEqual(env["PCAP_TIER1_API_TOKEN"], "shared-secret-token")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Closed port returns None
+        self.assertIsNone(launcher.probe_tier1_health(port))
+
 
 @unittest.skipUnless(HAS_PYDANTIC_V2, "requires pydantic>=2 + fastapi TestClient")
 class WorkspaceApiAndSpaTests(unittest.TestCase):

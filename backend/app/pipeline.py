@@ -2714,6 +2714,18 @@ def _build_bundle(
             mean_confidence=round(triage_report.mean_confidence, 4),
             mean_ppl=round(triage_report.mean_ppl, 4),
             etbert_scored_count=getattr(triage_report, "etbert_scored_count", 0),
+            etbert_backend=getattr(triage_report, "etbert_backend", None),
+            etbert_device=getattr(triage_report, "etbert_device", None),
+            etbert_model=getattr(triage_report, "etbert_model", None),
+            etbert_top_classes=[
+                Tier1ClassStat(
+                    label=item.label,
+                    count=item.count,
+                    avg_confidence=item.avg_confidence,
+                    escalated=item.escalated,
+                )
+                for item in getattr(triage_report, "etbert_top_classes", [])[:20]
+            ],
             top_classes=[
                 Tier1ClassStat(
                     label=item.label,

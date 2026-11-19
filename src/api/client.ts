@@ -355,6 +355,10 @@ export interface Tier1Summary {
   mean_confidence: number;
   mean_ppl: number;
   etbert_scored_count?: number;
+  etbert_backend?: string | null;
+  etbert_device?: string | null;
+  etbert_model?: string | null;
+  etbert_top_classes?: Tier1ClassStat[];
   top_classes: Tier1ClassStat[];
   escalated_evidence_ids: string[];
 }

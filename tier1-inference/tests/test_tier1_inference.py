@@ -334,7 +334,28 @@ class MockedNeuralScorerTests(unittest.TestCase):
                 self.assertTrue(et._model.eval_called)
                 et_res = et.score_batch([{"item_id": "d1", "kind": "dns", "features": {"packets": 4}}])
                 self.assertEqual(et_res[0]["label"], "DNS_Tunnel_DGA")
+                self.assertEqual(et_res[0]["backend"], "neural_hf")
+                self.assertEqual(et_res[0]["device"], "cpu")
                 self.assertGreater(et_res[0]["score"], 0.95)
+
+                # Verify modern dtype= is passed first, with graceful torch_dtype= fallback on older transformers
+                seen_kwargs: list[dict[str, object]] = []
+
+                def _legacy_from_pretrained(*_a, **kw):
+                    seen_kwargs.append(dict(kw))
+                    if "dtype" in kw:
+                        raise TypeError("from_pretrained() got an unexpected keyword argument 'dtype'")
+                    return _FakeSeqClfModel()
+
+                fake_transformers.AutoModelForSequenceClassification = types.SimpleNamespace(
+                    from_pretrained=_legacy_from_pretrained
+                )
+                et_legacy = ETBertDatagramScorer(checkpoint_path=et_dir, device="cpu")
+                self.assertTrue(et_legacy.loaded_weights)
+                self.assertEqual(len(seen_kwargs), 2)
+                self.assertIn("dtype", seen_kwargs[0])
+                self.assertNotIn("torch_dtype", seen_kwargs[0])
+                self.assertIn("torch_dtype", seen_kwargs[1])
 
 
 class FastApiServerAndCliTests(unittest.TestCase):
@@ -382,7 +403,13 @@ class FastApiServerAndCliTests(unittest.TestCase):
             },
         )
         self.assertEqual(et_resp.status_code, 200)
-        self.assertEqual(et_resp.json()["results"][0]["label"], "Web_Injection_Or_Tunnel")
+        et_body = et_resp.json()
+        self.assertEqual(et_body["device"], "cpu")
+        self.assertEqual(et_body["etbert_loaded"], False)
+        self.assertEqual(et_body["etbert_mode"], "feature_fallback")
+        self.assertEqual(et_body["results"][0]["label"], "Web_Injection_Or_Tunnel")
+        self.assertEqual(et_body["results"][0]["backend"], "feature_fallback")
+        self.assertEqual(et_body["results"][0]["device"], "cpu")
 
         # /classify
         cls_resp = client.post(

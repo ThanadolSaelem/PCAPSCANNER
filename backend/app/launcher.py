@@ -18,7 +18,7 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 from urllib.error import URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -96,6 +96,43 @@ def probe_pcapscanner_health(port: int, *, host: str = "127.0.0.1", timeout: flo
             return isinstance(data, dict) and data.get("status") == "ok" and "api_version" in data
     except (OSError, URLError, ValueError):
         return False
+
+
+def probe_tier1_health(port: int, *, host: str = "127.0.0.1", timeout: float = 0.8) -> dict[str, Any] | None:
+    """Detect a healthy running tier1-inference sidecar on `host:port` and return its /health JSON."""
+    url = f"http://{host}:{port}/health"
+    try:
+        with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read(8192).decode("utf-8"))
+            if not isinstance(data, dict) or data.get("status") != "ok":
+                return None
+            if (
+                data.get("service") == "pcapscanner-tier1-inference"
+                or "etbert_loaded" in data
+                or "openjev_loaded" in data
+            ):
+                return data
+            return None
+    except (OSError, URLError, ValueError):
+        return None
+
+
+def wire_tier1_env(child_env: dict[str, str], *, port: int, token: str | None = None) -> str:
+    """Configure PCAP_TRIAGE_* environment variables pointing to `http://127.0.0.1:<port>`."""
+    origin = f"http://127.0.0.1:{port}"
+    child_env["PCAP_TRIAGE_ENABLED"] = "1"
+    child_env["PCAP_TRIAGE_MODE"] = "etbert_openjev"
+    child_env["PCAP_TRIAGE_ALLOWED_ORIGINS"] = _append_allowed_origin(
+        child_env.get("PCAP_TRIAGE_ALLOWED_ORIGINS"), origin
+    )
+    child_env["PCAP_TRIAGE_ENDPOINT_URL"] = f"{origin}/v1/systemone"
+    child_env["PCAP_TRIAGE_ETBERT_ENABLED"] = "1"
+    child_env["PCAP_TRIAGE_ETBERT_ENDPOINT_URL"] = f"{origin}/etbert/score"
+    if token and token.strip():
+        child_env["PCAP_TIER1_API_TOKEN"] = token.strip()
+    return origin
 
 
 def discover_local_ollama_model(
@@ -469,43 +506,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        # 1. Standalone tier1-inference sidecar (or optional Trainer-Pipeline fallback)
+        # 1. Standalone tier1-inference sidecar (reuse running service on tier1_port or auto-spawn)
         if not args.no_tier1 and not child_env.get("PCAP_TRIAGE_ENDPOINT_URL"):
-            tier1_port = find_available_port(args.tier1_port)
-            plan = resolve_tier1_launch_plan(
-                repo_root=REPO_ROOT,
-                home_dir=home_dir,
-                port=tier1_port,
-                no_tier1=args.no_tier1,
-                with_tier1=args.with_tier1,
-            )
-            if plan is not None:
-                tier1_cmd, tier1_cwd = plan
-                tier1_token = (
-                    os.environ.get("TIER1_API_TOKEN")
-                    or os.environ.get("PCAP_TIER1_API_TOKEN")
-                    or secrets.token_urlsafe(24)
-                ).strip()
-                tier1_env = os.environ.copy()
-                tier1_env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-                tier1_env["TIER1_API_TOKEN"] = tier1_token
-                print(f"[PCAPSCANNER] Starting Tier-1 classifier service on http://127.0.0.1:{tier1_port} ...")
-                tier1_proc = subprocess.Popen(tier1_cmd, cwd=str(tier1_cwd), env=tier1_env)
-                children.append(("tier1", tier1_proc))
-                if _wait_for_http_ok(f"http://127.0.0.1:{tier1_port}/health", timeout_seconds=15.0, proc=tier1_proc):
-                    origin = f"http://127.0.0.1:{tier1_port}"
-                    child_env["PCAP_TRIAGE_ENABLED"] = "1"
-                    child_env["PCAP_TRIAGE_MODE"] = "etbert_openjev"
-                    child_env["PCAP_TRIAGE_ALLOWED_ORIGINS"] = _append_allowed_origin(
-                        child_env.get("PCAP_TRIAGE_ALLOWED_ORIGINS"), origin
-                    )
-                    child_env["PCAP_TRIAGE_ENDPOINT_URL"] = f"{origin}/v1/systemone"
-                    child_env["PCAP_TRIAGE_ETBERT_ENABLED"] = "1"
-                    child_env["PCAP_TRIAGE_ETBERT_ENDPOINT_URL"] = f"{origin}/etbert/score"
-                    child_env["PCAP_TIER1_API_TOKEN"] = tier1_token
-                    print("[PCAPSCANNER] Tier-1 ET-BERT + OpenJev service ready.")
-                else:
-                    print("[PCAPSCANNER] Tier-1 service did not become ready in time; using built-in calibrated Tier-1 scorer.")
+            existing_tier1 = probe_tier1_health(args.tier1_port)
+            if existing_tier1 is not None:
+                existing_token = (
+                    os.environ.get("PCAP_TIER1_API_TOKEN") or os.environ.get("TIER1_API_TOKEN") or ""
+                ).strip() or None
+                wire_tier1_env(child_env, port=args.tier1_port, token=existing_token)
+                print(
+                    f"[PCAPSCANNER] Connected to existing Tier-1 service on http://127.0.0.1:{args.tier1_port} "
+                    f"(device={existing_tier1.get('device', 'unknown')}, "
+                    f"etbert={existing_tier1.get('etbert_mode', 'unknown')}, "
+                    f"openjev={existing_tier1.get('openjev_mode', 'unknown')})."
+                )
+            else:
+                tier1_port = find_available_port(args.tier1_port)
+                plan = resolve_tier1_launch_plan(
+                    repo_root=REPO_ROOT,
+                    home_dir=home_dir,
+                    port=tier1_port,
+                    no_tier1=args.no_tier1,
+                    with_tier1=args.with_tier1,
+                )
+                if plan is not None:
+                    tier1_cmd, tier1_cwd = plan
+                    tier1_token = (
+                        os.environ.get("TIER1_API_TOKEN")
+                        or os.environ.get("PCAP_TIER1_API_TOKEN")
+                        or secrets.token_urlsafe(24)
+                    ).strip()
+                    tier1_env = os.environ.copy()
+                    tier1_env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+                    tier1_env["TIER1_API_TOKEN"] = tier1_token
+                    print(f"[PCAPSCANNER] Starting Tier-1 classifier service on http://127.0.0.1:{tier1_port} ...")
+                    tier1_proc = subprocess.Popen(tier1_cmd, cwd=str(tier1_cwd), env=tier1_env)
+                    children.append(("tier1", tier1_proc))
+                    if _wait_for_http_ok(f"http://127.0.0.1:{tier1_port}/health", timeout_seconds=15.0, proc=tier1_proc):
+                        wire_tier1_env(child_env, port=tier1_port, token=tier1_token)
+                        print("[PCAPSCANNER] Tier-1 ET-BERT + OpenJev service ready.")
+                    else:
+                        print("[PCAPSCANNER] Tier-1 service did not become ready in time; using built-in calibrated Tier-1 scorer.")
 
         # 2. Layer-2 Local Ollama auto-detection (opt-out with PCAP_AI_ENABLED=0)
         detected_ollama = maybe_autoconfigure_local_ai(child_env, ws_path)

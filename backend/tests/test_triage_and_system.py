@@ -927,6 +927,95 @@ class BackendPipelineAndChunkedUploadTests(unittest.TestCase):
         self.assertNotIn("aa:bb:cc:11:22:33", all_sent)
         self.assertNotIn("evil.example", all_sent)
 
+    def test_etbert_request_items_include_valid_bigram_tokens_and_preserve_neural_app_classes(self) -> None:
+        ev_tls = _StubEvidence(
+            evidence_id="EV-APP-1",
+            kind="tls",
+            summary="TLS 1.3 flow to 142.250.190.78:443",
+            packet_refs=[1, 2, 3, 4],
+            attributes={
+                "protocol": "TLS",
+                "src": "192.168.1.25",
+                "dst": "142.250.190.78",
+                "src_port": 54321,
+                "dst_port": 443,
+                "packets": 14,
+                "bytes": 18200,
+                "data_len_sum": 16800,
+                "tls_client_hello_count": 1,
+                "tls_handshake_types": "1,2",
+                "server_name": "www.youtube.com",
+            },
+        )
+        items, ev_ids = etbert_bridge.build_etbert_request_items([ev_tls], salt="fixed-test-salt")
+        self.assertEqual(ev_ids, ["EV-APP-1"])
+        self.assertEqual(len(items), 1)
+        bigrams = items[0].get("bigram_tokens")
+        self.assertIsInstance(bigrams, list)
+        self.assertGreaterEqual(len(bigrams), 20)
+        for tok in bigrams:
+            self.assertEqual(len(tok), 4)
+            self.assertTrue(all(ch in "0123456789abcdef" for ch in tok), tok)
+        serialized = json.dumps(items)
+        self.assertNotIn("192.168.1.25", serialized)
+        self.assertNotIn("142.250.190.78", serialized)
+        self.assertNotIn("youtube.com", serialized)
+
+        # Mock a neural_hf ET-BERT sidecar on Apple MPS returning a 120-class app label ("Youtube")
+        def _fake_neural_post(_url: str, payload: dict, **_kwargs):
+            return {
+                "model": "etbert-l7-datagram",
+                "device": "mps",
+                "etbert_loaded": True,
+                "etbert_mode": "neural_hf",
+                "results": [
+                    {
+                        "item_id": item["item_id"],
+                        "label": "Youtube",
+                        "score": 0.08,
+                        "confidence": 0.942,
+                        "entropy": 0.21,
+                        "model": "etbert-l7-datagram",
+                        "backend": "neural_hf",
+                        "device": "mps",
+                    }
+                    for item in payload["items"]
+                ],
+            }
+
+        bundle = _StubBundle(evidence=[ev_tls], findings=[])
+        cfg = SimpleNamespace(
+            enabled=True,
+            mode="heuristic_calibrated",
+            model_name="openjev-cal-tier1",
+            endpoint_url=None,
+            etbert_enabled=True,
+            etbert_endpoint_url="http://127.0.0.1:9000/etbert/score",
+            etbert_model_name="etbert-l7-datagram",
+            etbert_timeout_seconds=5,
+            high_confidence_threshold=0.90,
+            low_confidence_threshold=0.35,
+            timeout_seconds=5,
+        )
+        orig_post = etbert_bridge.post_json_bounded
+        etbert_bridge.post_json_bounded = _fake_neural_post  # type: ignore[assignment]
+        try:
+            report = triage.classify_bundle(bundle, cfg, allow_network=True)
+        finally:
+            etbert_bridge.post_json_bounded = orig_post  # type: ignore[assignment]
+
+        self.assertEqual(report.etbert_scored_count, 1)
+        self.assertEqual(report.etbert_backend, "neural_hf")
+        self.assertEqual(report.etbert_device, "mps")
+        self.assertEqual(report.etbert_model, "etbert-l7-datagram")
+        self.assertEqual(len(report.etbert_top_classes), 1)
+        self.assertEqual(report.etbert_top_classes[0].label, "Youtube")
+        self.assertEqual(report.etbert_top_classes[0].count, 1)
+        self.assertAlmostEqual(report.etbert_top_classes[0].avg_confidence, 0.942, places=3)
+        # 120-class app label does NOT falsely trigger security escalation
+        self.assertEqual(report.decisions[0].predicted_class, "Benign")
+        self.assertEqual(report.decisions[0].etbert_label, "Youtube")
+
 
 if __name__ == "__main__":
     unittest.main()

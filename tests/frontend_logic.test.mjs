@@ -4,6 +4,7 @@ import { PcapApiClient } from "../src/api/client.ts";
 import { resolveBatchLimits } from "../src/utils/batchLimits.ts";
 import {
   adaptBackendReport,
+  describeEtbertExecution,
   exportReportJson,
   exportReportMarkdown,
   exportTriageJsonlFallback,
@@ -21,6 +22,8 @@ import {
   parseCsvRow,
 } from "../src/utils/localAnalyzer.ts";
 import { PrivacyRedactor } from "../src/utils/privacy.ts";
+import { computeScrollDuration, easeInOutQuint } from "../src/utils/smoothScroll.ts";
+import { buildTimelineBucketDetails, parseComparableTime } from "../src/utils/timelineEvents.ts";
 
 test("batch upload uses repeated multipart file parts and stable request headers", async () => {
   const previousFetch = globalThis.fetch;
@@ -894,5 +897,218 @@ test("PcapApiClient sends pagination, delete, prune, and ?redact=true export req
     globalThis.fetch = previousFetch;
   }
 });
+
+test("easeInOutQuint delivers monotonic speed-up and slow-down scroll physics", () => {
+  assert.equal(easeInOutQuint(-0.5), 0);
+  assert.equal(easeInOutQuint(0), 0);
+  assert.equal(easeInOutQuint(0.5), 0.5);
+  assert.equal(easeInOutQuint(1), 1);
+  assert.equal(easeInOutQuint(1.5), 1);
+
+  let prev = -1;
+  for (let i = 0; i <= 100; i += 1) {
+    const val = easeInOutQuint(i / 100);
+    assert.ok(val >= prev, `expected monotonic progress at i=${i}`);
+    prev = val;
+  }
+
+  // Instantaneous velocity near midpoint should be much faster than launch & braking phases
+  const dt = 0.01;
+  const vStart = (easeInOutQuint(0.1 + dt) - easeInOutQuint(0.1)) / dt;
+  const vMid = (easeInOutQuint(0.5 + dt) - easeInOutQuint(0.5)) / dt;
+  const vEnd = (easeInOutQuint(0.9 + dt) - easeInOutQuint(0.9)) / dt;
+  assert.ok(vMid > vStart * 10, `expected strong acceleration at midpoint (vMid=${vMid}, vStart=${vStart})`);
+  assert.ok(vMid > vEnd * 10, `expected smooth deceleration at landing (vMid=${vMid}, vEnd=${vEnd})`);
+
+  // Duration scaling stays bounded and skips tiny hops
+  assert.equal(computeScrollDuration(3), 0);
+  assert.ok(computeScrollDuration(150) >= 540);
+  assert.ok(computeScrollDuration(2500) <= 960);
+  assert.ok(computeScrollDuration(1200) > computeScrollDuration(120));
+});
+
+test("buildTimelineBucketDetails maps packets, flows, and findings per bucket while honoring Privacy Mode", () => {
+  assert.deepEqual(parseComparableTime("12.5s"), { kind: "seconds", value: 12.5 });
+  assert.deepEqual(parseComparableTime("250ms"), { kind: "seconds", value: 0.25 });
+  assert.deepEqual(parseComparableTime("frame #42"), { kind: "frame", value: 42 });
+
+  const live = adaptBackendReport({
+    analysis_id: "tl-test-0001",
+    status: "completed",
+    capture_filename: "sample.pcap",
+    capture_size_bytes: 2048,
+    capture_format: "pcap",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "b".repeat(64),
+      created_at: "2026-11-16T00:00:00Z",
+      coverage: {
+        packets_seen: 120,
+        packets_analyzed: 120,
+        truncated: false,
+        parser: "tshark",
+        warnings: [],
+        stages: [{ name: "tshark", state: "completed", detail: "ok" }],
+      },
+      evidence: [
+        {
+          evidence_id: "ev-1",
+          kind: "dns",
+          summary: "DNS burst to 203.0.113.55",
+          packet_refs: [10],
+          attributes: { protocol: "DNS", src: "192.168.1.10", dst: "203.0.113.55", packets: 12, bytes: 960 },
+        },
+        {
+          evidence_id: "ev-2",
+          kind: "flow",
+          summary: "TLS flow to 198.51.100.77",
+          packet_refs: [90],
+          attributes: { protocol: "TLS", src: "192.168.1.10", dst: "198.51.100.77", packets: 45, bytes: 18400 },
+        },
+      ],
+      findings: [
+        {
+          finding_id: "F-1",
+          detector: "dns_entropy",
+          title: "Suspicious DNS query burst to 203.0.113.55",
+          severity: "high",
+          confidence: "high",
+          evidence_ids: ["ev-1"],
+          limitations: [],
+          summary: "High-entropy queries observed",
+        },
+      ],
+      telemetry: {
+        duration_seconds: 10,
+        start_epoch: null,
+        end_epoch: null,
+        total_bytes: 19360,
+        protocol_counts: { TLS: 80, DNS: 40 },
+        timeline: [
+          { index: 0, label: "0.0s", packets: 20, bytes: 1200, anomalies: 1 },
+          { index: 1, label: "3.3s", packets: 10, bytes: 800, anomalies: 0 },
+          { index: 2, label: "6.6s", packets: 5, bytes: 400, anomalies: 0 },
+          { index: 3, label: "10.0s", packets: 85, bytes: 16960, anomalies: 0 },
+        ],
+        sample_packets: [
+          {
+            no: 10,
+            time: "0.50",
+            source: "192.168.1.10",
+            destination: "203.0.113.55",
+            protocol: "DNS",
+            length: 92,
+            info: "Standard query A suspicious.example.com",
+            evidence_id: "ev-1",
+          },
+          {
+            no: 90,
+            time: "9.40",
+            source: "192.168.1.10",
+            destination: "198.51.100.77",
+            protocol: "TLS",
+            length: 1420,
+            info: "Application Data",
+            evidence_id: "ev-2",
+          },
+        ],
+      },
+    },
+    ai: { state: "disabled" },
+    disclaimer: "test",
+  });
+
+  const buckets = buildTimelineBucketDetails(live);
+  assert.equal(buckets.length, 4);
+
+  // Bucket 0 matched DNS packet + high finding
+  assert.equal(buckets[0].label, "0.0s");
+  assert.equal(buckets[0].packetCount, 20);
+  assert.equal(buckets[0].dominantProtocol, "DNS");
+  assert.equal(buckets[0].targetKind, "packet");
+  assert.equal(buckets[0].targetPacketNo, 10);
+  assert.equal(buckets[0].matchingFinding?.id, "F-1");
+  assert.equal(buckets[0].isPeak, true);
+
+  // Middle bucket without direct sample still falls back to nearest sampled frame so click always jumps
+  assert.equal(buckets[1].isApproximateTarget, true);
+  assert.equal(buckets[1].targetKind, "packet");
+  assert.ok(buckets[1].targetPacketNo === 10 || buckets[1].targetPacketNo === 90);
+
+  // Last bucket matched TLS peak packet
+  assert.equal(buckets[3].dominantProtocol, "TLS");
+  assert.equal(buckets[3].targetPacketNo, 90);
+  assert.equal(buckets[3].isPeak, true);
+
+  // Privacy Mode: redacted report must never leak raw IPs or domains into tooltip headlines/sublines
+  const redactor = new PrivacyRedactor(true);
+  const redacted = redactor.redactReport(live);
+  const redactedBuckets = buildTimelineBucketDetails(redacted);
+  const combinedText = redactedBuckets.map((b) => `${b.headline} ${b.subline}`).join(" ");
+  assert.equal(combinedText.includes("203.0.113.55"), false);
+  assert.equal(combinedText.includes("198.51.100.77"), false);
+  assert.equal(combinedText.includes("suspicious.example.com"), false);
+});
+
+test("describeEtbertExecution truthfully distinguishes neural weights from fallbacks and shows top L7 classes", () => {
+  const baseTriage = {
+    enabled: true,
+    model: "openjev-cal-tier1",
+    mode: "etbert_openjev",
+    total_evaluated: 50,
+    benign_filtered: 48,
+    escalated_count: 2,
+    uncertain_count: 0,
+    reduction_ratio: 0.96,
+    mean_confidence: 0.95,
+    mean_ppl: 1.12,
+    top_classes: [{ label: "Benign", count: 48, avg_confidence: 0.96, escalated: 0 }],
+    escalated_evidence_ids: [],
+  };
+
+  const neural = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 14,
+    etbert_backend: "neural_hf",
+    etbert_device: "mps",
+    etbert_top_classes: [
+      { label: "Youtube", count: 9, avg_confidence: 0.94, escalated: 0 },
+      { label: "Google", count: 5, avg_confidence: 0.91, escalated: 0 },
+    ],
+  });
+  assert.equal(neural.tone, "neural");
+  assert.equal(neural.badge, "ET-BERT Neural (mps)");
+  assert.match(neural.stageNote, /ET-BERT Neural \(mps\): 14 L7 scored/);
+  assert.match(neural.stageNote, /Youtube \(9\)/);
+
+  const localBin = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 12,
+    etbert_backend: "local_bin_fallback",
+    etbert_device: "cpu",
+  });
+  assert.equal(localBin.tone, "fallback");
+  assert.equal(localBin.badge, "Local .bin Heuristic Fallback");
+  assert.match(localBin.stageNote, /ไม่ใช่ Neural Transformer Weights/);
+
+  const featureFb = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 8,
+    etbert_backend: "feature_fallback",
+    etbert_device: "cpu",
+  });
+  assert.equal(featureFb.tone, "fallback");
+  assert.equal(featureFb.badge, "ET-BERT Feature Fallback");
+  assert.match(featureFb.stageNote, /ยังไม่ได้โหลด Neural Weights/);
+
+  const standby = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 0,
+    etbert_backend: "none",
+  });
+  assert.equal(standby.tone, "idle");
+  assert.match(standby.badge, /Standby/);
+});
+
 
 

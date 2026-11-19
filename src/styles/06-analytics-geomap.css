@@ -365,6 +365,114 @@
   transition: transform .15s, filter .15s;
 }
 .av-heatmap-cell:hover { transform: scaleY(1.18); filter: brightness(1.25); }
+.av-heatmap-btn {
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+}
+.av-heatmap-btn:focus-visible { outline: 1px solid var(--cyan-2); outline-offset: 1px; }
+
+.av-card-interactive { position: relative; }
+.av-hover-popover {
+  --tip-tx: 0%;
+  position: absolute;
+  z-index: 35;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  width: max-content;
+  min-width: 215px;
+  max-width: min(295px, calc(100vw - 48px));
+  padding: 9px 11px 8px;
+  border: 1px solid rgba(74, 128, 152, .62);
+  border-radius: 8px;
+  background: linear-gradient(155deg, rgba(16, 26, 36, .97), rgba(11, 18, 26, .97));
+  backdrop-filter: blur(12px);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, .54), 0 0 0 1px rgba(50, 189, 209, .14);
+  pointer-events: none;
+  animation: chart-tip-in .18s var(--spring) both;
+}
+.av-hover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.av-hover-head strong {
+  color: #e4f0f5;
+  font-size: 9.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.av-hover-badge {
+  flex: none;
+  padding: 1px 5px;
+  border: 1px solid rgba(50, 189, 209, .34);
+  border-radius: 4px;
+  color: var(--cyan-2);
+  background: rgba(50, 189, 209, .12);
+  font-size: 8px;
+  font-weight: 600;
+}
+.av-hover-metrics {
+  margin-top: 4px;
+  color: #9dd4df;
+  font-size: 8.5px;
+}
+.av-hover-detail {
+  margin-top: 3px;
+  color: #92a7b6;
+  font-size: 8.5px;
+  line-height: 1.4;
+}
+.av-hover-cta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px solid rgba(48, 67, 82, .62);
+  color: var(--cyan-2);
+  font-size: 8px;
+  font-weight: 600;
+}
+
+.av-port-btn {
+  cursor: pointer;
+  transition: border-color .16s, background .16s, transform .18s var(--ease);
+}
+.av-port-btn:hover {
+  border-color: rgba(50, 189, 209, .55);
+  background: rgba(50, 189, 209, .14);
+  transform: translateY(-1px);
+}
+
+.av-hist-btn {
+  padding: 2px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  transition: border-color .16s, background .16s, transform .18s var(--ease);
+}
+.av-hist-btn:hover {
+  border-color: rgba(50, 189, 209, .28);
+  background: rgba(50, 189, 209, .05);
+  transform: translateY(-1px);
+}
+
+.av-sankey-track-btn {
+  display: block;
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+}
+.av-sankey-track-btn:hover .av-sankey-fill { filter: brightness(1.18); }
+
+.av-click-pulse {
+  animation: av-click-pop .44s var(--spring);
+}
 
 /* WorldFlowMap GeoIP widget */
 .wm-card { padding: 16px 17px; }

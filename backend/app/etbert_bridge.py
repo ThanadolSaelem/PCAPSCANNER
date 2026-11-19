@@ -163,6 +163,16 @@ def is_data_bearing_evidence(evidence: Any) -> bool:
     return False
 
 
+def hex_to_etbert_bigram_tokens(hex_stream: str, *, max_len: int = 256) -> list[str]:
+    """Convert a hex byte string into ET-BERT 4-hex-char sliding bigram tokens (2-byte window, 1-byte stride)."""
+    clean = "".join(ch for ch in str(hex_stream or "").lower() if ch in "0123456789abcdef")
+    if len(clean) % 2 == 1:
+        clean = clean[:-1]
+    if len(clean) < 4:
+        return []
+    return [clean[i : i + 4] for i in range(0, len(clean) - 3, 2)][: max(1, int(max_len))]
+
+
 def build_etbert_request_items(
     evidence_list: Sequence[Any],
     *,
@@ -215,6 +225,9 @@ def build_etbert_request_items(
         if attrs.get("intervals"):
             features["intervals"] = str(attrs["intervals"])[:64]
 
+        # Deterministic anonymized L7 hex-bigram tokens for ET-BERT bigram vocabulary (0000..ffff)
+        bigram_tokens = hex_to_etbert_bigram_tokens(extract_l7_datagram_hex(evidence, max_bytes=128), max_len=128)
+
         item_id = anonymize_identifier(ev_id or str(len(items)), ephemeral_salt, "ev")
         items.append(
             {
@@ -230,6 +243,7 @@ def build_etbert_request_items(
                     ephemeral_salt,
                 ),
                 "features": features,
+                "bigram_tokens": bigram_tokens,
             }
         )
         evidence_ids.append(ev_id)
@@ -257,7 +271,7 @@ def score_with_etbert_http(
 ) -> dict[str, dict[str, Any]]:
     """Query user-hosted ET-BERT HTTP endpoint for data-bearing L7 flows.
 
-    Returns `{evidence_id: {"label": str, "score": float, "confidence": float, "entropy": float, "model": str}}`
+    Returns `{evidence_id: {"label": str, "score": float, "confidence": float, "entropy": float, "model": str, "backend": str, "device": str | None}}`
     or `{}` cleanly on network/timeout/malformed-response failures.
     """
     if not allow_network or not endpoint_url or not evidence_list:
@@ -286,6 +300,8 @@ def score_with_etbert_http(
         rows = parsed.get("results") if isinstance(parsed, dict) else parsed
         if not isinstance(rows, list):
             return {}
+        resp_mode = str(parsed.get("etbert_mode") or "").strip() if isinstance(parsed, dict) else ""
+        resp_device = str(parsed.get("device") or "").strip() if isinstance(parsed, dict) else ""
 
         id_map = {item["item_id"]: ev_id for item, ev_id in zip(items, ev_ids)}
         out: dict[str, dict[str, Any]] = {}
@@ -324,12 +340,19 @@ def score_with_etbert_http(
                 ent = round(max(0.0, ent), 4)
             except (TypeError, ValueError):
                 ent = 0.0
+            row_model = str(row.get("model") or model_name)[:80]
+            raw_backend = str(row.get("backend") or resp_mode or "").strip()
+            if not raw_backend:
+                raw_backend = "feature_fallback" if "fallback" in row_model.lower() else "neural_hf"
+            raw_device = str(row.get("device") or resp_device or "").strip() or None
             out[ev_id] = {
                 "label": label,
                 "score": score,
                 "confidence": conf,
                 "entropy": ent,
-                "model": str(row.get("model") or model_name)[:80],
+                "model": row_model,
+                "backend": raw_backend[:64],
+                "device": raw_device[:32] if raw_device else None,
             }
         return out
     except (ValueError, TypeError, KeyError):
@@ -751,6 +774,8 @@ def score_with_etbert_local_bin(
             "confidence": conf,
             "entropy": ent,
             "model": f"{model_name}({info.get('checkpoint_type', 'bin')})",
+            "backend": "local_bin_fallback",
+            "device": "cpu",
             "checkpoint_fingerprint": info.get("header_fingerprint"),
         }
     return out
@@ -842,6 +867,7 @@ __all__ = [
     "anonymize_identifier",
     "build_etbert_request_items",
     "extract_l7_datagram_hex",
+    "hex_to_etbert_bigram_tokens",
     "inspect_etbert_checkpoint",
     "is_data_bearing_evidence",
     "is_etbert_effectively_enabled",
