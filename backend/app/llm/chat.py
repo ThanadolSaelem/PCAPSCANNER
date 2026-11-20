@@ -70,12 +70,12 @@ class ChatLimits:
     """Hard per-turn budgets; no sampling or evidence truncation is performed."""
 
     max_question_bytes: int = 2_000
-    max_context_bytes: int = 24_000
-    max_prompt_bytes: int = 32_000
+    max_context_bytes: int = 200_000
+    max_prompt_bytes: int = 250_000
     max_output_bytes: int = 8_000
-    context_window_tokens: int = 8_192
+    context_window_tokens: int = 16_384
     max_output_tokens: int = 1_200
-    timeout_seconds: float = 20.0
+    timeout_seconds: float = 30.0
     max_claims: int = 20
 
     def __post_init__(self) -> None:

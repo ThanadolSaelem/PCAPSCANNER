@@ -148,6 +148,8 @@ export interface ModelSettingsDraft {
   responseMode: ModelResponseMode;
   tokenParameter: ModelTokenParameter;
   timeoutSeconds: number;
+  contextWindowTokens: number;
+  inputMaxBytes: number;
 }
 
 export const PRESET_CATEGORY_LABELS: Record<AIProviderPreset["category"], string> = {
@@ -228,6 +230,8 @@ export function draftFromPreset(preset: AIProviderPreset, previous?: ModelSettin
     responseMode: preset.response_mode,
     tokenParameter: preset.token_parameter,
     timeoutSeconds: preset.timeout_seconds,
+    contextWindowTokens: 65536,
+    inputMaxBytes: 150000,
   };
 }
 
@@ -248,6 +252,8 @@ export function draftFromConfig(
     responseMode: cfg.response_mode ?? preset.response_mode,
     tokenParameter: cfg.token_parameter ?? preset.token_parameter,
     timeoutSeconds: cfg.timeout_seconds ?? preset.timeout_seconds,
+    contextWindowTokens: cfg.context_window_tokens ?? 65536,
+    inputMaxBytes: cfg.input_max_bytes ?? 150000,
   };
 }
 
@@ -319,6 +325,8 @@ export function buildSavePayload(
     response_mode: draft.responseMode,
     token_parameter: draft.tokenParameter,
     timeout_seconds: Math.min(120, Math.max(1, Math.round(draft.timeoutSeconds) || preset.timeout_seconds)),
+    context_window_tokens: Math.max(1024, Math.min(2_000_000, Math.round(draft.contextWindowTokens) || 65536)),
+    input_max_bytes: Math.max(1024, Math.min(2_000_000, Math.round(draft.inputMaxBytes) || 150000)),
   };
 }
 

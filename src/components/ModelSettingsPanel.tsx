@@ -524,6 +524,30 @@ export default function ModelSettingsPanel({
               onChange={(e) => patch({ timeoutSeconds: Number(e.target.value) || preset.timeout_seconds })}
             />
           </label>
+          <label className="modal-field">
+            <span>Context window (Tokens)</span>
+            <input
+              type="number"
+              min={1024}
+              max={2000000}
+              step={1024}
+              value={draft.contextWindowTokens}
+              onChange={(e) => patch({ contextWindowTokens: Number(e.target.value) || 65536 })}
+              placeholder="เช่น 16384, 65536, 128000"
+            />
+          </label>
+          <label className="modal-field">
+            <span>Input budget (Bytes)</span>
+            <input
+              type="number"
+              min={1024}
+              max={2000000}
+              step={10000}
+              value={draft.inputMaxBytes}
+              onChange={(e) => patch({ inputMaxBytes: Number(e.target.value) || 150000 })}
+              placeholder="เช่น 150000, 300000"
+            />
+          </label>
         </div>
       </details>
 

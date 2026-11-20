@@ -1495,24 +1495,59 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 return await generate_chat_completion(prompt, cfg_now)
 
             max_output_tokens = min(1_200, cfg_now.ai.max_output_tokens, cfg_now.ai.context_window_tokens - 513)
+            token_input_space = max(512, cfg_now.ai.context_window_tokens - max_output_tokens - 512)
+            token_bytes_budget = token_input_space * 3
+            effective_context_bytes = min(cfg_now.ai.input_max_bytes, token_bytes_budget)
+            effective_prompt_bytes = min(cfg_now.ai.input_max_bytes, effective_context_bytes + 8_000)
+
+            target_bundle = bundle
+            if len(bundle.evidence) > 25 or len(bundle.findings) > 25:
+                try:
+                    from .triage import pack_evidence_for_ai
+                    target_bundle, _ = pack_evidence_for_ai(
+                        bundle,
+                        max_bytes=effective_context_bytes,
+                        triage_cfg=cfg_now.triage,
+                    )
+                except Exception:
+                    target_bundle = bundle
+
             limits = ChatLimits(
                 max_question_bytes=min(2_000, cfg_now.ai.input_max_bytes),
-                max_context_bytes=min(24_000, cfg_now.ai.input_max_bytes),
-                max_prompt_bytes=min(32_000, cfg_now.ai.input_max_bytes),
+                max_context_bytes=effective_context_bytes,
+                max_prompt_bytes=effective_prompt_bytes,
                 max_output_bytes=min(8_000, max_output_tokens * 4),
                 context_window_tokens=cfg_now.ai.context_window_tokens,
                 max_output_tokens=max_output_tokens,
-                timeout_seconds=min(20.0, cfg_now.ai.timeout_seconds),
+                timeout_seconds=min(60.0, cfg_now.ai.timeout_seconds),
                 max_claims=20,
             )
             async with app.state.chat_semaphore:
                 result = await answer_question(
-                    bundle,
+                    target_bundle,
                     body.question,
                     consent=True,
                     provider=provider_call,
                     limits=limits,
                 )
+                if result.state == "budget_exceeded" and (len(bundle.evidence) > 1 or len(bundle.findings) > 1):
+                    try:
+                        from .triage import pack_evidence_for_ai
+                        tighter_budget = max(3_000, int(effective_context_bytes * 0.6))
+                        tighter_bundle, _ = pack_evidence_for_ai(
+                            bundle,
+                            max_bytes=tighter_budget,
+                            triage_cfg=cfg_now.triage,
+                        )
+                        result = await answer_question(
+                            tighter_bundle,
+                            body.question,
+                            consent=True,
+                            provider=provider_call,
+                            limits=limits,
+                        )
+                    except Exception:
+                        pass
         return {
             "state": result.state,
             "claims": [claim.model_dump(mode="json") for claim in result.claims],

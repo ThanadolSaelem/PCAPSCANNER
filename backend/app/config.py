@@ -156,7 +156,7 @@ class AIConfig(BaseModel):
     data_boundary: DataBoundary = "remote"
     timeout_seconds: int = Field(default=30, ge=1, le=120)
     retries: int = Field(default=0, ge=0, le=2)
-    input_max_bytes: int = Field(default=100_000, ge=1, le=100_000)
+    input_max_bytes: int = Field(default=150_000, ge=1, le=2_000_000)
     max_output_tokens: int = Field(default=2048, ge=1, le=8192)
     context_window_tokens: int = Field(default=16_384, ge=1, le=2_000_000)
     token_parameter: TokenParameter = "max_tokens"
