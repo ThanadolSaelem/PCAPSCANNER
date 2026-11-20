@@ -1682,7 +1682,6 @@ function App() {
 
           {screen === "analyze" && (
             <AnalyzePage
-              apiClient={api}
               connectionStatus={connectionStatus}
               connectionError={connectionError}
               capabilities={capabilities}
@@ -1824,9 +1823,6 @@ function App() {
                   return Promise.reject(new Error("live_backend_required"));
                 }
                 return api.askGroundedQuestion(activeReport.analysisId, question, consent, options);
-              }}
-              onRefreshReport={async () => {
-                await loadBackendReport(activeReport.analysisId);
               }}
               onNavigate={navigate}
               onOpenEvidence={openEvidence}
@@ -5441,7 +5437,6 @@ function TrafficPage({
 
 function ReportsPage({
   report,
-  apiClient,
   connected,
   aiConfig,
   aiModels,
@@ -5458,7 +5453,6 @@ function ReportsPage({
   onOpenConnectionModal,
 }: {
   report: WorkspaceReport;
-  apiClient: PcapApiClient;
   connected: boolean;
   aiConfig: AIConfigResponse | null;
   aiModels: AIModelsResponse | null;
@@ -5475,13 +5469,11 @@ function ReportsPage({
     consent: boolean,
     options?: { timeout_seconds?: number; max_output_tokens?: number },
   ) => Promise<GroundedChatResponse>;
-  onRefreshReport?: () => Promise<void>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
   onOpenConnectionModal: (tab?: SettingsTab) => void;
 }) {
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  const aiActive = report.ai?.state === "completed" && Boolean(report.ai.report);
   const aiBackendEnabled = Boolean(aiConfig?.configuration.enabled);
   const aiBackendModel = aiConfig?.configuration.model ?? null;
   const aiBackendReady = Boolean(aiBackendEnabled && aiBackendModel);
@@ -5495,8 +5487,6 @@ function ReportsPage({
   const [chatTurns, setChatTurns] = useState<{ question: string; claims: GroundedChatResponse["claims"] }[]>([]);
   const [quickModelInput, setQuickModelInput] = useState("");
   const [quickAiBusy, setQuickAiBusy] = useState(false);
-  const [generatingSummary, setGeneratingSummary] = useState(false);
-  const [summaryError, setSummaryError] = useState<string | null>(null);
   const [promptTimeoutSec, setPromptTimeoutSec] = useState<number>(() =>
     Math.min(600, Math.max(5, aiConfig?.configuration.timeout_seconds ?? 120)),
   );
@@ -5544,27 +5534,6 @@ function ReportsPage({
     timeout_seconds: Math.min(600, Math.max(5, Math.round(promptTimeoutSec) || 120)),
     max_output_tokens: Math.min(16384, Math.max(256, Math.round(promptMaxTokens) || 4096)),
   });
-
-  const handleGenerateSummary = async () => {
-    if (generatingSummary || !connected || !aiBackendReady) return;
-    setGeneratingSummary(true);
-    setSummaryError(null);
-    try {
-      const res = await apiClient.generateAnalysisSummary(report.analysisId, normalizedPromptOptions());
-      if (onRefreshReport) {
-        await onRefreshReport();
-      }
-      const state = typeof res.state === "string" ? res.state : "completed";
-      if (state !== "completed") {
-        const code = typeof res.error_code === "string" ? res.error_code : state;
-        setSummaryError(describeAiError(code));
-      }
-    } catch (err) {
-      setSummaryError(safeFormatError(err));
-    } finally {
-      setGeneratingSummary(false);
-    }
-  };
 
   useEffect(() => {
     if (!exportMenuOpen) return;
@@ -5683,7 +5652,7 @@ function ReportsPage({
       <PageHeading
         eyebrow="HANDOFF / REPORTS"
         title="Analysis report"
-        detail="แยกผล detector ที่อิง packet evidence, การคัดกรอง Tier-1 และคำอธิบาย AI อย่างชัดเจน"
+        detail="แยกผล detector ที่อิง packet evidence, การคัดกรอง Tier-1 และ grounded chat อย่างชัดเจน"
         actions={
           <div className="heading-actions" style={{ flexWrap: "wrap" }}>
             <button
@@ -5882,148 +5851,200 @@ function ReportsPage({
             </div>
           )}
 
-          <div className="report-section ai-report-section" id="report-ai">
-            <div className="ai-report-title">
+          <div className="report-section triage-report-section" id="report-ai">
+            <div className="triage-report-title">
               <div>
-                <span className="section-kicker">03 / TIER-1 TRIAGE &amp; AI NARRATIVE</span>
-                <h3>Analyst narrative &amp; context reduction</h3>
+                <span className="section-kicker">03 / TIER-1 TRIAGE GRAPH REPORT</span>
+                <h3>Classifier reduction &amp; escalation profile</h3>
               </div>
-              {aiActive && (
-                <span className="ai-mode-tag ai-mode-on">
-                  <Icon name="spark" size={13} />
-                  AI: {report.ai?.model ?? "COMPLETED"}
-                </span>
-              )}
+              {report.triage && (() => {
+                const etInfo = describeEtbertExecution(report.triage);
+                return (
+                  <div className="triage-model-info">
+                    <span className="triage-model-tag">
+                      <Icon name="filter" size={13} />
+                      {redactor.redactFreeText(\`Tier-1 · \${report.triage.model}\`)}
+                    </span>
+                    <span className={\`triage-model-tag triage-model-\${etInfo.tone}\`}>
+                      {redactor.redactFreeText(etInfo.badge)}
+                    </span>
+                  </div>
+                );
+              })()}
             </div>
 
-            {report.triage && (() => {
-              const etInfo = describeEtbertExecution(report.triage);
+            {report.triage ? (() => {
+              const triage = report.triage;
+              const tier1Classes = triage.top_classes.slice(0, 6);
+              const etbertClasses = (triage.etbert_top_classes ?? []).slice(0, 6);
+              const maxTier1Count = Math.max(1, ...tier1Classes.map((item) => item.count));
+              const maxEtbertCount = Math.max(1, ...etbertClasses.map((item) => item.count));
+              const escalatedEvidence = triage.escalated_evidence_ids;
+              const display = (value: string | number) => redactor.redactFreeText(String(value));
+              const formatCount = (value: number) => display(formatCompactCount(value));
+              const classEvidenceId = (label: string, index: number) => {
+                const normalized = label.trim().toLowerCase();
+                const findingEvidence = report.findings.find((finding) => finding.triageClass?.trim().toLowerCase() === normalized)?.evidence[0];
+                return findingEvidence ?? escalatedEvidence[index % Math.max(1, escalatedEvidence.length)];
+              };
+              const funnelEscalatedWidth = triage.total_evaluated > 0
+                ? Math.max(16, Math.round((triage.escalated_count / triage.total_evaluated) * 100))
+                : 16;
+              const stats = [
+                { label: "TOTAL EVALUATED", value: formatCount(triage.total_evaluated), tone: "neutral" },
+                { label: "BENIGN FILTERED", value: formatCount(triage.benign_filtered), tone: "benign" },
+                { label: "ESCALATED", value: formatCount(triage.escalated_count), tone: "escalated" },
+                { label: "UNCERTAIN", value: formatCount(triage.uncertain_count), tone: "uncertain" },
+                { label: "REDUCTION", value: display(\`\${Math.round(triage.reduction_ratio * 100)}%\`), tone: "reduction" },
+                { label: "MEAN CONFIDENCE", value: display(\`\${Math.round(triage.mean_confidence * 100)}%\`), tone: "confidence" },
+                { label: "MEAN PPL", value: display(triage.mean_ppl.toFixed(2)), tone: "ppl" },
+              ];
+
               return (
-                <div className="triage-report-box mono">
-                  <span>
-                    Tier-1 Classifier ({report.triage.model}): evaluated {formatCompactCount(report.triage.total_evaluated)} items · filtered{" "}
-                    {formatCompactCount(report.triage.benign_filtered)} Benign ({Math.round(report.triage.reduction_ratio * 100)}% reduction) ·{" "}
-                    escalated {formatCompactCount(report.triage.escalated_count)} · mean PPL={report.triage.mean_ppl.toFixed(2)}
-                    {etInfo.stageNote}
-                  </span>
-                  {report.ai?.context_reduction && (
-                    <span>
-                      Pre-AI evidence budget: selected {report.ai.context_reduction.sent_evidence_count ?? 0} of{" "}
-                      {report.ai.context_reduction.raw_evidence_count ?? 0} structured records; evidence references are retained
-                    </span>
-                  )}
+                <div className="triage-graph-report">
+                  <div className="triage-stat-grid">
+                    {stats.map((stat) => (
+                      <article className={\`triage-stat-tile triage-stat-\${stat.tone}\`} key={stat.label}>
+                        <span>{stat.label}</span>
+                        <strong className="mono">{stat.value}</strong>
+                      </article>
+                    ))}
+                  </div>
+
+                  <div className="triage-funnel-card">
+                    <div className="triage-card-head">
+                      <span>TRIAGE FUNNEL</span>
+                      <small className="mono">{display(\`\${Math.round(triage.reduction_ratio * 100)}% benign reduction\`)}</small>
+                    </div>
+                    <div className="triage-funnel" aria-label="Tier-1 triage funnel from evaluated records to escalated records">
+                      <div className="triage-funnel-stage triage-funnel-evaluated">
+                        <span>Evaluated</span>
+                        <strong className="mono">{formatCount(triage.total_evaluated)}</strong>
+                      </div>
+                      <div className="triage-funnel-stage triage-funnel-filtered">
+                        <span>Benign filtered</span>
+                        <strong className="mono">{formatCount(triage.benign_filtered)}</strong>
+                      </div>
+                      <div className="triage-funnel-stage triage-funnel-escalated" style={{ width: \`\${funnelEscalatedWidth}%\` }}>
+                        <span>Escalated</span>
+                        <strong className="mono">{formatCount(triage.escalated_count)}</strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="triage-class-grid">
+                    <section className="triage-class-card" aria-labelledby="tier1-class-chart">
+                      <div className="triage-card-head">
+                        <span id="tier1-class-chart">TOP TIER-1 CLASSES</span>
+                        <small>Click an escalated class to inspect evidence</small>
+                      </div>
+                      {tier1Classes.length === 0 ? (
+                        <p className="triage-chart-empty">No Tier-1 class distribution was returned for this run.</p>
+                      ) : (
+                        <div className="triage-class-bars">
+                          {tier1Classes.map((item, index) => {
+                            const evidenceId = classEvidenceId(item.label, index);
+                            const isEscalated = item.escalated > 0;
+                            const width = Math.max(5, Math.round((item.count / maxTier1Count) * 100));
+                            return (
+                              <button
+                                key={\`tier1-\${item.label}\`}
+                                type="button"
+                                className={\`triage-class-bar \${isEscalated ? "is-escalated" : ""}\`}
+                                disabled={!evidenceId}
+                                onClick={() => evidenceId && onOpenEvidence(null, evidenceId)}
+                                title={evidenceId ? "Open linked evidence" : "No linked evidence reference"}
+                              >
+                                <span className="triage-class-label">{display(item.label)}</span>
+                                <span className="triage-class-metrics mono">
+                                  {formatCount(item.count)} · {display(\`\${Math.round(item.avg_confidence * 100)}%\`)}
+                                  {isEscalated && <b>{display(\`\${item.escalated} escalated\`)}</b>}
+                                </span>
+                                <span className="triage-class-track" aria-hidden="true">
+                                  <span className="triage-class-fill" style={{ width: \`\${width}%\` }} />
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+
+                    <section className="triage-class-card" aria-labelledby="etbert-class-chart">
+                      <div className="triage-card-head">
+                        <span id="etbert-class-chart">TOP ET-BERT CLASSES</span>
+                        <small>{display(\`\${triage.etbert_scored_count ?? 0} L7 items scored\`)}</small>
+                      </div>
+                      {etbertClasses.length === 0 ? (
+                        <p className="triage-chart-empty">No ET-BERT class distribution was recorded for this run.</p>
+                      ) : (
+                        <div className="triage-class-bars">
+                          {etbertClasses.map((item, index) => {
+                            const evidenceId = classEvidenceId(item.label, index);
+                            const isEscalated = item.escalated > 0;
+                            const width = Math.max(5, Math.round((item.count / maxEtbertCount) * 100));
+                            return (
+                              <button
+                                key={\`etbert-\${item.label}\`}
+                                type="button"
+                                className={\`triage-class-bar triage-etbert-bar \${isEscalated ? "is-escalated" : ""}\`}
+                                disabled={!evidenceId}
+                                onClick={() => evidenceId && onOpenEvidence(null, evidenceId)}
+                                title={evidenceId ? "Open linked evidence" : "No linked evidence reference"}
+                              >
+                                <span className="triage-class-label">{display(item.label)}</span>
+                                <span className="triage-class-metrics mono">
+                                  {formatCount(item.count)} · {display(\`\${Math.round(item.avg_confidence * 100)}%\`)}
+                                  {isEscalated && <b>{display(\`\${item.escalated} escalated\`)}</b>}
+                                </span>
+                                <span className="triage-class-track" aria-hidden="true">
+                                  <span className="triage-class-fill" style={{ width: \`\${width}%\` }} />
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  </div>
+
+                  <div className="triage-evidence-strip">
+                    <div>
+                      <span className="triage-evidence-label">ESCALATED EVIDENCE</span>
+                      <small>References remain available for direct review</small>
+                    </div>
+                    <div className="triage-evidence-chips">
+                      {escalatedEvidence.length > 0 ? (
+                        escalatedEvidence.slice(0, 12).map((evidenceId) => (
+                          <button key={evidenceId} type="button" className="triage-evidence-chip mono" onClick={() => onOpenEvidence(null, evidenceId)}>
+                            {evidenceId}
+                          </button>
+                        ))
+                      ) : (
+                        <span className="triage-no-evidence">No escalated evidence references were emitted.</span>
+                      )}
+                    </div>
+                  </div>
                 </div>
               );
-            })()}
-
-            {aiActive && report.ai?.report ? (
-              <div className="ai-narrative">
-                <ul className="ai-summary-list">
-                  {report.ai.report.summary.map((claim, idx) => (
-                    <li key={idx}>
-                      {redactor.redactFreeText(claim.claim)}{" "}
-                      {claim.evidence_ids.map((eid) => (
-                        <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
-                      ))}
-                    </li>
-                  ))}
-                </ul>
-                {report.ai.report.assessments.length > 0 && (
-                  <ul className="ai-assessment-list">
-                    {report.ai.report.assessments.map((a) => (
-                      <li key={a.finding_id}>
-                        <b>[{a.finding_id}]</b> ({a.confidence}) {redactor.redactFreeText(a.interpretation)}{" "}
-                        {a.evidence_ids.map((eid) => (
-                          <button key={eid} onClick={() => onOpenEvidence(null, eid)}>
-                            [{eid}]
-                          </button>
-                        ))}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {report.ai.report.limitations.length > 0 && (
-                  <ul className="ai-limitation-list">
-                    {report.ai.report.limitations.map((claim, idx) => (
-                      <li key={idx}>
-                        Limitation: {redactor.redactFreeText(claim.claim)}{" "}
-                        {claim.evidence_ids.map((eid) => (
-                          <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
-                        ))}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {report.ai.report.recommended_actions.length > 0 && (
-                  <ul className="ai-action-list">
-                    {report.ai.report.recommended_actions.map((act, idx) => (
-                      <li key={idx}>
-                        Action: {redactor.redactFreeText(act.action)}{" "}
-                        {act.evidence_ids.map((eid) => (
-                          <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
-                        ))}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <small>
-                  Provider: {report.ai.provider} · Model: {report.ai.model} · Prompt hash: {report.ai.prompt_sha256?.slice(0, 12) ?? "unavailable"}
-                </small>
-              </div>
-            ) : (
-              <div className="ai-disabled">
-                <Icon name="shield" size={17} />
-                <span>
-                  {connected && aiBackendReady
-                    ? `พร้อมสร้าง AI Narrative สำหรับรายงานนี้ (${aiConfig?.configuration.provider}: ${aiBackendModel})`
-                    : "ยังไม่ได้เปิดใช้งาน Layer-2 AI — ตรวจสอบผลจาก deterministic findings และ Tier-1 triage ได้ตามปกติ"}
-                </span>
-                <div className="ai-disabled-actions">
-                  {connected && aiBackendReady && report.origin === "live" && (
-                    <>
-                      <label className="prompt-tuning-field" title="เวลารอ AI สูงสุด (วินาที) สำหรับการสร้างสรุปครั้งนี้">
-                        <span>Timeout (s)</span>
-                        <input
-                          type="number"
-                          min={5}
-                          max={600}
-                          step={15}
-                          value={promptTimeoutSec}
-                          disabled={generatingSummary}
-                          onChange={(e) => setPromptTimeoutSec(Number(e.target.value) || 120)}
-                          aria-label="Summary timeout seconds"
-                        />
-                      </label>
-                      <button
-                        type="button"
-                        className="primary-button tiny-btn"
-                        disabled={generatingSummary}
-                        onClick={() => void handleGenerateSummary()}
-                      >
-                        <Icon name="spark" size={13} />{" "}
-                        {generatingSummary ? "กำลังสร้าง AI Summary…" : "สร้าง AI Summary ให้รายงานนี้"}
-                      </button>
-                    </>
-                  )}
-                  <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
-                    <Icon name="spark" size={13} /> ตั้งค่า AI &amp; Models
-                  </button>
-                  <button type="button" className="text-button" onClick={() => onNavigate("analyze")}>
-                    ไปหน้าวิเคราะห์ <Icon name="arrow" size={14} />
-                  </button>
-                </div>
-                {summaryError && (
-                  <p role="alert" className="grounded-chat-error" style={{ marginTop: "8px" }}>
-                    {summaryError}
-                  </p>
-                )}
+            })() : (
+              <div className="triage-empty-state">
+                <Icon name="filter" size={17} />
+                <span>Tier-1 triage was not enabled or did not return a summary for this report.</span>
               </div>
             )}
           </div>
 
           <div className="report-section grounded-chat-section" id="report-chat">
-            <span className="section-kicker">04 / GROUNDED CONTEXTUAL CHAT</span>
-            <h3>ถาม AI จาก evidence ของ analysis นี้</h3>
+            <div className="grounded-chat-header">
+              <div>
+                <span className="section-kicker">04 / GROUNDED CONTEXTUAL CHAT</span>
+                <h3>ถาม AI จาก evidence ของ analysis นี้</h3>
+              </div>
+              <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
+                <Icon name="spark" size={13} /> ตั้งค่า AI &amp; Models
+              </button>
+            </div>
             {report.origin !== "live" ? (
               <p className="muted">Contextual chat ใช้ได้กับ analysis ที่ประมวลผลโดย backend เท่านั้น</p>
             ) : (
@@ -6228,7 +6249,7 @@ function ReportsPage({
                 <Icon name="arrow" size={14} />
               </button>
               <button onClick={() => jumpTo("report-ai")}>
-                <span>03</span>Tier-1 &amp; AI narrative
+                <span>03</span>Tier-1 triage graph
                 <Icon name="arrow" size={14} />
               </button>
               <button onClick={() => jumpTo("report-chat")}>
