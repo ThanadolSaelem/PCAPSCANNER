@@ -5832,10 +5832,12 @@ function ReportsPage({
                 <span className="section-kicker">03 / TIER-1 TRIAGE &amp; AI NARRATIVE</span>
                 <h3>Analyst narrative &amp; context reduction</h3>
               </div>
-              <span className={`ai-mode-tag ${aiActive ? "ai-mode-on" : ""}`}>
-                <Icon name="spark" size={13} />
-                {aiActive ? `AI: ${report.ai?.model ?? "ENABLED"}` : `AI: ${(report.ai?.state ?? "disabled").toUpperCase()}`}
-              </span>
+              {aiActive && (
+                <span className="ai-mode-tag ai-mode-on">
+                  <Icon name="spark" size={13} />
+                  AI: {report.ai?.model ?? "COMPLETED"}
+                </span>
+              )}
             </div>
 
             {report.triage && (() => {
@@ -5916,15 +5918,9 @@ function ReportsPage({
               <div className="ai-disabled">
                 <Icon name="shield" size={17} />
                 <span>
-                  {report.ai?.error_code
-                    ? `Layer-2 AI narrative ถูกข้ามด้วย fallback (${report.ai.error_code}) — deterministic findings และ Layer-1 Tier-1 triage ยังอยู่ครบ`
-                    : connected && aiConfig && !aiBackendEnabled
-                      ? "Layer-2 AI ถูกปิดอยู่ (ai.enabled = false) — deterministic findings และ export ใช้งานได้ตามปกติ"
-                      : connected && aiBackendEnabled && !aiBackendModel
-                        ? `Layer-2 AI เปิดใช้งานแล้ว (${aiConfig?.configuration.provider}) — เลือกโมเดลใน Grounded Chat ด้านล่างหรือ Settings`
-                        : connected && aiBackendReady
-                          ? `รอบนี้ไม่ได้เปิด AI narrative ตอนส่งงาน (${aiConfig?.configuration.provider}: ${aiBackendModel} พร้อมใช้งาน) — ถาม AI จาก evidence ด้านล่างได้ทันที`
-                          : "Layer-2 AI narrative ยังไม่ถูกสร้างในรอบนี้ — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
+                  {connected && aiBackendReady
+                    ? `พร้อมสร้าง AI Narrative สำหรับรายงานนี้ (${aiConfig?.configuration.provider}: ${aiBackendModel})`
+                    : "ยังไม่ได้เปิดใช้งาน Layer-2 AI — ตรวจสอบผลจาก deterministic findings และ Tier-1 triage ได้ตามปกติ"}
                 </span>
                 <div className="ai-disabled-actions">
                   {connected && aiBackendReady && report.origin === "live" && (
