@@ -708,7 +708,9 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 11px;
+  box-sizing: border-box;
+  /* Keep labels and counts clear of the funnel's angled clip edges. */
+  padding: 0 max(24px, 8%);
   clip-path: polygon(7% 0, 93% 0, 100% 100%, 0 100%);
   color: #b8cbd4;
   background: linear-gradient(90deg, rgba(50, 189, 209, .3), rgba(50, 189, 209, .08));
