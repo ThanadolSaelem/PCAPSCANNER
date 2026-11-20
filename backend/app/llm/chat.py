@@ -139,13 +139,77 @@ def _async_provider(provider: Any) -> bool:
     return inspect.iscoroutinefunction(provider) or inspect.iscoroutinefunction(getattr(provider, "__call__", None))
 
 
-def _claims_from_output(raw: str, evidence_ids: set[str], limits: ChatLimits) -> tuple[GroundedClaim, ...]:
-    if len(raw.encode("utf-8")) > limits.max_output_bytes:
-        raise ValueError("output_budget_exceeded")
-    if math.ceil(len(raw.encode("utf-8")) / _TOKEN_BYTES) > limits.max_output_tokens:
-        raise ValueError("output_token_budget_exceeded")
+def _normalize_evidence_id(raw_id: str, known_ids: set[str]) -> str:
+    if raw_id in known_ids:
+        return raw_id
+    upper = raw_id.upper()
+    if upper in known_ids:
+        return upper
+    m = re.match(r"^EV[_-]?(\d+)$", raw_id, re.I)
+    if m:
+        formatted = f"EV-{int(m.group(1)):06d}"
+        if formatted in known_ids:
+            return formatted
+    return raw_id
+
+
+def _extract_chat_json(raw: str) -> Any:
+    # 1. Strip reasoning / think tags (<think>...</think> or unclosed <think>...)
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.I | re.S).strip()
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.I | re.S).strip()
+    if not cleaned:
+        cleaned = raw.strip()
+
+    # 2. Try fenced code block
+    fenced_match = re.search(r"```(?:json)?\s*([\[\{].*?[\]\}])\s*```", cleaned, flags=re.I | re.S)
+    if fenced_match:
+        try:
+            return json.loads(fenced_match.group(1).strip())
+        except Exception:
+            pass
+
+    # 3. Direct candidate after stripping simple ``` fences
+    candidate = cleaned.strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I | re.S).strip()
     try:
-        parsed = json.loads(raw)
+        return json.loads(candidate)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+
+    # 4. Outermost [ ... ] or { ... }
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    first_bracket = cleaned.find("[")
+    last_bracket = cleaned.rfind("]")
+
+    candidates: list[str] = []
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(cleaned[first_brace : last_brace + 1].strip())
+    if first_bracket != -1 and last_bracket > first_bracket:
+        candidates.append(cleaned[first_bracket : last_bracket + 1].strip())
+
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except Exception:
+            pass
+
+    # Fall back to json.loads on raw so proper JSONDecodeError is raised if invalid
+    return json.loads(raw)
+
+
+def _claims_from_output(raw: str, evidence_ids: set[str], limits: ChatLimits) -> tuple[GroundedClaim, ...]:
+    # Measure output budget against the effective claim content (excluding <think> tags)
+    stripped = re.sub(r"<think>.*?</think>", "", raw, flags=re.I | re.S).strip()
+    stripped = re.sub(r"<think>.*$", "", stripped, flags=re.I | re.S).strip() or raw
+    if len(stripped.encode("utf-8")) > limits.max_output_bytes:
+        raise ValueError("output_budget_exceeded")
+    if math.ceil(len(stripped.encode("utf-8")) / _TOKEN_BYTES) > limits.max_output_tokens:
+        raise ValueError("output_token_budget_exceeded")
+
+    try:
+        parsed = _extract_chat_json(raw)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("invalid_json") from exc
     if isinstance(parsed, dict) and (
@@ -153,14 +217,33 @@ def _claims_from_output(raw: str, evidence_ids: set[str], limits: ChatLimits) ->
         or parsed.get("state") == "refused"
     ):
         raise ValueError("provider_refused")
-    if not isinstance(parsed, dict) or set(parsed) != {"claims"}:
+
+    if isinstance(parsed, list):
+        rows = parsed
+    elif isinstance(parsed, dict):
+        if "claims" in parsed:
+            rows = parsed.get("claims")
+        elif "answer" in parsed and isinstance(parsed["answer"], str) and parsed["answer"].strip():
+            eids = parsed.get("evidence_ids", [])
+            rows = [{"claim": parsed["answer"].strip(), "evidence_ids": eids if isinstance(eids, list) else []}]
+        elif "response" in parsed and isinstance(parsed["response"], str) and parsed["response"].strip():
+            eids = parsed.get("evidence_ids", [])
+            rows = [{"claim": parsed["response"].strip(), "evidence_ids": eids if isinstance(eids, list) else []}]
+        else:
+            raise ValueError("invalid_shape")
+    else:
         raise ValueError("invalid_shape")
-    rows = parsed.get("claims")
+
     if not isinstance(rows, list) or not rows or len(rows) > limits.max_claims:
         raise ValueError("empty_or_excessive_claims")
     claims: list[GroundedClaim] = []
     try:
         for row in rows:
+            if isinstance(row, dict) and "evidence_ids" in row and isinstance(row["evidence_ids"], list):
+                row = dict(row)
+                row["evidence_ids"] = [
+                    _normalize_evidence_id(str(eid), evidence_ids) for eid in row["evidence_ids"]
+                ]
             claim = GroundedClaim.model_validate(row)
             if not set(claim.evidence_ids).issubset(evidence_ids):
                 raise ValueError("unknown_citation")
@@ -168,6 +251,7 @@ def _claims_from_output(raw: str, evidence_ids: set[str], limits: ChatLimits) ->
     except ValidationError as exc:
         raise ValueError("invalid_claim") from exc
     return tuple(claims)
+
 
 
 async def answer_question(

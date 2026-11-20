@@ -634,3 +634,78 @@ async def test_manus_v2_probe_summary_and_chat_lifecycle(monkeypatch: pytest.Mon
     finally:
         clear_runtime_api_key("manus")
 
+
+@pytest.mark.asyncio
+async def test_reasoning_tags_and_fenced_json_in_summary():
+    payload = summary_payload()
+    raw_content = (
+        "<think>\n"
+        "Let's review the evidence and findings.\n"
+        "All references are grounded.\n"
+        "</think>\n"
+        "```json\n"
+        f"{json.dumps(payload)}\n"
+        "```\n"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": raw_content}}]})
+
+    result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    assert result.report is not None
+    assert len(result.report.summary) == 1
+    assert result.report.summary[0].evidence_ids == ["EV-000001"]
+
+
+@pytest.mark.asyncio
+async def test_schema_400_retries_without_response_format():
+    calls: list[httpx.Request] = []
+    payload = summary_payload()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        body = json.loads(request.read())
+        # Simulate llama.cpp rejecting response_format with 400 Bad Request
+        if "response_format" in body:
+            return httpx.Response(400, json={"error": {"message": "failed to parse schema into grammar"}})
+        # On retry without response_format, return successful JSON
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    assert len(calls) == 2
+    assert "response_format" in json.loads(calls[0].read())
+    assert "response_format" not in json.loads(calls[1].read())
+
+
+@pytest.mark.asyncio
+async def test_unassessed_findings_retained_in_summary():
+    # Bundle with 2 findings
+    b = bundle()
+    finding_2 = Finding(
+        finding_id="F-0002",
+        detector="fixture2",
+        title="Second finding",
+        severity="medium",
+        confidence="medium",
+        evidence_ids=["EV-000001"],
+    )
+    b.findings.append(finding_2)
+
+    # LLM summary payload only assesses F-0001
+    payload = summary_payload()
+    assert len(payload["assessments"]) == 1
+    assert payload["assessments"][0]["finding_id"] == "F-0001"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    result = await generate_summary(b, settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    assert result.report is not None
+    # Verify F-0002 was auto-retained deterministically rather than failing with missing_finding
+    assessed_ids = {a.finding_id for a in result.report.assessments}
+    assert assessed_ids == {"F-0001", "F-0002"}
+
+

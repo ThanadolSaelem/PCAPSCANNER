@@ -5590,7 +5590,19 @@ function ReportsPage({
       const result = await onChat(chatQuestion, true);
       if (chatTargetId.current !== targetAnalysisId) return;
       if (result.state !== "completed" || result.claims.length === 0) {
-        setChatError(result.error_code ?? `chat_${result.state}`);
+        const errCode = result.error_code ?? `chat_${result.state}`;
+        const humanDesc: Record<string, string> = {
+          provider_error: "AI Provider ตอบกลับผิดพลาด: ตรวจสอบสถานะของโมเดลหรือ endpoint (llama.cpp / Ollama)",
+          provider_timeout: "AI ตอบกลับไม่ทันเวลา (Timeout)",
+          budget_exceeded: "ขนาดคำถามหรือ evidence เกิน Context budget ของโมเดล",
+          context_budget_exceeded: "ขนาด Context เกิน Token budget ที่ตั้งไว้",
+          prompt_budget_exceeded: "ขนาด Prompt เกิน Token budget ที่ตั้งไว้",
+          invalid_output: "รูปแบบคำตอบจาก AI ไม่ตรงกับ JSON Claim Schema (กรุณาลองใหม่อีกครั้ง)",
+          invalid_json: "AI ไม่ได้ส่งคำตอบเป็น JSON หรือ format ผิดพลาด",
+          unknown_citation: "AI อ้างอิง evidence ID ที่ไม่มีใน capture นี้",
+          refused: "AI ปฏิเสธการตอบคำถามเกี่ยวกับ capture นี้",
+        };
+        setChatError(humanDesc[errCode] ?? `เกิดข้อผิดพลาด (${errCode})`);
         return;
       }
       setChatTurns((current) => [...current, { question: chatQuestion.trim(), claims: result.claims }].slice(-12));

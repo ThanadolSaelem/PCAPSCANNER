@@ -28,7 +28,7 @@ import httpx
 from pydantic import ValidationError
 
 from ..config import AIConfig, AppSettings, ProviderName
-from ..models import AIResult, AISummary, EvidenceBundle
+from ..models import AIResult, AISummary, Assessment, EvidenceBundle
 from .catalog import preset_ids
 
 
@@ -768,6 +768,33 @@ async def _post_json(
             usage = _usage(parsed.get("usage"))
             return parsed, usage
 
+        if status == 400 and ("response_format" in body or "output_config" in body):
+            # Local engines (e.g. llama.cpp) often reject json_schema with HTTP 400 when
+            # schema compilation fails or strict formatting is unsupported.
+            # Retry immediately without schema parameter so the model can still generate text.
+            body_no_format = dict(body)
+            body_no_format.pop("response_format", None)
+            body_no_format.pop("output_config", None)
+            remaining_fb = deadline - time.monotonic()
+            if remaining_fb > 0.05:
+                try:
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        timeout=httpx.Timeout(max(0.05, remaining_fb)),
+                        trust_env=False,
+                        follow_redirects=False,
+                    ) as fb_client:
+                        async with fb_client.stream(
+                            "POST", runtime.endpoint, headers=runtime.headers, json=body_no_format
+                        ) as fb_response:
+                            fb_raw = await _read_response(fb_response, deadline)
+                            if fb_response.status_code == 200:
+                                fb_parsed = json.loads(fb_raw)
+                                if isinstance(fb_parsed, dict) and not fb_parsed.get("error"):
+                                    return fb_parsed, _usage(fb_parsed.get("usage"))
+                except Exception:
+                    pass
+
         retriable = status == 429 or 500 <= status <= 599
         failure = _RequestFailure("rate_limited" if status == 429 else "provider_http_error", retriable=retriable, status=status)
         last_failure = failure
@@ -821,29 +848,85 @@ def _extract_text(payload: dict[str, Any], route: str) -> tuple[str, str | None,
         return "", None, True
     message = choice.get("message")
     if not isinstance(message, dict):
+        if isinstance(choice.get("text"), str):
+            return choice["text"], None, False
         raise _RequestFailure("malformed_output")
     if message.get("refusal"):
         return "", "refused", False
     content = message.get("content")
     if isinstance(content, str):
+        if not content.strip() and isinstance(message.get("reasoning_content"), str):
+            return message["reasoning_content"], None, False
         return content, None, False
     if isinstance(content, list):
         texts = [part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)]
         if texts:
             return "".join(texts), None, False
+    if message.get("reasoning_content") and isinstance(message["reasoning_content"], str):
+        return message["reasoning_content"], None, False
     raise _RequestFailure("malformed_output")
 
 
-def _parse_summary(text: str) -> AISummary:
-    candidate = text.strip()
+def _extract_json_object_from_text(text: str) -> str:
+    """Return a clean JSON object string if present, tolerating reasoning tokens (<think>), markdown fences, or wrapper prose."""
+    # 1. Strip reasoning / think tags (<think>...</think> or unclosed <think>...)
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.I | re.S).strip()
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.I | re.S).strip()
+    if not cleaned:
+        cleaned = text.strip()
+
+    # 2. Try fenced code block
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.I | re.S)
+    if fenced:
+        try:
+            cand = fenced.group(1).strip()
+            parsed = json.loads(cand)
+            if isinstance(parsed, dict):
+                return cand
+        except Exception:
+            pass
+
+    # 3. Direct candidate after stripping simple ``` fences
+    candidate = cleaned.strip()
     if candidate.startswith("```"):
         candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I | re.S).strip()
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return candidate
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+
+    # 4. Outermost { ... }
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        cand = cleaned[start : end + 1].strip()
+        try:
+            parsed = json.loads(cand)
+            if isinstance(parsed, dict):
+                return cand
+        except Exception:
+            pass
+
+    return candidate
+
+
+def _parse_summary(text: str) -> AISummary:
+    candidate = _extract_json_object_from_text(text)
     try:
         value = json.loads(candidate)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _RequestFailure("invalid_output") from exc
     if not isinstance(value, dict):
         raise _RequestFailure("invalid_output")
+    # Normalize optional arrays to empty lists if None or omitted
+    if "assessments" not in value or value["assessments"] is None:
+        value["assessments"] = []
+    if "limitations" not in value or value["limitations"] is None:
+        value["limitations"] = []
+    if "recommended_actions" not in value or value["recommended_actions"] is None:
+        value["recommended_actions"] = []
     try:
         return AISummary.model_validate(value)
     except ValidationError as exc:
@@ -888,7 +971,18 @@ def _validate_grounding(report: AISummary, bundle: EvidenceBundle) -> None:
             raise _RequestFailure("confidence_exceeded")
         seen.add(assessment.finding_id)
     if seen != set(findings):
-        raise _RequestFailure("missing_finding")
+        # Auto-populate unassessed findings with deterministic interpretations instead of failing
+        for fid, finding in findings.items():
+            if fid not in seen:
+                report.assessments.append(
+                    Assessment(
+                        finding_id=fid,
+                        interpretation=f"Deterministic finding '{finding.title}' retained.",
+                        confidence=finding.confidence,
+                        evidence_ids=finding.evidence_ids,
+                    )
+                )
+                seen.add(fid)
     for recommendation in report.recommended_actions:
         if not set(recommendation.evidence_ids).issubset(evidence_ids):
             raise _RequestFailure("invalid_refs")
@@ -920,27 +1014,6 @@ def _result(
         error_code=error_code,
         context_reduction=context_reduction,
     )
-
-
-def _extract_json_object_from_text(text: str) -> str:
-    """Return a clean JSON object string if present, tolerating markdown fences or wrapper prose."""
-    candidate = text.strip()
-    if candidate.startswith("```"):
-        candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I | re.S).strip()
-    try:
-        parsed = json.loads(candidate)
-        if isinstance(parsed, dict):
-            return candidate
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        pass
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.I | re.S)
-    if fenced:
-        return fenced.group(1).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        return text[start : end + 1].strip()
-    return candidate
 
 
 def _extract_manus_v2_messages_output(messages: list[dict[str, Any]]) -> str | None:

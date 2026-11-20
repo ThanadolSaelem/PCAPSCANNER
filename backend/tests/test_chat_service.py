@@ -177,3 +177,39 @@ async def test_output_budget_and_timeout_fail_closed():
     assert timed_out.state == "unavailable"
     assert timed_out.error_code == "provider_timeout"
     assert timed_out.claims == ()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_tags_and_markdown_fences_parsed_cleanly():
+    raw_with_think = (
+        "<think>\n"
+        "1. The user asks about flows in the capture.\n"
+        "2. Evidence EV-000001 has HTTP flow data.\n"
+        "</think>\n"
+        "```json\n"
+        '{"claims": [{"claim": "Observed one HTTP flow in EV-000001", "evidence_ids": ["ev_1"]}]}\n'
+        "```\n"
+    )
+
+    async def reasoning_provider(prompt: str) -> str:
+        return raw_with_think
+
+    result = await answer_question(make_bundle(), "Explain flow", consent=True, provider=reasoning_provider)
+    assert result.state == "completed"
+    assert len(result.claims) == 1
+    assert result.claims[0].claim == "Observed one HTTP flow in EV-000001"
+    assert result.claims[0].evidence_ids == ["EV-000001"]
+
+
+@pytest.mark.asyncio
+async def test_direct_claim_list_shape_accepted():
+    raw_list = '[{"claim": "Direct list format", "evidence_ids": ["EV-000001"]}]'
+
+    async def list_provider(prompt: str) -> str:
+        return raw_list
+
+    result = await answer_question(make_bundle(), "Explain flow", consent=True, provider=list_provider)
+    assert result.state == "completed"
+    assert len(result.claims) == 1
+    assert result.claims[0].claim == "Direct list format"
+
