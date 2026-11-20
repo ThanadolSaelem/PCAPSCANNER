@@ -1359,6 +1359,19 @@ class Store:
                     raise StoreError("job_not_found", 404)
                 raise StoreError("evidence_not_ready", 409)
 
+    def save_ai_result(self, jid: str, result_json: str) -> None:
+        """Store or update the bounded AI summary result on an analysis with ready evidence."""
+        self._validate_id(jid)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE jobs SET ai_result=?, updated_at=? WHERE id=? AND evidence IS NOT NULL",
+                (result_json, utcnow(), jid),
+            )
+            if cursor.rowcount != 1:
+                if not db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone():
+                    raise StoreError("job_not_found", 404)
+                raise StoreError("evidence_not_ready", 409)
+
     def recover_stale(self, stale_seconds=600) -> int:
         cutoff = time.time() - stale_seconds
         timestamp = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")

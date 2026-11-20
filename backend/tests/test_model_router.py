@@ -277,3 +277,16 @@ def test_repointing_a_fixed_endpoint_preset_drops_its_key_slot(tmp_path, monkeyp
     assert body["configuration"]["preset"] is None
     assert body["credential_slot"] == "openai_compatible"
     assert body["runtime_key_set"] is False
+
+
+def test_on_demand_summary_endpoint_validates_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("PCAP_WORKSPACE_CONFIG", str(tmp_path / "workspace.json"))
+    app = create_app(AppSettings(data_dir=tmp_path / "data", api_token=TOKEN, ai=AIConfig(enabled=False)))
+    client = TestClient(app, headers={"Authorization": f"Bearer {TOKEN}"})
+    # Unknown analysis -> 404
+    missing = client.post("/api/v1/analyses/0123456789abcdef0123456789abcdef/summary")
+    assert missing.status_code == 404
+    # Malformed analysis id -> 404
+    bad_id = client.post("/api/v1/analyses/not-hex/summary")
+    assert bad_id.status_code == 404
+

@@ -1243,6 +1243,8 @@ function App() {
       const updated = await api.updateAiConfig(payload);
       setAiConfig(updated);
       if (updated.configuration.enabled && updated.configuration.model) {
+        setAiEnabled(true);
+        setAiConsent(true);
         const keyReady = Boolean(updated.runtime_key_set || updated.api_key_env_set || updated.manus_ready || updated.manus_env_set);
         pushToast(
           `บันทึก Layer-2 AI (${updated.configuration.provider}: ${updated.configuration.model}) แล้ว`,
@@ -1250,6 +1252,7 @@ function App() {
           `Boundary: ${updated.configuration.data_boundary} · API Key ${keyReady ? "ready" : "optional/unset"}`,
         );
       } else {
+        if (!updated.configuration.enabled) setAiEnabled(false);
         pushToast(
           "อัปเดตการตั้งค่า Layer-2 AI แล้ว (Standby)",
           "info",
@@ -1821,6 +1824,9 @@ function App() {
                   return Promise.reject(new Error("live_backend_required"));
                 }
                 return api.askGroundedQuestion(activeReport.analysisId, question, consent);
+              }}
+              onRefreshReport={async () => {
+                await loadBackendReport(activeReport.analysisId);
               }}
               onNavigate={navigate}
               onOpenEvidence={openEvidence}
@@ -5446,6 +5452,7 @@ function ReportsPage({
   onProbeAiModels,
   onExport,
   onChat,
+  onRefreshReport,
   onNavigate,
   onOpenEvidence,
   onOpenConnectionModal,
@@ -5464,6 +5471,7 @@ function ReportsPage({
     kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
   ) => void;
   onChat: (question: string, consent: boolean) => Promise<GroundedChatResponse>;
+  onRefreshReport?: () => Promise<void>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
   onOpenConnectionModal: (tab?: SettingsTab) => void;
@@ -5483,7 +5491,25 @@ function ReportsPage({
   const [chatTurns, setChatTurns] = useState<{ question: string; claims: GroundedChatResponse["claims"] }[]>([]);
   const [quickModelInput, setQuickModelInput] = useState("");
   const [quickAiBusy, setQuickAiBusy] = useState(false);
+  const [generatingSummary, setGeneratingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
   const chatTargetId = useRef(report.analysisId);
+
+  const handleGenerateSummary = async () => {
+    if (generatingSummary || !connected || !aiBackendReady) return;
+    setGeneratingSummary(true);
+    setSummaryError(null);
+    try {
+      await apiClient.generateAnalysisSummary(report.analysisId);
+      if (onRefreshReport) {
+        await onRefreshReport();
+      }
+    } catch (err) {
+      setSummaryError(safeFormatError(err));
+    } finally {
+      setGeneratingSummary(false);
+    }
+  };
 
   useEffect(() => {
     if (!exportMenuOpen) return;
@@ -5901,6 +5927,17 @@ function ReportsPage({
                           : "Layer-2 AI narrative ยังไม่ถูกสร้างในรอบนี้ — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
                 </span>
                 <div className="ai-disabled-actions">
+                  {connected && aiBackendReady && report.origin === "live" && (
+                    <button
+                      type="button"
+                      className="primary-button tiny-btn"
+                      disabled={generatingSummary}
+                      onClick={() => void handleGenerateSummary()}
+                    >
+                      <Icon name="spark" size={13} />{" "}
+                      {generatingSummary ? "กำลังสร้าง AI Summary…" : "สร้าง AI Summary ให้รายงานนี้"}
+                    </button>
+                  )}
                   <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
                     <Icon name="spark" size={13} /> ตั้งค่า AI &amp; Models
                   </button>
@@ -5908,6 +5945,11 @@ function ReportsPage({
                     ไปหน้าวิเคราะห์ <Icon name="arrow" size={14} />
                   </button>
                 </div>
+                {summaryError && (
+                  <p role="alert" className="grounded-chat-error" style={{ marginTop: "8px" }}>
+                    {summaryError}
+                  </p>
+                )}
               </div>
             )}
           </div>

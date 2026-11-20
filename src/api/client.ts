@@ -1273,6 +1273,12 @@ export class PcapApiClient {
     });
   }
 
+  generateAnalysisSummary(analysisId: string): Promise<Record<string, unknown>> {
+    return this.requestJson<Record<string, unknown>>(`/api/v1/analyses/${encodeURIComponent(analysisId)}/summary`, {
+      method: "POST",
+    });
+  }
+
   async getStixJson(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
     const q = options.redact ? "?redact=true" : "";
     const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.stix.json${q}`), {

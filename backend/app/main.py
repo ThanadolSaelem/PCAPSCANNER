@@ -77,6 +77,7 @@ from .llm import (
     credential_slot_for,
     credential_slot_names,
     generate_chat_completion,
+    generate_summary,
     infer_preset,
     list_presets,
     probe_models,
@@ -1455,6 +1456,23 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             }:
                 code = "invalid_osint_request"
             raise HTTPException(422, code) from exc
+
+    @app.post("/api/v1/analyses/{analysis_id}/summary", tags=["AI"])
+    async def generate_analysis_summary(analysis_id: str):
+        if not re.fullmatch(r"[a-f0-9]{32}", analysis_id):
+            raise HTTPException(404, "analysis_not_found")
+        row = _store().job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        cfg_now = _cfg()
+        if not cfg_now.ai.enabled:
+            raise HTTPException(409, "ai_disabled_by_operator")
+        if not cfg_now.ai.model and str(cfg_now.ai.provider) != "manus":
+            raise HTTPException(409, "ai_model_not_configured")
+        result = await generate_summary(bundle, cfg_now)
+        _store().save_ai_result(analysis_id, result.model_dump_json())
+        return result.model_dump(mode="json")
 
     @app.post("/api/v1/analyses/{analysis_id}/chat", tags=["AI"])
     async def grounded_chat(analysis_id: str, body: GroundedChatRequest):
