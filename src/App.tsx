@@ -1682,6 +1682,7 @@ function App() {
 
           {screen === "analyze" && (
             <AnalyzePage
+              apiClient={api}
               connectionStatus={connectionStatus}
               connectionError={connectionError}
               capabilities={capabilities}
@@ -1808,6 +1809,7 @@ function App() {
           {screen === "reports" && (
             <ReportsPage
               report={displayReport}
+              apiClient={api}
               connected={connectionStatus === "connected"}
               aiConfig={aiConfig}
               aiModels={aiModels}
@@ -5436,6 +5438,7 @@ function TrafficPage({
 
 function ReportsPage({
   report,
+  apiClient,
   connected,
   aiConfig,
   aiModels,
@@ -5446,12 +5449,12 @@ function ReportsPage({
   onProbeAiModels,
   onExport,
   onChat,
-  onRefreshReport,
   onNavigate,
   onOpenEvidence,
   onOpenConnectionModal,
 }: {
   report: WorkspaceReport;
+  apiClient: PcapApiClient;
   connected: boolean;
   aiConfig: AIConfigResponse | null;
   aiModels: AIModelsResponse | null;
