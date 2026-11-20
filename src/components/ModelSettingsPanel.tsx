@@ -518,10 +518,22 @@ export default function ModelSettingsPanel({
             <span>Timeout (วินาที)</span>
             <input
               type="number"
-              min={1}
-              max={120}
+              min={5}
+              max={600}
               value={draft.timeoutSeconds}
               onChange={(e) => patch({ timeoutSeconds: Number(e.target.value) || preset.timeout_seconds })}
+            />
+          </label>
+          <label className="modal-field">
+            <span>Max output tokens</span>
+            <input
+              type="number"
+              min={256}
+              max={16384}
+              step={256}
+              value={draft.maxOutputTokens}
+              onChange={(e) => patch({ maxOutputTokens: Number(e.target.value) || 4096 })}
+              placeholder="เช่น 2048, 4096, 8192"
             />
           </label>
           <label className="modal-field">

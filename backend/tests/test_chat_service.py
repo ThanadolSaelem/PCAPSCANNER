@@ -213,3 +213,16 @@ async def test_direct_claim_list_shape_accepted():
     assert len(result.claims) == 1
     assert result.claims[0].claim == "Direct list format"
 
+
+@pytest.mark.asyncio
+async def test_provider_output_length_is_not_masked_as_provider_error():
+    from backend.app.llm.providers import _RequestFailure
+
+    async def truncated_provider(prompt: str) -> str:
+        raise _RequestFailure("output_length")
+
+    result = await answer_question(make_bundle(), "Explain flow", consent=True, provider=truncated_provider)
+    assert result.state == "invalid_output"
+    assert result.error_code == "output_length"
+
+

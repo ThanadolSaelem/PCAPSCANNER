@@ -40,6 +40,7 @@ from .models import (
     CaseNoteCreateRequest,
     CasePatchRequest,
     ChunkUploadInitRequest,
+    AISummaryRequest,
     EvidenceBundle,
     GroundedChatRequest,
     JobsPruneRequest,
@@ -1458,7 +1459,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise HTTPException(422, code) from exc
 
     @app.post("/api/v1/analyses/{analysis_id}/summary", tags=["AI"])
-    async def generate_analysis_summary(analysis_id: str):
+    async def generate_analysis_summary(
+        analysis_id: str,
+        body: AISummaryRequest | None = Body(default=None),
+    ):
         if not re.fullmatch(r"[a-f0-9]{32}", analysis_id):
             raise HTTPException(404, "analysis_not_found")
         row = _store().job(analysis_id, internal=True)
@@ -1470,7 +1474,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise HTTPException(409, "ai_disabled_by_operator")
         if not cfg_now.ai.model and str(cfg_now.ai.provider) != "manus":
             raise HTTPException(409, "ai_model_not_configured")
-        result = await generate_summary(bundle, cfg_now)
+        ai_overrides: dict[str, Any] = {}
+        if body is not None:
+            if body.timeout_seconds is not None:
+                ai_overrides["timeout_seconds"] = body.timeout_seconds
+            if body.max_output_tokens is not None:
+                ai_overrides["max_output_tokens"] = body.max_output_tokens
+        cfg_effective = (
+            cfg_now.model_copy(update={"ai": cfg_now.ai.model_copy(update=ai_overrides)})
+            if ai_overrides
+            else cfg_now
+        )
+        result = await generate_summary(bundle, cfg_effective)
         _store().save_ai_result(analysis_id, result.model_dump_json())
         return result.model_dump(mode="json")
 
@@ -1491,14 +1506,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if cfg_now.ai.context_window_tokens <= 513:
                 raise HTTPException(409, "ai_context_window_too_small")
 
-            async def provider_call(prompt: str) -> str:
-                return await generate_chat_completion(prompt, cfg_now)
+            ai_overrides: dict[str, Any] = {}
+            if body.timeout_seconds is not None:
+                ai_overrides["timeout_seconds"] = body.timeout_seconds
+            if body.max_output_tokens is not None:
+                ai_overrides["max_output_tokens"] = body.max_output_tokens
+            cfg_effective = (
+                cfg_now.model_copy(update={"ai": cfg_now.ai.model_copy(update=ai_overrides)})
+                if ai_overrides
+                else cfg_now
+            )
 
-            max_output_tokens = min(1_200, cfg_now.ai.max_output_tokens, cfg_now.ai.context_window_tokens - 513)
-            token_input_space = max(512, cfg_now.ai.context_window_tokens - max_output_tokens - 512)
+            async def provider_call(prompt: str) -> str:
+                return await generate_chat_completion(prompt, cfg_effective)
+
+            max_output_tokens = min(
+                4_096,
+                cfg_effective.ai.max_output_tokens,
+                cfg_effective.ai.context_window_tokens - 513,
+            )
+            token_input_space = max(512, cfg_effective.ai.context_window_tokens - max_output_tokens - 512)
             token_bytes_budget = token_input_space * 3
-            effective_context_bytes = min(cfg_now.ai.input_max_bytes, token_bytes_budget)
-            effective_prompt_bytes = min(cfg_now.ai.input_max_bytes, effective_context_bytes + 8_000)
+            effective_context_bytes = min(cfg_effective.ai.input_max_bytes, token_bytes_budget)
+            effective_prompt_bytes = min(cfg_effective.ai.input_max_bytes, effective_context_bytes + 8_000)
 
             target_bundle = bundle
             if len(bundle.evidence) > 25 or len(bundle.findings) > 25:
@@ -1507,19 +1537,19 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     target_bundle, _ = pack_evidence_for_ai(
                         bundle,
                         max_bytes=effective_context_bytes,
-                        triage_cfg=cfg_now.triage,
+                        triage_cfg=cfg_effective.triage,
                     )
                 except Exception:
                     target_bundle = bundle
 
             limits = ChatLimits(
-                max_question_bytes=min(2_000, cfg_now.ai.input_max_bytes),
+                max_question_bytes=min(2_000, cfg_effective.ai.input_max_bytes),
                 max_context_bytes=effective_context_bytes,
                 max_prompt_bytes=effective_prompt_bytes,
-                max_output_bytes=min(8_000, max_output_tokens * 4),
-                context_window_tokens=cfg_now.ai.context_window_tokens,
+                max_output_bytes=min(32_000, max_output_tokens * 4),
+                context_window_tokens=cfg_effective.ai.context_window_tokens,
                 max_output_tokens=max_output_tokens,
-                timeout_seconds=min(60.0, cfg_now.ai.timeout_seconds),
+                timeout_seconds=float(cfg_effective.ai.timeout_seconds),
                 max_claims=20,
             )
             async with app.state.chat_semaphore:

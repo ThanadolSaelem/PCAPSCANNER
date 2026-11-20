@@ -154,10 +154,10 @@ class AIConfig(BaseModel):
     # This is an environment variable *name*, never a key value.
     api_key_env: str | None = Field(default=None, max_length=128)
     data_boundary: DataBoundary = "remote"
-    timeout_seconds: int = Field(default=30, ge=1, le=120)
+    timeout_seconds: int = Field(default=30, ge=1, le=600)
     retries: int = Field(default=0, ge=0, le=2)
     input_max_bytes: int = Field(default=150_000, ge=1, le=2_000_000)
-    max_output_tokens: int = Field(default=2048, ge=1, le=8192)
+    max_output_tokens: int = Field(default=2048, ge=1, le=16_384)
     context_window_tokens: int = Field(default=16_384, ge=1, le=2_000_000)
     token_parameter: TokenParameter = "max_tokens"
     response_mode: ResponseMode = "json_schema"

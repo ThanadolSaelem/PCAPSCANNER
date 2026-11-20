@@ -1819,11 +1819,11 @@ function App() {
               onSaveAiConfig={handleSaveAiConfig}
               onProbeAiModels={handleProbeAiModels}
               onExport={(kind) => void handleExport(kind)}
-              onChat={(question, consent) => {
+              onChat={(question, consent, options) => {
                 if (activeReport.origin !== "live" || connectionStatus !== "connected") {
                   return Promise.reject(new Error("live_backend_required"));
                 }
-                return api.askGroundedQuestion(activeReport.analysisId, question, consent);
+                return api.askGroundedQuestion(activeReport.analysisId, question, consent, options);
               }}
               onRefreshReport={async () => {
                 await loadBackendReport(activeReport.analysisId);
@@ -5470,7 +5470,11 @@ function ReportsPage({
   onExport: (
     kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
   ) => void;
-  onChat: (question: string, consent: boolean) => Promise<GroundedChatResponse>;
+  onChat: (
+    question: string,
+    consent: boolean,
+    options?: { timeout_seconds?: number; max_output_tokens?: number },
+  ) => Promise<GroundedChatResponse>;
   onRefreshReport?: () => Promise<void>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
@@ -5493,16 +5497,67 @@ function ReportsPage({
   const [quickAiBusy, setQuickAiBusy] = useState(false);
   const [generatingSummary, setGeneratingSummary] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [promptTimeoutSec, setPromptTimeoutSec] = useState<number>(() =>
+    Math.min(600, Math.max(5, aiConfig?.configuration.timeout_seconds ?? 120)),
+  );
+  const [promptMaxTokens, setPromptMaxTokens] = useState<number>(() =>
+    Math.min(16384, Math.max(4096, aiConfig?.configuration.max_output_tokens ?? 4096)),
+  );
   const chatTargetId = useRef(report.analysisId);
+
+  useEffect(() => {
+    if (aiConfig?.configuration.timeout_seconds) {
+      setPromptTimeoutSec((prev) =>
+        prev === 120 ? Math.min(600, Math.max(5, aiConfig.configuration.timeout_seconds)) : prev,
+      );
+    }
+    if (aiConfig?.configuration.max_output_tokens) {
+      setPromptMaxTokens((prev) =>
+        prev === 4096 ? Math.min(16384, Math.max(4096, aiConfig.configuration.max_output_tokens)) : prev,
+      );
+    }
+  }, [aiConfig?.configuration.timeout_seconds, aiConfig?.configuration.max_output_tokens]);
+
+  const describeAiError = (errCode: string): string => {
+    const humanDesc: Record<string, string> = {
+      output_length:
+        "โมเดลสร้างคำตอบเกินขีดจำกัด Max tokens ก่อนเขียน JSON จบ (มักเกิดจาก thinking/reasoning ยาว) — ลองเพิ่ม Max tokens ด้านล่างหรือตั้ง Timeout เพิ่มขึ้น",
+      output_budget_exceeded: "ขนาดคำตอบเกิน Max output budget — ลองเพิ่ม Max tokens แล้วส่งใหม่",
+      output_token_budget_exceeded: "จำนวน token คำตอบเกิน Max tokens ที่ตั้งไว้ — ลองเพิ่ม Max tokens แล้วส่งใหม่",
+      provider_timeout: "AI ตอบกลับไม่ทันเวลา (Timeout) — ลองเพิ่ม Timeout (วินาที) ก่อนส่งคำถามใหม่",
+      timeout: "AI ตอบกลับไม่ทันเวลา (Timeout) — ลองเพิ่ม Timeout (วินาที) ก่อนส่งใหม่",
+      provider_error: "AI Provider ตอบกลับผิดพลาด: ตรวจสอบสถานะของโมเดลหรือ endpoint (llama.cpp / Ollama)",
+      rate_limited: "AI Provider จำกัดอัตราการเรียกใช้งาน (Rate Limited) — กรุณารอสักครู่แล้วลองใหม่",
+      budget_exceeded: "ขนาดคำถามหรือ evidence เกิน Context budget ของโมเดล",
+      context_budget_exceeded: "ขนาด Context เกิน Token budget ที่ตั้งไว้",
+      prompt_budget_exceeded: "ขนาด Prompt เกิน Token budget ที่ตั้งไว้",
+      invalid_output: "รูปแบบคำตอบจาก AI ไม่ตรงกับ JSON Schema (กรุณาลองใหม่อีกครั้ง)",
+      invalid_json: "AI ไม่ได้ส่งคำตอบเป็น JSON หรือ format ผิดพลาด",
+      unknown_citation: "AI อ้างอิง evidence ID ที่ไม่มีใน capture นี้",
+      refused: "AI ปฏิเสธการตอบคำถามเกี่ยวกับ capture นี้",
+      provider_refused: "AI ปฏิเสธการตอบคำถามเกี่ยวกับ capture นี้",
+    };
+    return humanDesc[errCode] ?? `เกิดข้อผิดพลาด (${errCode})`;
+  };
+
+  const normalizedPromptOptions = () => ({
+    timeout_seconds: Math.min(600, Math.max(5, Math.round(promptTimeoutSec) || 120)),
+    max_output_tokens: Math.min(16384, Math.max(256, Math.round(promptMaxTokens) || 4096)),
+  });
 
   const handleGenerateSummary = async () => {
     if (generatingSummary || !connected || !aiBackendReady) return;
     setGeneratingSummary(true);
     setSummaryError(null);
     try {
-      await apiClient.generateAnalysisSummary(report.analysisId);
+      const res = await apiClient.generateAnalysisSummary(report.analysisId, normalizedPromptOptions());
       if (onRefreshReport) {
         await onRefreshReport();
+      }
+      const state = typeof res.state === "string" ? res.state : "completed";
+      if (state !== "completed") {
+        const code = typeof res.error_code === "string" ? res.error_code : state;
+        setSummaryError(describeAiError(code));
       }
     } catch (err) {
       setSummaryError(safeFormatError(err));
@@ -5587,22 +5642,11 @@ function ReportsPage({
     setChatPending(true);
     setChatError("");
     try {
-      const result = await onChat(chatQuestion, true);
+      const result = await onChat(chatQuestion, true, normalizedPromptOptions());
       if (chatTargetId.current !== targetAnalysisId) return;
       if (result.state !== "completed" || result.claims.length === 0) {
         const errCode = result.error_code ?? `chat_${result.state}`;
-        const humanDesc: Record<string, string> = {
-          provider_error: "AI Provider ตอบกลับผิดพลาด: ตรวจสอบสถานะของโมเดลหรือ endpoint (llama.cpp / Ollama)",
-          provider_timeout: "AI ตอบกลับไม่ทันเวลา (Timeout)",
-          budget_exceeded: "ขนาดคำถามหรือ evidence เกิน Context budget ของโมเดล",
-          context_budget_exceeded: "ขนาด Context เกิน Token budget ที่ตั้งไว้",
-          prompt_budget_exceeded: "ขนาด Prompt เกิน Token budget ที่ตั้งไว้",
-          invalid_output: "รูปแบบคำตอบจาก AI ไม่ตรงกับ JSON Claim Schema (กรุณาลองใหม่อีกครั้ง)",
-          invalid_json: "AI ไม่ได้ส่งคำตอบเป็น JSON หรือ format ผิดพลาด",
-          unknown_citation: "AI อ้างอิง evidence ID ที่ไม่มีใน capture นี้",
-          refused: "AI ปฏิเสธการตอบคำถามเกี่ยวกับ capture นี้",
-        };
-        setChatError(humanDesc[errCode] ?? `เกิดข้อผิดพลาด (${errCode})`);
+        setChatError(describeAiError(errCode));
         return;
       }
       setChatTurns((current) => [...current, { question: chatQuestion.trim(), claims: result.claims }].slice(-12));
@@ -5936,15 +5980,30 @@ function ReportsPage({
                 </span>
                 <div className="ai-disabled-actions">
                   {connected && aiBackendReady && report.origin === "live" && (
-                    <button
-                      type="button"
-                      className="primary-button tiny-btn"
-                      disabled={generatingSummary}
-                      onClick={() => void handleGenerateSummary()}
-                    >
-                      <Icon name="spark" size={13} />{" "}
-                      {generatingSummary ? "กำลังสร้าง AI Summary…" : "สร้าง AI Summary ให้รายงานนี้"}
-                    </button>
+                    <>
+                      <label className="prompt-tuning-field" title="เวลารอ AI สูงสุด (วินาที) สำหรับการสร้างสรุปครั้งนี้">
+                        <span>Timeout (s)</span>
+                        <input
+                          type="number"
+                          min={5}
+                          max={600}
+                          step={15}
+                          value={promptTimeoutSec}
+                          disabled={generatingSummary}
+                          onChange={(e) => setPromptTimeoutSec(Number(e.target.value) || 120)}
+                          aria-label="Summary timeout seconds"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={generatingSummary}
+                        onClick={() => void handleGenerateSummary()}
+                      >
+                        <Icon name="spark" size={13} />{" "}
+                        {generatingSummary ? "กำลังสร้าง AI Summary…" : "สร้าง AI Summary ให้รายงานนี้"}
+                      </button>
+                    </>
                   )}
                   <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
                     <Icon name="spark" size={13} /> ตั้งค่า AI &amp; Models
@@ -6099,6 +6158,34 @@ function ReportsPage({
                     >
                       {chatPending ? "Analyzing evidence…" : "Ask grounded AI"}
                     </button>
+                    <div className="prompt-tuning-bar">
+                      <label className="prompt-tuning-field" title="เวลารอ AI สูงสุด (วินาที) สำหรับคำถามนี้">
+                        <span>Timeout (s)</span>
+                        <input
+                          type="number"
+                          min={5}
+                          max={600}
+                          step={15}
+                          value={promptTimeoutSec}
+                          disabled={chatPending}
+                          onChange={(e) => setPromptTimeoutSec(Number(e.target.value) || 120)}
+                          aria-label="Prompt timeout seconds"
+                        />
+                      </label>
+                      <label className="prompt-tuning-field" title="จำนวน output tokens สูงสุด (รวม thinking + JSON)">
+                        <span>Max tokens</span>
+                        <input
+                          type="number"
+                          min={256}
+                          max={16384}
+                          step={512}
+                          value={promptMaxTokens}
+                          disabled={chatPending}
+                          onChange={(e) => setPromptMaxTokens(Number(e.target.value) || 4096)}
+                          aria-label="Prompt max output tokens"
+                        />
+                      </label>
+                    </div>
                     {chatDisabledReason && <small className="chat-helper-hint">{chatDisabledReason}</small>}
                   </div>
                 </form>

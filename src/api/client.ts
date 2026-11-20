@@ -1265,17 +1265,33 @@ export class PcapApiClient {
     }
   }
 
-  askGroundedQuestion(analysisId: string, question: string, consent: boolean): Promise<GroundedChatResponse> {
+  askGroundedQuestion(
+    analysisId: string,
+    question: string,
+    consent: boolean,
+    options?: { timeout_seconds?: number; max_output_tokens?: number },
+  ): Promise<GroundedChatResponse> {
+    const body: Record<string, unknown> = { question, consent };
+    if (options?.timeout_seconds !== undefined) body.timeout_seconds = options.timeout_seconds;
+    if (options?.max_output_tokens !== undefined) body.max_output_tokens = options.max_output_tokens;
     return this.requestJson<GroundedChatResponse>(`/api/v1/analyses/${analysisId}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, consent }),
+      body: JSON.stringify(body),
     });
   }
 
-  generateAnalysisSummary(analysisId: string): Promise<Record<string, unknown>> {
+  generateAnalysisSummary(
+    analysisId: string,
+    options?: { timeout_seconds?: number; max_output_tokens?: number },
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {};
+    if (options?.timeout_seconds !== undefined) body.timeout_seconds = options.timeout_seconds;
+    if (options?.max_output_tokens !== undefined) body.max_output_tokens = options.max_output_tokens;
+    const hasBody = Object.keys(body).length > 0;
     return this.requestJson<Record<string, unknown>>(`/api/v1/analyses/${encodeURIComponent(analysisId)}/summary`, {
       method: "POST",
+      ...(hasBody ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
     });
   }
 

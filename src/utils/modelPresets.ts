@@ -150,6 +150,7 @@ export interface ModelSettingsDraft {
   timeoutSeconds: number;
   contextWindowTokens: number;
   inputMaxBytes: number;
+  maxOutputTokens: number;
 }
 
 export const PRESET_CATEGORY_LABELS: Record<AIProviderPreset["category"], string> = {
@@ -232,6 +233,7 @@ export function draftFromPreset(preset: AIProviderPreset, previous?: ModelSettin
     timeoutSeconds: preset.timeout_seconds,
     contextWindowTokens: 65536,
     inputMaxBytes: 150000,
+    maxOutputTokens: 4096,
   };
 }
 
@@ -254,6 +256,7 @@ export function draftFromConfig(
     timeoutSeconds: cfg.timeout_seconds ?? preset.timeout_seconds,
     contextWindowTokens: cfg.context_window_tokens ?? 65536,
     inputMaxBytes: cfg.input_max_bytes ?? 150000,
+    maxOutputTokens: cfg.max_output_tokens ?? 4096,
   };
 }
 
@@ -324,9 +327,10 @@ export function buildSavePayload(
     data_boundary: preset.category === "custom" ? draft.boundary : preset.data_boundary,
     response_mode: draft.responseMode,
     token_parameter: draft.tokenParameter,
-    timeout_seconds: Math.min(120, Math.max(1, Math.round(draft.timeoutSeconds) || preset.timeout_seconds)),
+    timeout_seconds: Math.min(600, Math.max(1, Math.round(draft.timeoutSeconds) || preset.timeout_seconds)),
     context_window_tokens: Math.max(1024, Math.min(2_000_000, Math.round(draft.contextWindowTokens) || 65536)),
     input_max_bytes: Math.max(1024, Math.min(2_000_000, Math.round(draft.inputMaxBytes) || 150000)),
+    max_output_tokens: Math.max(256, Math.min(16_384, Math.round(draft.maxOutputTokens) || 4096)),
   };
 }
 
@@ -371,7 +375,10 @@ export function hasTuningDrift(
     (saved?.id ?? "") !== draft.presetId ||
     (cfg.response_mode ?? "json_schema") !== draft.responseMode ||
     (cfg.token_parameter ?? "max_tokens") !== draft.tokenParameter ||
-    (cfg.timeout_seconds ?? 30) !== draft.timeoutSeconds
+    (cfg.timeout_seconds ?? 30) !== draft.timeoutSeconds ||
+    (cfg.max_output_tokens ?? 2048) !== draft.maxOutputTokens ||
+    (cfg.context_window_tokens ?? 16384) !== draft.contextWindowTokens ||
+    (cfg.input_max_bytes ?? 150000) !== draft.inputMaxBytes
   );
 }
 

@@ -221,6 +221,13 @@ class AnalysisRequest(Contract):
 class GroundedChatRequest(Contract):
     question: str = Field(min_length=1, max_length=8_000)
     consent: StrictBool
+    timeout_seconds: int | None = Field(default=None, ge=5, le=600)
+    max_output_tokens: int | None = Field(default=None, ge=128, le=16_384)
+
+
+class AISummaryRequest(Contract):
+    timeout_seconds: int | None = Field(default=None, ge=5, le=600)
+    max_output_tokens: int | None = Field(default=None, ge=128, le=16_384)
 
 
 class OSINTLookupRequest(Contract):
@@ -477,10 +484,10 @@ class AIConfigUpdateRequest(Contract):
     model: str | None = Field(default=None, max_length=200)
     api_key_env: str | None = Field(default=None, max_length=128)
     data_boundary: Literal["local", "remote"] | None = None
-    timeout_seconds: int | None = Field(default=None, ge=1, le=120)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=600)
     retries: int | None = Field(default=None, ge=0, le=2)
-    input_max_bytes: int | None = Field(default=None, ge=1, le=100_000)
-    max_output_tokens: int | None = Field(default=None, ge=1, le=8192)
+    input_max_bytes: int | None = Field(default=None, ge=1, le=2_000_000)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=16_384)
     context_window_tokens: int | None = Field(default=None, ge=1, le=2_000_000)
     token_parameter: Literal["max_tokens", "max_completion_tokens"] | None = None
     response_mode: Literal["json_schema", "json_object", "text"] | None = None

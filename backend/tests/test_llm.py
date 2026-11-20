@@ -177,7 +177,7 @@ async def test_grounded_chat_completion_uses_strict_schema_and_bounded_output():
     assert json.loads(raw) == answer
     assert len(requests) == 1
     request = requests[0]
-    assert request["max_tokens"] == 1_200
+    assert request["max_tokens"] == 4_096
     assert request["response_format"]["json_schema"]["strict"] is True
     assert request["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
     assert request["messages"][-1]["content"] == "Return one evidence-cited claim."
@@ -707,5 +707,37 @@ async def test_unassessed_findings_retained_in_summary():
     # Verify F-0002 was auto-retained deterministically rather than failing with missing_finding
     assessed_ids = {a.finding_id for a in result.report.assessments}
     assert assessed_ids == {"F-0001", "F-0002"}
+
+
+@pytest.mark.asyncio
+async def test_local_output_length_retries_with_thinking_disabled():
+    calls: list[dict] = []
+    answer = {"claims": [{"claim": "Recovered after disabling thinking.", "evidence_ids": ["EV-000001"]}]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        calls.append(body)
+        if body.get("chat_template_kwargs", {}).get("enable_thinking") is False:
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": json.dumps(answer)}, "finish_reason": "stop"}]},
+            )
+        # First call simulates llama.cpp Qwen thinking model hitting max_tokens inside <think>
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "<think>long reasoning..."}, "finish_reason": "length"}]},
+        )
+
+    raw = await generate_chat_completion(
+        "Summarize what happened.",
+        settings(max_output_tokens=2048),
+        transport=httpx.MockTransport(handler),
+    )
+    assert json.loads(raw) == answer
+    assert len(calls) == 2
+    assert "chat_template_kwargs" not in calls[0]
+    assert calls[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert calls[1]["max_tokens"] >= 4096
+
 
 
