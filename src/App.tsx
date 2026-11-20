@@ -1808,7 +1808,6 @@ function App() {
           {screen === "reports" && (
             <ReportsPage
               report={displayReport}
-              apiClient={api}
               connected={connectionStatus === "connected"}
               aiConfig={aiConfig}
               aiModels={aiModels}
