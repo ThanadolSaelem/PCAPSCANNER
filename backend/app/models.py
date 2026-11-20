@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Annotated, Any, Literal
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 
 def utcnow() -> str:
@@ -21,7 +21,7 @@ Severity = Literal["info", "low", "medium", "high"]
 
 class Stage(Contract):
     name: str = Field(max_length=80)
-    state: Literal["completed", "partial", "failed", "skipped", "unavailable"]
+    state: Literal["completed", "partial", "failed", "skipped", "unavailable", "awaiting_consent"]
     detail: str = Field(max_length=500)
 
 
@@ -80,6 +80,10 @@ class Tier1Summary(Contract):
     mean_confidence: float = Field(ge=0.0, le=1.0)
     mean_ppl: float = Field(ge=0.0)
     etbert_scored_count: int = Field(default=0, ge=0)
+    etbert_backend: str | None = Field(default=None, max_length=64)
+    etbert_device: str | None = Field(default=None, max_length=32)
+    etbert_model: str | None = Field(default=None, max_length=120)
+    etbert_top_classes: list[Tier1ClassStat] = Field(default_factory=list, max_length=20)
     top_classes: list[Tier1ClassStat] = Field(default_factory=list, max_length=30)
     escalated_evidence_ids: list[EvidenceId] = Field(default_factory=list, max_length=500)
 
@@ -114,6 +118,19 @@ class CaptureMetrics(Contract):
     sample_packets: list[SamplePacket] = Field(default_factory=list, max_length=250)
 
 
+class ArtifactRecord(Contract):
+    artifact_id: str = Field(pattern=r"^ART-[a-f0-9]{16}$")
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int = Field(ge=0)
+    content_type: str = Field(default="application/octet-stream", max_length=120)
+    protocol: str = Field(default="HTTP", max_length=32)
+    object_index: int = Field(default=0, ge=0)
+    matched_rules: list[str] = Field(default_factory=list, max_length=50)
+    evidence_id: EvidenceId | None = None
+    header_hex: str = Field(default="", max_length=64)
+    review_available: bool = False
+
+
 class EvidenceBundle(Contract):
     schema_version: Literal["1.0"] = "1.0"
     capture_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -123,6 +140,12 @@ class EvidenceBundle(Contract):
     findings: list[Finding] = Field(max_length=1000)
     triage: Tier1Summary | None = None
     telemetry: CaptureMetrics | None = None
+    mitre_attack: dict[str, Any] | None = None
+    correlations: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    artifacts: list[ArtifactRecord] = Field(default_factory=list, max_length=200)
+    flow_analytics: dict[str, Any] | None = None
+    geoip: dict[str, Any] | None = None
+    iocs: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
 
     @model_validator(mode="after")
     def cross_references(self):
@@ -195,6 +218,34 @@ class AnalysisRequest(Contract):
         return self
 
 
+class GroundedChatRequest(Contract):
+    question: str = Field(min_length=1, max_length=8_000)
+    consent: StrictBool
+    timeout_seconds: int | None = Field(default=None, ge=5, le=600)
+    max_output_tokens: int | None = Field(default=None, ge=128, le=16_384)
+
+
+class AISummaryRequest(Contract):
+    timeout_seconds: int | None = Field(default=None, ge=5, le=600)
+    max_output_tokens: int | None = Field(default=None, ge=128, le=16_384)
+
+
+class OSINTLookupRequest(Contract):
+    operation_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    candidate_ids: list[Annotated[str, Field(pattern=r"^IOC-[a-f0-9]{16}$")]] = Field(min_length=1, max_length=12)
+    providers: list[Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx", "rdns", "rdap"]] = Field(min_length=1, max_length=7)
+    consent: StrictBool
+    accept_uncertain_retry_risk: StrictBool = False
+
+    @model_validator(mode="after")
+    def unique_selection(self):
+        if len(set(self.candidate_ids)) != len(self.candidate_ids):
+            raise ValueError("duplicate_osint_candidate")
+        if len(set(self.providers)) != len(self.providers):
+            raise ValueError("duplicate_osint_provider")
+        return self
+
+
 class ChunkUploadInitRequest(Contract):
     filename: str = Field(min_length=1, max_length=255)
     total_bytes: int = Field(ge=1)
@@ -218,10 +269,13 @@ class WorkspaceUpdateRequest(Contract):
     add_local_ingest_root: str | None = Field(default=None, min_length=1, max_length=1024)
     remove_local_ingest_root: str | None = Field(default=None, min_length=1, max_length=1024)
     resource_mode: Literal["auto", "fast", "deep", "unlimited"] | None = None
+    etbert_checkpoint_path: str | None = Field(default=None, min_length=1, max_length=1024)
+    etbert_enabled: bool | None = None
+    clear_etbert_checkpoint: bool = False
 
 
 class NativePickRequest(Contract):
-    purpose: Literal["data_dir", "capture_root", "capture_file"]
+    purpose: Literal["data_dir", "capture_root", "capture_file", "model_file"]
 
 
 class BatchItemResponse(Contract):
@@ -230,7 +284,7 @@ class BatchItemResponse(Contract):
     analysis_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     size_bytes: int = Field(ge=1)
-    format: Literal["pcap", "pcapng"]
+    format: Literal["pcap", "pcapng", "csv", "tsv"]
     state: Literal["queued", "parsing", "awaiting_ai", "generating", "completed", "partial", "failed", "cancelled"]
     error_code: str | None = None
     evidence_available: bool = False
@@ -254,3 +308,224 @@ class ProblemDetails(Contract):
     status: int = Field(ge=400, le=599)
     code: str
     request_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+# Cases contain bounded analyst metadata only; capture bytes and packet payloads are never stored here.
+CaseStatus = Literal["open", "in_progress", "resolved", "closed"]
+CaseSeverity = Literal["info", "low", "medium", "high", "critical"]
+CaseTag = Annotated[str, Field(min_length=1, max_length=64)]
+
+
+class CaseCreateRequest(Contract):
+    title: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=4000)
+    status: CaseStatus = "open"
+    severity: CaseSeverity = "info"
+    tags: list[CaseTag] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def normalize_case_fields(self):
+        self.title = self.title.strip()
+        if not self.title:
+            raise ValueError("title must not be blank")
+        self.description = self.description.strip()
+        normalized = [tag.strip() for tag in self.tags]
+        if any(not tag for tag in normalized):
+            raise ValueError("tags must not be blank")
+        if len({tag.casefold() for tag in normalized}) != len(normalized):
+            raise ValueError("tags must be unique")
+        self.tags = normalized
+        return self
+
+
+class CasePatchRequest(Contract):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    description: str | None = Field(default=None, max_length=4000)
+    status: CaseStatus | None = None
+    severity: CaseSeverity | None = None
+    tags: list[CaseTag] | None = Field(default=None, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_case_patch(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one field is required")
+        if any(getattr(self, name) is None for name in self.model_fields_set):
+            raise ValueError("case fields cannot be null")
+        if self.title is not None:
+            self.title = self.title.strip()
+            if not self.title:
+                raise ValueError("title must not be blank")
+        if self.description is not None:
+            self.description = self.description.strip()
+        if self.tags is not None:
+            normalized = [tag.strip() for tag in self.tags]
+            if any(not tag for tag in normalized):
+                raise ValueError("tags must not be blank")
+            if len({tag.casefold() for tag in normalized}) != len(normalized):
+                raise ValueError("tags must be unique")
+            self.tags = normalized
+        return self
+
+
+class CaseAnalysisLinkRequest(Contract):
+    analysis_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class CaseNoteCreateRequest(Contract):
+    note: str = Field(min_length=1, max_length=4000)
+
+    @model_validator(mode="after")
+    def normalize_note(self):
+        self.note = self.note.strip()
+        if not self.note:
+            raise ValueError("note must not be blank")
+        return self
+
+
+class CaseSummary(Contract):
+    id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    title: str = Field(max_length=160)
+    description: str = Field(max_length=4000)
+    status: CaseStatus
+    severity: CaseSeverity
+    tags: list[CaseTag] = Field(max_length=20)
+    created_at: str = Field(max_length=40)
+    updated_at: str = Field(max_length=40)
+    analysis_count: int = Field(ge=0, le=100)
+    note_count: int = Field(ge=0, le=100)
+
+
+class CaseAnalysis(Contract):
+    analysis_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    capture_filename: str | None = Field(default=None, max_length=255)
+    state: str = Field(max_length=32)
+    linked_at: str = Field(max_length=40)
+
+
+class CaseNote(Contract):
+    id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    note: str = Field(max_length=4000)
+    created_at: str = Field(max_length=40)
+
+
+class CaseDetail(CaseSummary):
+    analyses: list[CaseAnalysis] = Field(max_length=100)
+    notes: list[CaseNote] = Field(max_length=100)
+
+
+class CaseListResponse(Contract):
+    items: list[CaseSummary] = Field(max_length=100)
+    total: int = Field(ge=0)
+
+
+ScopedKeyScope = Literal[
+    "read:status",
+    "read:manifest",
+    "read:evidence",
+    "read:report",
+    "read:analyses",
+    "write:analyses",
+    "read:cases",
+    "write:cases",
+    "read:osint",
+    "write:osint",
+    "export:reports",
+    "admin:keys",
+]
+
+
+class ScopedKeyCreateRequest(Contract):
+    name: str = Field(min_length=1, max_length=120)
+    scopes: list[ScopedKeyScope] = Field(min_length=1, max_length=12)
+    expires_in_days: int | None = Field(default=30, ge=1, le=365)
+    quota_limit: int = Field(default=1000, ge=1, le=1_000_000)
+    rate_limit_rpm: int = Field(default=60, ge=1, le=6000)
+
+    @model_validator(mode="after")
+    def clean_key_fields(self):
+        self.name = self.name.strip()
+        if not self.name:
+            raise ValueError("name must not be blank")
+        if len(set(self.scopes)) != len(self.scopes):
+            raise ValueError("scopes must be unique")
+        return self
+
+
+class OSINTKeyRotateRequest(Contract):
+    provider: Literal["virustotal", "abuseipdb", "greynoise", "shodan", "otx"]
+    api_key: str = Field(min_length=4, max_length=256)
+    invalidate_cache: bool = True
+
+
+class CaseIOCCreateRequest(Contract):
+    ioc_type: Literal["ip", "ipv4", "ipv6", "domain", "md5", "sha1", "sha256", "ja3"]
+    value: str = Field(min_length=1, max_length=255)
+    severity: CaseSeverity = "medium"
+    tags: list[CaseTag] = Field(default_factory=list, max_length=20)
+    note: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def clean_ioc_fields(self):
+        self.value = self.value.strip()
+        if not self.value:
+            raise ValueError("value must not be blank")
+        self.tags = [tag.strip() for tag in self.tags if tag.strip()]
+        self.note = self.note.strip()
+        return self
+
+
+class AIConfigUpdateRequest(Contract):
+    """Loopback-only runtime update of non-secret AI narrator configuration."""
+
+    enabled: StrictBool | None = None
+    provider: Literal["openai_compatible", "anthropic", "manus"] | None = None
+    base_url: str | None = Field(default=None, max_length=500)
+    allowed_origins: list[str] | None = Field(default=None, max_length=20)
+    model: str | None = Field(default=None, max_length=200)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    data_boundary: Literal["local", "remote"] | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=600)
+    retries: int | None = Field(default=None, ge=0, le=2)
+    input_max_bytes: int | None = Field(default=None, ge=1, le=2_000_000)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=16_384)
+    context_window_tokens: int | None = Field(default=None, ge=1, le=2_000_000)
+    token_parameter: Literal["max_tokens", "max_completion_tokens"] | None = None
+    response_mode: Literal["json_schema", "json_object", "text"] | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    anthropic_version: str | None = Field(default=None, min_length=1, max_length=64)
+    preset: str | None = Field(default=None, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one AI configuration field is required")
+        return self
+
+
+class AICredentialUpdateRequest(Contract):
+    """Loopback-only in-memory API key registration (never persisted to disk or echoed)."""
+
+    # Credential slot: a wire provider (openai_compatible/anthropic/manus) or a
+    # catalog preset id (e.g. "openai", "groq").  Unknown slots are rejected.
+    provider: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")
+    api_key: str = Field(min_length=4, max_length=4096)
+
+
+class AIModelProbeRequest(Contract):
+    """Non-secret endpoint parameters for probing available provider models."""
+
+    provider: Literal["openai_compatible", "anthropic", "manus"] | None = None
+    base_url: str | None = Field(default=None, max_length=500)
+    allowed_origins: list[str] | None = Field(default=None, max_length=20)
+    api_key_env: str | None = Field(default=None, max_length=128)
+    data_boundary: Literal["local", "remote"] | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=120)
+    anthropic_version: str | None = Field(default=None, min_length=1, max_length=64)
+    preset: str | None = Field(default=None, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")
+
+
+class JobsPruneRequest(Contract):
+    """Bounded parameters for pruning historical terminal analyses."""
+
+    keep_latest: int = Field(default=20, ge=0, le=500)
+    max_age_hours: int | None = Field(default=None, ge=1, le=8760)

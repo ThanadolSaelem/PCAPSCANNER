@@ -1,0 +1,11 @@
+.venv
+.venv*
+__pycache__
+*.py[cod]
+.pytest_cache
+dist
+build
+*.egg-info
+.git
+.DS_Store
+models

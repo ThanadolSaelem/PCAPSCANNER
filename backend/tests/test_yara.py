@@ -67,8 +67,21 @@ def test_recursive_output_budget_counts_nested_objects_and_rejects_symlinks(tmp_
     assert bounded_directory_size(root, 100) == (101, True)
 
 
-def test_yara_configuration_is_default_off_and_caps_are_validated() -> None:
-    assert AppSettings().yara_enabled is False
+def test_local_stage_configuration_is_default_on_and_caps_are_validated() -> None:
+    defaults = AppSettings()
+    assert defaults.zeek_enabled is True
+    assert defaults.yara_enabled is True
+    assert defaults.osint_enabled is True
+    assert defaults.yara_rules_dir == Path("./yara-rules")
+    assert AppSettings.model_validate(
+        _env_overlay(
+            {
+                "PCAP_ZEEK_ENABLED": "0",
+                "PCAP_YARA_ENABLED": "0",
+                "PCAP_OSINT_ENABLED": "0",
+            }
+        )
+    ).model_dump()["yara_enabled"] is False
     config = AppSettings.model_validate(
         _env_overlay(
             {
@@ -94,6 +107,26 @@ def test_yara_configuration_is_default_off_and_caps_are_validated() -> None:
             yara_max_total_bytes=192 * 1024 * 1024,
             yara_max_output_bytes=16 * 1024 * 1024,
         )
+
+
+def test_default_on_yara_skips_cleanly_when_no_operator_rules_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "empty-rules.pcap"
+    capture.write_bytes(b"synthetic capture placeholder")
+    rules = tmp_path / "empty-rules"
+    rules.mkdir()
+    monkeypatch.setattr("backend.app.pipeline.shutil.which", lambda name: f"/usr/bin/{name}")
+    limits = _get_limits(AppSettings(yara_enabled=True, yara_rules_dir=rules))
+    stage, matches = _run_yara(
+        capture,
+        limits=limits,
+        deadline=time.monotonic() + 5,
+        is_cancelled=lambda: False,
+    )
+    assert stage.state == "skipped"
+    assert "no .yar/.yara signatures" in stage.detail
+    assert matches == []
 
 
 def test_yara_match_is_evidence_with_no_raw_payload_or_external_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -122,7 +122,7 @@ class _BatchMultipartParser:
         # stored, returned, logged, or used to build a filesystem path.
         basename = filename.replace(b"\\", b"/").rsplit(b"/", 1)[-1]
         suffix = basename.rsplit(b".", 1)[-1].lower() if b"." in basename else b""
-        if suffix not in {b"pcap", b"pcapng", b"cap"}:
+        if suffix not in {b"pcap", b"pcapng", b"cap", b"csv", b"tsv"}:
             raise BatchUploadError("invalid_capture_suffix")
         self._file_count += 1
         if self._file_count > self.max_files:
@@ -137,6 +137,7 @@ class _BatchMultipartParser:
         self._current = {
             "path": path, "handle": handle, "size": 0, "digest": hashlib.sha256(),
             "prefix": bytearray(), "buffer": bytearray(), "complete": False,
+            "suffix": suffix.decode("ascii"),
         }
 
     def on_part_data(self, data: bytes, start: int, end: int) -> None:
@@ -152,8 +153,8 @@ class _BatchMultipartParser:
             raise BatchUploadError("batch_total_size_exceeded", 413)
         view = memoryview(data)[start:end]
         current["digest"].update(view)
-        if len(current["prefix"]) < 28:
-            current["prefix"].extend(view[:28 - len(current["prefix"])])
+        if len(current["prefix"]) < 2048:
+            current["prefix"].extend(view[:2048 - len(current["prefix"])])
         current["size"] += size
         self.received_file_bytes += size
         current["buffer"].extend(view)
@@ -163,12 +164,27 @@ class _BatchMultipartParser:
         if current is None:
             raise BatchUploadError("invalid_multipart_body")
         prefix = bytes(current["prefix"])
-        if len(prefix) < 4 or prefix[:4] not in PCAP_MAGIC:
-            raise BatchUploadError("invalid_capture_magic")
-        minimum = 28 if prefix[:4] == b"\x0a\x0d\x0d\x0a" else 24
-        if current["size"] < minimum:
-            raise BatchUploadError("invalid_capture_header")
-        current["format"] = "pcapng" if prefix[:4] == b"\x0a\x0d\x0d\x0a" else "pcap"
+        suffix = str(current.get("suffix") or "")
+        if suffix in {"csv", "tsv"}:
+            sample = prefix[:2048].lstrip(b"\xef\xbb\xbf")
+            if len(sample) >= 4 and sample[:4] in PCAP_MAGIC:
+                raise BatchUploadError("invalid_capture_magic")
+            if current["size"] < 12 or b"\x00" in sample:
+                raise BatchUploadError("invalid_capture_header")
+            first_line = sample.decode("utf-8", errors="ignore").lower().splitlines()[0] if sample else ""
+            has_time = "time" in first_line
+            has_src = ("source" in first_line) or ("src" in first_line)
+            has_dst = ("destination" in first_line) or ("dst" in first_line)
+            if not (has_time and has_src and has_dst):
+                raise BatchUploadError("invalid_capture_header")
+            current["format"] = "tsv" if (suffix == "tsv" or first_line.count("\t") >= first_line.count(",")) else "csv"
+        else:
+            if len(prefix) < 4 or prefix[:4] not in PCAP_MAGIC:
+                raise BatchUploadError("invalid_capture_magic")
+            minimum = 28 if prefix[:4] == b"\x0a\x0d\x0d\x0a" else 24
+            if current["size"] < minimum:
+                raise BatchUploadError("invalid_capture_header")
+            current["format"] = "pcapng" if prefix[:4] == b"\x0a\x0d\x0d\x0a" else "pcap"
         current["complete"] = True
         self._finished_pending.append(current)
         self._current = None

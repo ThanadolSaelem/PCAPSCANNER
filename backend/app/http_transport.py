@@ -36,6 +36,7 @@ def post_json_bounded(
     transport: httpx.BaseTransport | None = None,
     deadline_monotonic: float | None = None,
     cancellation_check: Callable[[], bool] | None = None,
+    bearer_token: str | None = None,
 ) -> Any | None:
     """POST bounded JSON, with a hard total deadline and cooperative cancellation.
 
@@ -56,6 +57,10 @@ def post_json_bounded(
         deadline = min(local_deadline, deadline_monotonic) if deadline_monotonic is not None else local_deadline
         if deadline <= now or _is_cancelled(cancellation_check):
             return None
+
+        req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if bearer_token and bearer_token.strip():
+            req_headers["Authorization"] = f"Bearer {bearer_token.strip()}"
 
         limits = httpx.Limits(max_connections=1, max_keepalive_connections=0)
         state_lock = threading.Lock()
@@ -99,7 +104,7 @@ def post_json_bounded(
                     "POST",
                     url,
                     content=body,
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    headers=req_headers,
                 ) as response:
                     with state_lock:
                         active["response"] = response

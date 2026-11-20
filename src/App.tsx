@@ -1,8 +1,13 @@
-import type { ChangeEvent, DragEvent, ReactNode } from "react";
+import type { CSSProperties, ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AIConfigResponse,
+  AIConfigUpdatePayload,
+  AIModelProbePayload,
   AIModelsResponse,
+  AIProviderName,
+  AIProviderPreset,
+  GroundedChatResponse,
   JobSummary,
   LocalBrowseResponse,
   NativePickPurpose,
@@ -12,9 +17,19 @@ import type {
   WorkspaceConfigState,
 } from "./api/client";
 import { ApiProblemError, PcapApiClient, normalizeBaseUrl } from "./api/client";
+import { AnalyticsVisuals } from "./components/AnalyticsVisuals";
 import ArchitectureExplorer from "./components/ArchitectureExplorer";
 import BatchIntakePanel from "./components/BatchIntakePanel";
+import CasesPage from "./components/CasesPage";
+import { InteractiveTimelineChart } from "./components/InteractiveTimelineChart";
+import ModelSettingsPanel, { type ModelSettingsStatus } from "./components/ModelSettingsPanel";
+import OSINTPanel from "./components/OSINTPanel";
+import { WorldFlowMap } from "./components/WorldFlowMap";
+import { PrivacyRedactor } from "./utils/privacy";
+import { animateScrollToElement } from "./utils/smoothScroll";
+import type { TimelineBucketDetail } from "./utils/timelineEvents";
 import type {
+  PillTone,
   WorkspaceFinding,
   WorkspaceFlow,
   WorkspacePacket,
@@ -24,6 +39,7 @@ import type {
 } from "./utils/adapters";
 import {
   adaptBackendReport,
+  describeEtbertExecution,
   emptyWorkspaceReport,
   exportReportJson,
   exportReportMarkdown,
@@ -33,12 +49,33 @@ import {
   formatCompactCount,
   formatDuration,
   packetCoverageSummary,
+  resolveLayer1Status,
+  resolveRunConsentState,
 } from "./utils/adapters";
 import type { CaptureHeaderInspection } from "./utils/localAnalyzer";
 import { analyzeLocalCsvFile, inspectCaptureFile } from "./utils/localAnalyzer";
 import { resolveBatchLimits } from "./utils/batchLimits";
 
-type Screen = "overview" | "analyze" | "jobs" | "findings" | "traffic" | "reports" | "architecture";
+type Screen = "overview" | "analyze" | "jobs" | "findings" | "traffic" | "cases" | "reports" | "architecture";
+type ToastTone = "success" | "info" | "warn" | "error";
+
+interface TrafficJumpRequest {
+  nonce: number;
+  packetNo?: number | null;
+  flowId?: string | null;
+  evidenceId?: string | null;
+  bucketIndex?: number | null;
+  preferView?: "packets" | "flows";
+  reasonLabel?: string;
+}
+
+interface ToastItem {
+  id: number;
+  title: string;
+  detail?: string;
+  tone: ToastTone;
+  durationMs?: number;
+}
 type IconName =
   | "grid"
   | "upload"
@@ -62,10 +99,12 @@ type IconName =
   | "menu"
   | "close"
   | "file"
-  | "external";
+  | "external"
+  | "sliders";
 
 type ConnectionStatus = "checking" | "connected" | "auth_required" | "offline";
-type SourceTab = "upload" | "local";
+type SourceTab = "upload" | "local" | "batch";
+type SettingsTab = "ai" | "storage" | "connection";
 
 const STORAGE_URL_KEY = "pcapscanner.backendUrl";
 const SESSION_TOKEN_KEY = "pcapscanner.token";
@@ -76,6 +115,7 @@ const PATHS: Record<Screen, string> = {
   jobs: "/jobs",
   findings: "/findings",
   traffic: "/traffic",
+  cases: "/cases",
   reports: "/reports",
   architecture: "/architecture",
 };
@@ -104,6 +144,7 @@ const ICON_PATH: Record<IconName, string> = {
   close: "m6 6 12 12M18 6 6 18",
   file: "M6 3h8l5 5v13H6z M14 3v5h5M9 13h7m-7 4h7",
   external: "M14 4h6v6m0-6-9 9M18 13v6H4V5h6",
+  sliders: "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
 };
 
 const NAV_GROUPS: { group: string; items: { id: Screen; label: string; icon: IconName }[] }[] = [
@@ -120,6 +161,7 @@ const NAV_GROUPS: { group: string; items: { id: Screen; label: string; icon: Ico
     items: [
       { id: "findings", label: "Findings", icon: "alert" },
       { id: "traffic", label: "Packet explorer", icon: "packets" },
+      { id: "cases", label: "Investigation cases", icon: "report" },
     ],
   },
   {
@@ -132,6 +174,7 @@ const NAV_GROUPS: { group: string; items: { id: Screen; label: string; icon: Ico
 ];
 
 const ACTIVE_STATES = new Set<JobSummary["state"]>(["queued", "parsing", "awaiting_ai", "generating"]);
+const JOBS_PAGE_SIZE = 20;
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   return (
@@ -216,7 +259,15 @@ function safeEndpointOrigin(value?: string | null): string | null {
 }
 
 function safeFormatError(err: unknown): string {
-  if (err instanceof ApiProblemError) return err.message;
+  if (err instanceof ApiProblemError) {
+    if (err.code === "ai_disabled_by_operator") {
+      return "ai_disabled_by_operator: Layer-2 AI ถูกปิดอยู่ (กด 'เปิดใช้งาน Layer-2 AI' หรือเปิดใน Workspace Settings)";
+    }
+    if (err.code === "ai_model_not_configured") {
+      return "ai_model_not_configured: Layer-2 AI เปิดใช้งานอยู่แล้ว — กรุณาเลือก Model (หรือกด Detect Local Models)";
+    }
+    return err.message;
+  }
   if (err instanceof Error) return err.message;
   return "เกิดข้อผิดพลาดในการเชื่อมต่อ";
 }
@@ -244,6 +295,7 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [connectionError, setConnectionError] = useState<string>("");
   const [connectionModalOpen, setConnectionModalOpen] = useState(false);
+  const [connectionModalTab, setConnectionModalTab] = useState<SettingsTab>("ai");
   const [caseDropdownOpen, setCaseDropdownOpen] = useState(false);
 
   // Live backend metadata & queue
@@ -251,10 +303,15 @@ function App() {
   const [workspaceConfig, setWorkspaceConfig] = useState<WorkspaceConfigState | null>(null);
   const [aiConfig, setAiConfig] = useState<AIConfigResponse | null>(null);
   const [aiModels, setAiModels] = useState<AIModelsResponse | null>(null);
+  const [aiProviders, setAiProviders] = useState<AIProviderPreset[] | null>(null);
   const [localBrowse, setLocalBrowse] = useState<LocalBrowseResponse | null>(null);
   const [jobs, setJobs] = useState<JobSummary[]>([]);
+  const [jobsTotal, setJobsTotal] = useState(0);
+  const [jobsPage, setJobsPage] = useState(0);
+  const [jobsMutating, setJobsMutating] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isPickingPath, setIsPickingPath] = useState(false);
+  const [privacyMode, setPrivacyMode] = useState(false);
 
   // Active report is empty until a real backend or local CSV analysis is selected.
   const [activeReport, setActiveReport] = useState<WorkspaceReport>(() => emptyWorkspaceReport());
@@ -266,6 +323,8 @@ function App() {
   const [protocolFilter, setProtocolFilter] = useState("All protocols");
   const [packetSearch, setPacketSearch] = useState("");
   const [trafficView, setTrafficView] = useState<"packets" | "flows">("packets");
+  const [trafficJump, setTrafficJump] = useState<TrafficJumpRequest | null>(null);
+  const jumpNonceRef = useRef(0);
 
   // Analyze page state
   const [sourceTab, setSourceTab] = useState<SourceTab>("upload");
@@ -278,6 +337,7 @@ function App() {
   const [triageEndpointConsent, setTriageEndpointConsent] = useState(false);
   const [aiEnabled, setAiEnabled] = useState(false);
   const [aiConsent, setAiConsent] = useState(false);
+  const [consentPromptNonce, setConsentPromptNonce] = useState(0);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [uploadPaused, setUploadPaused] = useState(false);
   const [resumeUploadId, setResumeUploadId] = useState<string | null>(null);
@@ -285,17 +345,34 @@ function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [localCsvProgress, setLocalCsvProgress] = useState<number | null>(null);
 
-  const [toast, setToast] = useState("");
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  const openConnectionModal = useCallback(
+    (tab?: SettingsTab) => {
+      setConnectionModalTab(tab ?? (connectionStatus === "connected" ? "ai" : "connection"));
+      setConnectionModalOpen(true);
+    },
+    [connectionStatus],
+  );
 
   const uploadAbortRef = useRef<AbortController | null>(null);
   const pauseRequestedRef = useRef(false);
   const autoLoadedJobRef = useRef<string | null>(null);
   const userSetResourceModeRef = useRef(false);
+  const jobsPageRef = useRef(0);
+  jobsPageRef.current = jobsPage;
   const workspaceRefreshGenerationRef = useRef(0);
+  const toastSeqRef = useRef(0);
+  const toastTimersRef = useRef<Map<number, number>>(new Map());
 
   const api = useMemo(() => new PcapApiClient(backendUrl, bearerToken), [backendUrl, bearerToken]);
   const workspaceApiRef = useRef(api);
   const consentPolicyRef = useRef<string | null>(null);
+  const redactor = useMemo(() => new PrivacyRedactor(privacyMode), [privacyMode]);
+  const displayReport = useMemo(
+    () => (privacyMode ? redactor.redactReport(activeReport) : activeReport),
+    [activeReport, privacyMode, redactor],
+  );
 
   useEffect(() => {
     const nextPolicy = aiConfig?.policy_hash ?? null;
@@ -306,7 +383,13 @@ function App() {
     consentPolicyRef.current = nextPolicy;
   }, [aiConfig?.policy_hash]);
 
-  const activeFindingList = activeReport.findings;
+  useEffect(() => {
+    if (!aiConfig) return;
+    const ready = Boolean(aiConfig.configuration.enabled && aiConfig.configuration.model);
+    if (!ready) setAiConsent(false);
+  }, [aiConfig]);
+
+  const activeFindingList = displayReport.findings;
   const selectedFinding: WorkspaceFinding | null =
     activeFindingList.find((f) => f.id === selectedFindingId) ?? activeFindingList[0] ?? null;
 
@@ -322,19 +405,62 @@ function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(""), 3800);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+  const dismissToast = useCallback((id: number) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
 
-  const navigate = useCallback((next: Screen) => {
+  const pushToast = useCallback(
+    (title: string, tone: ToastTone = "info", detail?: string, durationMs = 4500) => {
+      const id = ++toastSeqRef.current;
+      setToasts((prev) => {
+        const overflow = prev.slice(0, Math.max(0, prev.length - 3));
+        for (const dropped of overflow) {
+          const oldTimer = toastTimersRef.current.get(dropped.id);
+          if (oldTimer !== undefined) {
+            window.clearTimeout(oldTimer);
+            toastTimersRef.current.delete(dropped.id);
+          }
+        }
+        return [...prev.slice(-3), { id, title, detail, tone, durationMs }];
+      });
+      const timer = window.setTimeout(() => {
+        toastTimersRef.current.delete(id);
+        setToasts((prev) => prev.filter((item) => item.id !== id));
+      }, durationMs);
+      toastTimersRef.current.set(id, timer);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const timers = toastTimersRef.current;
+    return () => {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
+
+  const navigate = useCallback((next: Screen, options?: { scrollMode?: "smooth" | "instant" | "none" }) => {
     const nextPath = PATHS[next];
     if (window.location.pathname !== nextPath) window.history.pushState({}, "", nextPath);
     setScreen(next);
     setSidebarOpen(false);
     setCaseDropdownOpen(false);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    const mode = options?.scrollMode ?? "smooth";
+    if (mode === "smooth") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (mode === "instant") {
+      try {
+        window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+      } catch {
+        window.scrollTo(0, 0);
+      }
+    }
   }, []);
 
   const refreshWorkspace = useCallback(
@@ -362,13 +488,12 @@ function App() {
           );
           return;
         }
-        const [capsRes, wsRes, cfgRes, modelsRes, browseRes, jobsRes] = await Promise.allSettled([
+        const [capsRes, wsRes, cfgRes, browseRes, jobsRes] = await Promise.allSettled([
           api.getCapabilities(),
           api.getWorkspaceConfig(),
           api.getAiConfig(),
-          api.getAiModels(),
           api.browseLocalCaptures(),
-          api.listJobs(50),
+          api.listJobsPage(JOBS_PAGE_SIZE, jobsPageRef.current * JOBS_PAGE_SIZE),
         ]);
         if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
 
@@ -378,7 +503,7 @@ function App() {
             setCapabilities(null);
             setConnectionStatus("auth_required");
             setConnectionError(reason.message);
-            if (!quiet) setToast(reason.message);
+            if (!quiet) pushToast("Backend ต้องการการยืนยันตัวตน", "error", reason.message);
             return;
           }
           throw reason;
@@ -398,19 +523,62 @@ function App() {
         } else setCapabilities(null);
         if (wsRes.status === "fulfilled") setWorkspaceConfig(wsRes.value);
         if (cfgRes.status === "fulfilled") setAiConfig(cfgRes.value);
-        if (modelsRes.status === "fulfilled") setAiModels(modelsRes.value);
         if (browseRes.status === "fulfilled") setLocalBrowse(browseRes.value);
-        setJobs(jobsRes.value);
-        if (!quiet) setToast("เชื่อมต่อ FastAPI backend สำเร็จ");
+        const pageData = jobsRes.value;
+        const maxPage = Math.max(0, Math.ceil(pageData.total / JOBS_PAGE_SIZE) - 1);
+        if (jobsPageRef.current > maxPage) {
+          try {
+            const clamped = await api.listJobsPage(JOBS_PAGE_SIZE, maxPage * JOBS_PAGE_SIZE);
+            if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
+            setJobs(clamped.items);
+            setJobsTotal(clamped.total);
+            setJobsPage(maxPage);
+          } catch {
+            setJobs(pageData.items);
+            setJobsTotal(pageData.total);
+          }
+        } else {
+          setJobs(pageData.items);
+          setJobsTotal(pageData.total);
+        }
+        if (!quiet) pushToast("เชื่อมต่อ FastAPI backend สำเร็จ", "success");
+
+        void api
+          .getAiProviders()
+          .then((res) => {
+            if (requestGeneration === workspaceRefreshGenerationRef.current) {
+              setAiProviders(res.items);
+            }
+          })
+          .catch(() => {
+            // Older backends lack the catalog endpoint; the panel falls back to built-in presets.
+          });
+
+        void api
+          .getAiModels()
+          .then((modelsRes) => {
+            if (requestGeneration === workspaceRefreshGenerationRef.current) {
+              setAiModels(modelsRes);
+            }
+          })
+          .catch(() => {
+            // Non-blocking catalog discovery; explicit Probe reports errors cleanly.
+          });
       } catch (err) {
         if (requestGeneration !== workspaceRefreshGenerationRef.current) return;
         setCapabilities(null);
         setConnectionStatus("offline");
         setConnectionError(safeFormatError(err));
-        if (!quiet) setToast("ไม่สามารถติดต่อ backend API — เชื่อมต่อ Backend เพื่อดูคิวและวิเคราะห์ capture");
+        if (!quiet) {
+          pushToast(
+            "ไม่สามารถติดต่อ backend API",
+            "error",
+            "เชื่อมต่อ Backend เพื่อดูคิวและวิเคราะห์ capture",
+          );
+        }
       }
     },
-    [api, bearerToken],
+    [api, bearerToken, pushToast],
   );
 
   // Probe backend on mount / credentials change
@@ -418,23 +586,47 @@ function App() {
     void refreshWorkspace(true);
   }, [refreshWorkspace]);
 
+  const loadJobsPage = useCallback(
+    async (targetPage: number) => {
+      if (connectionStatus !== "connected") return;
+      const safePage = Math.max(0, Math.trunc(targetPage));
+      try {
+        let res = await api.listJobsPage(JOBS_PAGE_SIZE, safePage * JOBS_PAGE_SIZE);
+        const maxPage = Math.max(0, Math.ceil(res.total / JOBS_PAGE_SIZE) - 1);
+        if (safePage > maxPage) {
+          res = await api.listJobsPage(JOBS_PAGE_SIZE, maxPage * JOBS_PAGE_SIZE);
+          setJobsPage(maxPage);
+        } else {
+          setJobsPage(safePage);
+        }
+        setJobs(res.items);
+        setJobsTotal(res.total);
+      } catch (err) {
+        pushToast("โหลดคิวงานไม่สำเร็จ", "error", safeFormatError(err));
+      }
+    },
+    [api, connectionStatus, pushToast],
+  );
+
   const loadBackendReport = useCallback(
     async (analysisId: string, targetScreen?: Screen) => {
       try {
         const raw = await api.getReport(analysisId);
         const adapted = adaptBackendReport(raw);
+        autoLoadedJobRef.current = analysisId;
         setActiveReport(adapted);
         setActiveJobId(analysisId);
         setSelectedFindingId(adapted.findings[0]?.id ?? "");
         setProtocolFilter("All protocols");
         setPacketSearch("");
-        setToast(`โหลดผลวิเคราะห์ ${adapted.fileName} (${adapted.findings.length} findings)`);
+        const displayName = privacyMode ? redactor.redactFilename(adapted.fileName) : adapted.fileName;
+        pushToast(`โหลดผลวิเคราะห์ ${displayName}`, "success", `${adapted.findings.length} deterministic findings`);
         if (targetScreen) navigate(targetScreen);
       } catch (err) {
-        setToast(safeFormatError(err));
+        pushToast("โหลดรายงานไม่สำเร็จ", "error", safeFormatError(err));
       }
     },
-    [api, navigate],
+    [api, navigate, privacyMode, pushToast, redactor],
   );
 
   // Poll live job queue while any job is running
@@ -443,10 +635,18 @@ function App() {
     if (connectionStatus !== "connected" || !hasRunningJobs) return;
     const timer = window.setInterval(async () => {
       try {
-        const updated = await api.listJobs(50);
-        setJobs(updated);
+        const updatedPage = await api.listJobsPage(JOBS_PAGE_SIZE, jobsPageRef.current * JOBS_PAGE_SIZE);
+        setJobs(updatedPage.items);
+        setJobsTotal(updatedPage.total);
         if (activeJobId && autoLoadedJobRef.current !== activeJobId) {
-          const target = updated.find((j) => j.id === activeJobId);
+          let target = updatedPage.items.find((j) => j.id === activeJobId);
+          if (!target) {
+            try {
+              target = await api.getJob(activeJobId);
+            } catch {
+              target = undefined;
+            }
+          }
           if (target && target.evidence_available && !ACTIVE_STATES.has(target.state)) {
             autoLoadedJobRef.current = activeJobId;
             await loadBackendReport(activeJobId);
@@ -461,7 +661,14 @@ function App() {
 
   // Select the first completed backend job automatically from the empty workspace state.
   useEffect(() => {
-    if (connectionStatus !== "connected" || jobs.length === 0 || activeReport.origin !== "empty") return;
+    if (
+      connectionStatus !== "connected" ||
+      jobs.length === 0 ||
+      activeReport.origin !== "empty" ||
+      autoLoadedJobRef.current === "__manual_clear__"
+    ) {
+      return;
+    }
     const readyJob = jobs.find((j) => j.evidence_available);
     if (readyJob && autoLoadedJobRef.current !== readyJob.id) {
       autoLoadedJobRef.current = readyJob.id;
@@ -494,28 +701,51 @@ function App() {
       setSelectedFindingId(report.findings[0]?.id ?? "");
       setProtocolFilter("All protocols");
       setPacketSearch("");
-      setToast(`วิเคราะห์ CSV ในเครื่องเสร็จสิ้น (${formatCompactCount(report.packetsAnalyzed)} packets · ${report.findings.length} findings)`);
+      pushToast(
+        "วิเคราะห์ CSV ในเครื่องเสร็จสิ้น",
+        "success",
+        `${formatCompactCount(report.packetsAnalyzed)} packets · ${report.findings.length} findings`,
+      );
       navigate(report.findings.length > 0 ? "findings" : "overview");
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("สแกน CSV ไม่สำเร็จ", "error", safeFormatError(err));
     } finally {
       setLocalCsvProgress(null);
     }
   };
 
-  const handleUploadAndAnalyze = async () => {
+  const handleUploadAndAnalyze = async (options: { forceOffline?: boolean } = {}) => {
     if (!selectedFile || isSubmitting) return;
-    if (aiEnabled && !aiConsent) {
-      setToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์");
-      return;
-    }
-    if (aiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
-      setToast("Backend ยังไม่เปิดใช้ AI provider หรือยังไม่ระบุ model");
-      return;
-    }
     if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
-      setToast("เชื่อมต่อ Backend API ก่อนอัปโหลดไฟล์ไบนารี (หรือใช้โหมด Local CSV)");
+      openConnectionModal("connection");
+      pushToast("เชื่อมต่อ Backend API ก่อนอัปโหลดไฟล์ไบนารี", "warn", "หรือใช้โหมด Local CSV ในเบราว์เซอร์");
+      return;
+    }
+    const effectiveAiEnabled = options.forceOffline ? false : aiEnabled;
+    const effectiveAiConsent = options.forceOffline ? false : aiConsent;
+    const effectiveTriageEndpointConsent = options.forceOffline ? false : triageEndpointConsent;
+    if (options.forceOffline) {
+      setAiEnabled(false);
+      setAiConsent(false);
+      setTriageEndpointConsent(false);
+    }
+
+    if (effectiveAiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
+      setConsentPromptNonce((n) => n + 1);
+      pushToast(
+        "Layer-2 AI ยังไม่พร้อมใช้งาน",
+        "warn",
+        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'วิเคราะห์แบบ Offline ทันที'",
+      );
+      return;
+    }
+    if (effectiveAiEnabled && !effectiveAiConsent) {
+      setConsentPromptNonce((n) => n + 1);
+      pushToast(
+        "กรุณาติ๊กยืนยัน Consent สำหรับ AI Narrative",
+        "warn",
+        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'วิเคราะห์แบบ Offline ทันที'",
+      );
       return;
     }
 
@@ -528,7 +758,7 @@ function App() {
     try {
       const chunkSize = capabilities?.profiles[resourceMode]?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes;
       if (!chunkSize || !Number.isSafeInteger(chunkSize) || chunkSize <= 0) {
-        setToast("ไม่สามารถยืนยันขนาด chunk จาก Backend ได้ — โหลด capabilities ก่อนอัปโหลด");
+        pushToast("ไม่สามารถยืนยันขนาด chunk จาก Backend ได้", "error", "โหลด capabilities ก่อนอัปโหลด");
         return;
       }
       const receipt = await api.uploadCapture(selectedFile, {
@@ -547,27 +777,33 @@ function App() {
       setResumeOffset(0);
       const job = await api.startAnalysis({
         captureId: receipt.capture_id,
-        aiEnabled,
-        aiConsent,
+        aiEnabled: effectiveAiEnabled,
+        aiConsent: effectiveAiConsent,
         resourceMode,
         triageEnabled,
-        triageEndpointConsent,
+        triageEndpointConsent: effectiveTriageEndpointConsent,
       });
       autoLoadedJobRef.current = null;
       setActiveJobId(job.id);
-      const updated = await api.listJobs(50);
-      setJobs(updated);
-      setToast(`ส่งงานวิเคราะห์แล้ว (${job.id.slice(0, 8)})`);
+      setJobsPage(0);
+      const pageRes = await api.listJobsPage(JOBS_PAGE_SIZE, 0);
+      setJobs(pageRes.items);
+      setJobsTotal(pageRes.total);
+      pushToast(
+        `ส่งงานวิเคราะห์แล้ว (${job.id.slice(0, 8)})`,
+        "success",
+        effectiveAiEnabled ? "รัน Layer-1 Tier-1 + Layer-2 AI Narrator" : "รัน Deterministic + Layer-1 Tier-1/ET-BERT (Offline)",
+      );
       navigate("jobs");
     } catch (err) {
       if (pauseRequestedRef.current) {
         setUploadPaused(true);
         setUploadProgress((prev) => (prev ? { ...prev, phase: "paused" } : prev));
-        setToast("หยุดอัปโหลดชั่วคราวแล้ว — กด Resume เพื่ออัปโหลดต่อจาก offset เดิม");
+        pushToast("หยุดอัปโหลดชั่วคราวแล้ว", "warn", "กด Resume เพื่ออัปโหลดต่อจาก offset เดิม");
       } else if (err instanceof DOMException && err.name === "AbortError") {
-        setToast("ยกเลิกการอัปโหลดแล้ว");
+        pushToast("ยกเลิกการอัปโหลดแล้ว", "info");
       } else {
-        setToast(safeFormatError(err));
+        pushToast("อัปโหลดหรือเริ่มงานวิเคราะห์ไม่สำเร็จ", "error", safeFormatError(err));
       }
     } finally {
       setIsSubmitting(false);
@@ -595,18 +831,42 @@ function App() {
         // Ignore cleanup errors
       }
     }
-    setToast("ล้างไฟล์ชั่วคราวที่อัปโหลดค้างไว้แล้ว");
+    pushToast("ล้างไฟล์ชั่วคราวที่อัปโหลดค้างไว้แล้ว", "info");
   };
 
-  const handleRegisterLocalCapture = async () => {
+  const handleRegisterLocalCapture = async (options: { forceOffline?: boolean } = {}) => {
     const clean = localPathInput.trim();
     if ((!clean && !localFileGrantToken) || isSubmitting) return;
-    if (aiEnabled && !aiConsent) {
-      setToast("กรุณายืนยัน consent สำหรับ AI narrative ก่อนเริ่มวิเคราะห์");
+    if (connectionStatus !== "connected") {
+      openConnectionModal("connection");
+      pushToast("เชื่อมต่อ Backend API ก่อนลงทะเบียน Local Capture", "warn");
       return;
     }
-    if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
+    const effectiveAiEnabled = options.forceOffline ? false : aiEnabled;
+    const effectiveAiConsent = options.forceOffline ? false : aiConsent;
+    const effectiveTriageEndpointConsent = options.forceOffline ? false : triageEndpointConsent;
+    if (options.forceOffline) {
+      setAiEnabled(false);
+      setAiConsent(false);
+      setTriageEndpointConsent(false);
+    }
+
+    if (effectiveAiEnabled && (!aiConfig?.configuration.enabled || !aiConfig.configuration.model)) {
+      setConsentPromptNonce((n) => n + 1);
+      pushToast(
+        "Layer-2 AI ยังไม่พร้อมใช้งาน",
+        "warn",
+        "เลือก Model ในกล่องด้านบนปุ่มส่ง หรือกด 'วิเคราะห์แบบ Offline ทันที'",
+      );
+      return;
+    }
+    if (effectiveAiEnabled && !effectiveAiConsent) {
+      setConsentPromptNonce((n) => n + 1);
+      pushToast(
+        "กรุณาติ๊กยืนยัน Consent สำหรับ AI Narrative",
+        "warn",
+        "ช่องยืนยันแสดงอยู่เหนือปุ่มส่งงานแล้ว — หรือกด 'วิเคราะห์แบบ Offline ทันที'",
+      );
       return;
     }
     setIsSubmitting(true);
@@ -618,21 +878,23 @@ function App() {
       if (fileGrantToken) setLocalFileGrantToken(null);
       const job = await api.startAnalysis({
         captureId: receipt.capture_id,
-        aiEnabled,
-        aiConsent,
+        aiEnabled: effectiveAiEnabled,
+        aiConsent: effectiveAiConsent,
         resourceMode,
         triageEnabled,
-        triageEndpointConsent,
+        triageEndpointConsent: effectiveTriageEndpointConsent,
       });
       autoLoadedJobRef.current = null;
       setActiveJobId(job.id);
-      const updated = await api.listJobs(50);
-      setJobs(updated);
-      setToast(`ลงทะเบียน local capture (${formatBytes(receipt.size_bytes)}) และเข้าคิวงานแล้ว`);
+      setJobsPage(0);
+      const pageRes = await api.listJobsPage(JOBS_PAGE_SIZE, 0);
+      setJobs(pageRes.items);
+      setJobsTotal(pageRes.total);
+      pushToast(`ลงทะเบียน local capture (${formatBytes(receipt.size_bytes)}) และเข้าคิวงานแล้ว`, "success");
       navigate("jobs");
     } catch (err) {
       if (fileGrantToken) setLocalFileGrantToken(null);
-      setToast(safeFormatError(err));
+      pushToast("ลงทะเบียน local capture ไม่สำเร็จ", "error", safeFormatError(err));
     } finally {
       setIsSubmitting(false);
     }
@@ -642,52 +904,195 @@ function App() {
     try {
       const updated = await api.cancelJob(jobId);
       setJobs((prev) => prev.map((j) => (j.id === jobId ? updated : j)));
-      setToast(`ส่งคำขอยกเลิกงาน ${jobId.slice(0, 8)} แล้ว`);
+      pushToast(`ส่งคำขอยกเลิกงาน ${jobId.slice(0, 8)} แล้ว`, "info");
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("ยกเลิกงานไม่สำเร็จ", "error", safeFormatError(err));
+    }
+  };
+
+  const handleDeleteJob = async (jobId: string) => {
+    if (jobsMutating) return;
+    const target = jobs.find((j) => j.id === jobId);
+    const rawName = target?.capture_filename ?? `capture-${jobId.slice(0, 8)}`;
+    const displayName = privacyMode ? redactor.redactFilename(rawName) : rawName;
+    if (!window.confirm(`ลบงานวิเคราะห์ ${displayName} (${jobId.slice(0, 8)}) ออกจากฐานข้อมูลหรือไม่?`)) {
+      return;
+    }
+    setJobsMutating(true);
+    try {
+      await api.deleteJob(jobId);
+      if (activeJobId === jobId || (activeReport.origin === "live" && activeReport.analysisId === jobId)) {
+        autoLoadedJobRef.current = "__manual_clear__";
+        setActiveJobId(null);
+        setActiveReport(emptyWorkspaceReport());
+        setSelectedFindingId("");
+      }
+      await loadJobsPage(jobsPageRef.current);
+      pushToast(`ลบงาน ${jobId.slice(0, 8)} แล้ว`, "info");
+    } catch (err) {
+      pushToast("ลบงานไม่สำเร็จ", "error", safeFormatError(err));
+    } finally {
+      setJobsMutating(false);
+    }
+  };
+
+  const handlePruneJobs = async () => {
+    if (jobsMutating || connectionStatus !== "connected") return;
+    if (
+      !window.confirm(
+        `ล้างงานเก่าที่จบแล้วโดยเก็บ ${JOBS_PAGE_SIZE} งานล่าสุด (งานที่กำลังรันและงานที่ผูกกับ Investigation Case จะไม่ถูกลบ) หรือไม่?`,
+      )
+    ) {
+      return;
+    }
+    setJobsMutating(true);
+    try {
+      const res = await api.pruneJobs({ keep_latest: JOBS_PAGE_SIZE });
+      if (
+        (activeJobId && res.deleted_ids.includes(activeJobId)) ||
+        (activeReport.origin === "live" && res.deleted_ids.includes(activeReport.analysisId))
+      ) {
+        autoLoadedJobRef.current = "__manual_clear__";
+        setActiveJobId(null);
+        setActiveReport(emptyWorkspaceReport());
+        setSelectedFindingId("");
+      }
+      await loadJobsPage(0);
+      pushToast(
+        res.deleted_count > 0 ? `ล้างงานเก่า ${res.deleted_count} รายการแล้ว` : "ไม่มีงานเก่าที่เข้าเกณฑ์ล้าง",
+        "info",
+        `คงเหลือ ${res.remaining_count} รายการในฐานข้อมูล`,
+      );
+    } catch (err) {
+      pushToast("ล้างงานเก่าไม่สำเร็จ", "error", safeFormatError(err));
+    } finally {
+      setJobsMutating(false);
+    }
+  };
+
+  const jumpToTrafficEvidence = (
+    target: Omit<TrafficJumpRequest, "nonce">,
+    options?: {
+      search?: string;
+      protocol?: string;
+      clearFilters?: boolean;
+    },
+  ) => {
+    if (options?.clearFilters) {
+      setPacketSearch("");
+      setProtocolFilter("All protocols");
+      setSeverityFilter("all");
+    } else {
+      if (options?.search !== undefined) setPacketSearch(options.search);
+      if (options?.protocol !== undefined) setProtocolFilter(options.protocol);
+    }
+    const nextView =
+      target.preferView ??
+      (target.packetNo != null ? "packets" : target.flowId ? "flows" : "packets");
+    setTrafficView(nextView);
+    setTrafficJump({ ...target, nonce: ++jumpNonceRef.current });
+    if (screen !== "traffic") {
+      navigate("traffic", { scrollMode: "instant" });
     }
   };
 
   const openEvidence = (finding: WorkspaceFinding | null, evidenceId?: string) => {
+    const resolvedEv = evidenceId ?? finding?.evidence[0] ?? "";
     if (finding) {
       setSelectedFindingId(finding.id);
-      setPacketSearch(evidenceId ?? finding.evidence[0] ?? "");
+      setPacketSearch(resolvedEv);
     } else if (evidenceId) {
       setPacketSearch(evidenceId);
     }
     setProtocolFilter("All protocols");
+    setSeverityFilter("all");
     setTrafficView("packets");
-    navigate("traffic");
+    setTrafficJump({
+      nonce: ++jumpNonceRef.current,
+      evidenceId: resolvedEv || null,
+      preferView: "packets",
+      reasonLabel: finding ? finding.title : resolvedEv ? `Evidence ${resolvedEv}` : "Packet evidence",
+    });
+    navigate("traffic", { scrollMode: "instant" });
   };
 
-  const handleExport = async (kind: "json" | "markdown" | "triage-jsonl") => {
+  const handleExport = async (
+    kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
+  ) => {
     if (activeReport.origin === "empty") {
-      setToast("ยังไม่มีผลวิเคราะห์จริงให้ส่งออก");
+      pushToast("ยังไม่มีผลวิเคราะห์จริงให้ส่งออก", "warn");
       return;
     }
     const slug = activeReport.caseId.toLowerCase();
+    const exportOptions = { redact: privacyMode, redactor };
     if (kind === "json") {
-      downloadTextFile(`${slug}-report.json`, exportReportJson(activeReport), "application/json");
-      setToast(`ดาวน์โหลด ${slug}-report.json แล้ว`);
+      downloadTextFile(`${slug}-report.json`, exportReportJson(activeReport, exportOptions), "application/json");
+      pushToast(`ดาวน์โหลด ${slug}-report.json แล้ว`, "success");
       return;
     }
     if (kind === "markdown") {
-      downloadTextFile(`${slug}-report.md`, exportReportMarkdown(activeReport), "text/markdown");
-      setToast(`ดาวน์โหลด ${slug}-report.md แล้ว`);
+      downloadTextFile(`${slug}-report.md`, exportReportMarkdown(activeReport, exportOptions), "text/markdown");
+      pushToast(`ดาวน์โหลด ${slug}-report.md แล้ว`, "success");
       return;
     }
-    if (activeReport.origin === "live" && connectionStatus === "connected") {
+    if (kind === "stix" || kind === "csv" || kind === "cef" || kind === "navigator" || kind === "pdf") {
+      if (activeReport.origin !== "live" || connectionStatus !== "connected") {
+        pushToast(`${kind.toUpperCase()} export ต้องเชื่อมต่อ backend และใช้ผลวิเคราะห์ live`, "warn");
+        return;
+      }
+      try {
+        if (kind === "stix") {
+          const stix = await api.getStixJson(activeReport.analysisId, { redact: privacyMode });
+          downloadTextFile(`${slug}-stix-2.1.json`, stix, "application/stix+json");
+          pushToast(`ดาวน์โหลด ${slug}-stix-2.1.json แล้ว`, "success");
+        } else if (kind === "csv") {
+          const csv = await api.getExportCsv(activeReport.analysisId, { redact: privacyMode });
+          downloadTextFile(`${slug}-export.csv`, csv, "text/csv");
+          pushToast(`ดาวน์โหลด ${slug}-export.csv แล้ว`, "success");
+        } else if (kind === "cef") {
+          const cef = await api.getExportCef(activeReport.analysisId, { redact: privacyMode });
+          downloadTextFile(`${slug}-findings.cef`, cef, "text/plain");
+          pushToast(`ดาวน์โหลด ${slug}-findings.cef แล้ว`, "success");
+        } else if (kind === "navigator") {
+          const nav = await api.getExportNavigatorJson(activeReport.analysisId, { redact: privacyMode });
+          downloadTextFile(`${slug}-attack-navigator.json`, nav, "application/json");
+          pushToast(`ดาวน์โหลด ${slug}-attack-navigator.json แล้ว`, "success");
+        } else if (kind === "pdf") {
+          const blob = await api.getExportPdfBlob(activeReport.analysisId, { redact: privacyMode });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${slug}-report.pdf`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          pushToast(`ดาวน์โหลด ${slug}-report.pdf แล้ว`, "success");
+        }
+      } catch (err) {
+        pushToast("ส่งออกรายงานไม่สำเร็จ", "error", safeFormatError(err));
+      }
+      return;
+    }
+    if (activeReport.origin === "live" && connectionStatus === "connected" && !privacyMode) {
       try {
         const jsonl = await api.getTriageJsonl(activeReport.analysisId);
         downloadTextFile(`${slug}-triage.jsonl`, jsonl, "application/x-ndjson");
-        setToast(`ดาวน์โหลด ${slug}-triage.jsonl (จาก backend) แล้ว`);
+        pushToast(`ดาวน์โหลด ${slug}-triage.jsonl (จาก backend) แล้ว`, "success");
         return;
       } catch (err) {
-        setToast(safeFormatError(err));
+        pushToast("ใช้ JSONL fallback ชั่วคราว", "warn", safeFormatError(err));
       }
     }
-    downloadTextFile(`${slug}-triage.jsonl`, exportTriageJsonlFallback(activeReport), "application/x-ndjson");
-    setToast(`ดาวน์โหลด ${slug}-triage.jsonl แล้ว`);
+    downloadTextFile(
+      `${slug}-triage.jsonl`,
+      exportTriageJsonlFallback(activeReport, exportOptions),
+      "application/x-ndjson",
+    );
+    pushToast(
+      privacyMode ? `ดาวน์โหลด ${slug}-triage.jsonl (Redacted) แล้ว` : `ดาวน์โหลด ${slug}-triage.jsonl แล้ว`,
+      "success",
+    );
   };
 
   const saveConnectionSettings = async (nextUrl: string, nextToken: string) => {
@@ -707,21 +1112,24 @@ function App() {
     sessionStorage.removeItem(SESSION_TOKEN_KEY);
     setBearerToken("");
     setJobs([]);
+    setJobsTotal(0);
+    setJobsPage(0);
     setCapabilities(null);
     setWorkspaceConfig(null);
     setAiConfig(null);
     setAiModels(null);
+    setAiProviders(null);
     setLocalBrowse(null);
     setConnectionStatus("auth_required");
     setConnectionModalOpen(false);
-    setToast("ตัดการเชื่อมต่อ token แล้ว");
+    pushToast("ตัดการเชื่อมต่อ token แล้ว", "info");
   };
 
   const handlePickNativePath = async (purpose: NativePickPurpose) => {
     if (isPickingPath) return;
     if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
-      setToast("กรุณาเชื่อมต่อ Backend API ก่อนเปิด OS File Manager");
+      openConnectionModal("connection");
+      pushToast("กรุณาเชื่อมต่อ Backend API ก่อนเปิด OS File Manager", "warn");
       return;
     }
     setIsPickingPath(true);
@@ -729,28 +1137,36 @@ function App() {
       const res = await api.pickNativePath(purpose);
       setWorkspaceConfig(res.workspace);
       if (res.cancelled) {
-        setToast("ยกเลิกการเลือกไฟล์ / โฟลเดอร์");
+        pushToast("ยกเลิกการเลือกไฟล์ / โฟลเดอร์", "info");
         return;
       }
       if (purpose === "data_dir") {
-        setToast(`สลับ Data Directory เป็น ${res.selected_path} แล้ว (API และ Worker ซิงค์อัตโนมัติ)`);
+        pushToast("สลับ Data Directory สำเร็จ", "success", `${res.selected_path} (API และ Worker ซิงค์อัตโนมัติ)`);
       } else if (purpose === "capture_root") {
-        setToast(`เพิ่มโฟลเดอร์ PCAP: ${res.selected_path}`);
+        pushToast(`เพิ่มโฟลเดอร์ PCAP สำเร็จ`, "success", res.selected_path ?? undefined);
+      } else if (purpose === "model_file") {
+        pushToast(
+          "เชื่อมต่อโมเดล ET-BERT สำเร็จ",
+          "success",
+          res.selected_path ?? res.filename ?? "pre-trained_model.bin",
+        );
       } else if (purpose === "capture_file") {
         if (!res.file_grant_token) {
-          setToast("Backend ไม่ได้ออก one-time file grant; เลือกไฟล์ใหม่หรือตรวจรุ่น backend");
+          pushToast("Backend ไม่ได้ออก one-time file grant", "warn", "เลือกไฟล์ใหม่หรือตรวจรุ่น backend");
           return;
         }
         setLocalFileGrantToken(res.file_grant_token);
         setLocalPathInput(res.filename ?? "ไฟล์ capture ที่เลือก");
         setSourceTab("local");
-        setToast(
-          `เลือก ${res.filename ?? "capture"}${res.size_bytes ? ` (${formatBytes(res.size_bytes)})` : ""}; สิทธิ์ไฟล์เดียวหมดอายุใน ${res.grant_expires_in_seconds ?? 300} วินาที และไม่เพิ่มโฟลเดอร์แม่`,
+        pushToast(
+          `เลือก ${res.filename ?? "capture"}${res.size_bytes ? ` (${formatBytes(res.size_bytes)})` : ""}`,
+          "success",
+          `สิทธิ์ไฟล์เดียวหมดอายุใน ${res.grant_expires_in_seconds ?? 300} วินาที และไม่เพิ่มโฟลเดอร์แม่`,
         );
       }
       await refreshWorkspace(true);
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("เปิด OS File Manager ไม่สำเร็จ", "error", safeFormatError(err));
     } finally {
       setIsPickingPath(false);
     }
@@ -760,16 +1176,50 @@ function App() {
     const clean = nextDir.trim();
     if (!clean) return;
     if (connectionStatus !== "connected") {
-      setConnectionModalOpen(true);
+      openConnectionModal("connection");
       return;
     }
     try {
       const ws = await api.updateWorkspaceConfig({ data_dir: clean });
       setWorkspaceConfig(ws);
-      setToast(`ตั้งค่า Data Directory เป็น ${ws.data_dir} แล้ว`);
+      pushToast("ตั้งค่า Data Directory สำเร็จ", "success", ws.data_dir);
       await refreshWorkspace(true);
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("ตั้งค่า Data Directory ไม่สำเร็จ", "error", safeFormatError(err));
+    }
+  };
+
+  const handleUpdateModelPath = async (nextPath: string) => {
+    const clean = nextPath.trim();
+    if (!clean) return;
+    if (connectionStatus !== "connected") {
+      openConnectionModal("connection");
+      return;
+    }
+    try {
+      const ws = await api.updateWorkspaceConfig({ etbert_checkpoint_path: clean, etbert_enabled: true });
+      setWorkspaceConfig(ws);
+      const hasHead = Boolean(ws.etbert_checkpoint_info?.has_classification_head);
+      pushToast(
+        hasHead ? "ผูกไฟล์โมเดล ET-BERT Classifier สำเร็จ" : "ผูกไฟล์ UER Encoder (.bin) แล้ว (Telemetry Fallback)",
+        hasHead ? "success" : "info",
+        ws.etbert_checkpoint_path ?? clean,
+      );
+      await refreshWorkspace(true);
+    } catch (err) {
+      pushToast("ตั้งค่าโมเดล ET-BERT ไม่สำเร็จ", "error", safeFormatError(err));
+    }
+  };
+
+  const handleClearModelPath = async () => {
+    if (connectionStatus !== "connected") return;
+    try {
+      const ws = await api.updateWorkspaceConfig({ clear_etbert_checkpoint: true });
+      setWorkspaceConfig(ws);
+      pushToast("ยกเลิกการผูกไฟล์ .bin แล้ว", "info");
+      await refreshWorkspace(true);
+    } catch (err) {
+      pushToast("ยกเลิกการผูกไฟล์ .bin ไม่สำเร็จ", "error", safeFormatError(err));
     }
   };
 
@@ -778,10 +1228,104 @@ function App() {
     try {
       const ws = await api.updateWorkspaceConfig({ remove_local_ingest_root: rootPath });
       setWorkspaceConfig(ws);
-      setToast(`นำโฟลเดอร์ capture ออกจากรายการที่อนุญาตแล้ว`);
+      pushToast("นำโฟลเดอร์ capture ออกจากรายการที่อนุญาตแล้ว", "info", rootPath);
       await refreshWorkspace(true);
     } catch (err) {
-      setToast(safeFormatError(err));
+      pushToast("นำโฟลเดอร์ออกไม่สำเร็จ", "error", safeFormatError(err));
+    }
+  };
+
+  const handleSaveAiConfig = async (payload: AIConfigUpdatePayload): Promise<AIConfigResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนตั้งค่า AI");
+    }
+    try {
+      const updated = await api.updateAiConfig(payload);
+      setAiConfig(updated);
+      if (updated.configuration.enabled && updated.configuration.model) {
+        setAiEnabled(true);
+        setAiConsent(true);
+        const keyReady = Boolean(updated.runtime_key_set || updated.api_key_env_set || updated.manus_ready || updated.manus_env_set);
+        pushToast(
+          `บันทึก Layer-2 AI (${updated.configuration.provider}: ${updated.configuration.model}) แล้ว`,
+          "success",
+          `Boundary: ${updated.configuration.data_boundary} · API Key ${keyReady ? "ready" : "optional/unset"}`,
+        );
+      } else {
+        if (!updated.configuration.enabled) setAiEnabled(false);
+        pushToast(
+          "อัปเดตการตั้งค่า Layer-2 AI แล้ว (Standby)",
+          "info",
+          "Deterministic + Layer-1 Tier-1/ET-BERT ยังทำงานอัตโนมัติ",
+        );
+      }
+      await refreshWorkspace(true);
+      return updated;
+    } catch (err) {
+      pushToast("บันทึกการตั้งค่า AI ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
+    }
+  };
+
+  const handleSetAiCredentials = async (provider: string, apiKey: string): Promise<AIConfigResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนบันทึก API Key");
+    }
+    try {
+      const updated = await api.setAiCredentials(provider, apiKey);
+      setAiConfig(updated);
+      const fp = updated.runtime_key_fingerprints?.[provider] ?? updated.runtime_key_fingerprint;
+      pushToast(
+        `บันทึก API Key สำหรับ ${provider} ใน RAM แล้ว`,
+        "success",
+        fp ? `Fingerprint: ${fp} · ไม่บันทึกลงดิสก์และไม่ส่งกลับใน API` : "เก็บเฉพาะในหน่วยความจำของ Backend",
+      );
+      return updated;
+    } catch (err) {
+      pushToast("บันทึก API Key ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
+    }
+  };
+
+  const handleClearAiCredentials = async (provider: string): Promise<AIConfigResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนล้าง API Key");
+    }
+    try {
+      const updated = await api.clearAiCredentials(provider);
+      setAiConfig(updated);
+      pushToast(`ล้าง API Key ของ ${provider} ออกจาก RAM แล้ว`, "info");
+      return updated;
+    } catch (err) {
+      pushToast("ล้าง API Key ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
+    }
+  };
+
+  const handleProbeAiModels = async (payload: AIModelProbePayload): Promise<AIModelsResponse> => {
+    if (connectionStatus !== "connected") {
+      throw new Error("ต้องเชื่อมต่อ Backend API ก่อนตรวจสอบโมเดล");
+    }
+    try {
+      const res = await api.probeAiModels(payload);
+      setAiModels(res);
+      if (res.items.length > 0) {
+        pushToast(
+          `พบ ${res.items.length} โมเดลจาก provider`,
+          "success",
+          res.items.slice(0, 3).map((m) => m.id).join(", "),
+        );
+      } else {
+        pushToast(
+          "ไม่พบรายชื่อโมเดลจาก endpoint",
+          "warn",
+          res.warning ?? "ตรวจสอบ endpoint URL, Ollama service หรือ API Key ENV",
+        );
+      }
+      return res;
+    } catch (err) {
+      pushToast("ตรวจสอบโมเดลจาก AI Endpoint ไม่สำเร็จ", "error", safeFormatError(err));
+      throw err;
     }
   };
 
@@ -825,10 +1369,10 @@ function App() {
             aria-expanded={caseDropdownOpen}
             onClick={() => setCaseDropdownOpen((v) => !v)}
           >
-            <div className="case-avatar">{activeReport.origin === "live" ? "LV" : activeReport.origin === "local-csv" ? "CS" : "—"}</div>
+            <div className="case-avatar">{displayReport.origin === "live" ? "LV" : displayReport.origin === "local-csv" ? "CS" : "—"}</div>
             <div className="case-meta">
-              <span>{activeReport.origin === "live" ? "LIVE CASE" : activeReport.origin === "local-csv" ? "LOCAL CSV CASE" : "NO ACTIVE CASE"}</span>
-              <strong>{activeReport.caseId}</strong>
+              <span>{displayReport.origin === "live" ? "LIVE CASE" : displayReport.origin === "local-csv" ? "LOCAL CSV CASE" : "NO ACTIVE CASE"}</span>
+              <strong>{displayReport.caseId}</strong>
             </div>
             <Icon name="chevron" size={15} />
           </button>
@@ -840,13 +1384,13 @@ function App() {
                 <button
                   type="button"
                   key={j.id}
-                  className={`case-option ${activeReport.analysisId === j.id ? "case-option-active" : ""}`}
+                  className={`case-option ${displayReport.analysisId === j.id ? "case-option-active" : ""}`}
                   onClick={() => {
                     setCaseDropdownOpen(false);
                     void loadBackendReport(j.id);
                   }}
                 >
-                  <strong>{j.capture_filename ?? `capture-${j.id.slice(0, 8)}`}</strong>
+                  <strong>{redactor.redactFilename(j.capture_filename ?? `capture-${j.id.slice(0, 8)}`)}</strong>
                   <small className="mono">
                     {j.finding_count ?? 0} findings · {j.capture_size_bytes ? formatBytes(j.capture_size_bytes) : j.resource_mode}
                   </small>
@@ -855,14 +1399,14 @@ function App() {
               {lastLocalCsvReport && (
                 <button
                   type="button"
-                  className={`case-option ${activeReport.analysisId === lastLocalCsvReport.analysisId ? "case-option-active" : ""}`}
+                  className={`case-option ${displayReport.analysisId === lastLocalCsvReport.analysisId ? "case-option-active" : ""}`}
                   onClick={() => {
                     setCaseDropdownOpen(false);
                     setActiveReport(lastLocalCsvReport);
                     setSelectedFindingId(lastLocalCsvReport.findings[0]?.id ?? "");
                   }}
                 >
-                  <strong>{lastLocalCsvReport.fileName} (Browser CSV)</strong>
+                  <strong>{redactor.redactFilename(lastLocalCsvReport.fileName)} (Browser CSV)</strong>
                   <small className="mono">
                     {lastLocalCsvReport.findings.length} findings · {lastLocalCsvReport.sizeLabel}
                   </small>
@@ -882,9 +1426,9 @@ function App() {
               {group.items.map((item) => {
                 const badge =
                   item.id === "jobs"
-                    ? String(activeJobCount > 0 ? activeJobCount : jobs.length)
+                    ? String(activeJobCount > 0 ? activeJobCount : jobsTotal || jobs.length)
                     : item.id === "findings"
-                      ? String(activeReport.findings.length)
+                      ? String(displayReport.findings.length)
                       : undefined;
                 return (
                   <button
@@ -921,14 +1465,20 @@ function App() {
             <div className="profile-avatar">OP</div>
             <span>
               <b>Analyst workspace</b>
-              <small>{connectionStatus === "connected" ? backendUrl || "Same-origin /api" : "No server session"}</small>
+              <small>
+                {connectionStatus === "connected"
+                  ? backendUrl
+                    ? redactor.redactEndpoint(backendUrl)
+                    : "Same-origin /api"
+                  : "No server session"}
+              </small>
             </span>
             <button
               className="icon-button tiny"
-              aria-label="ตั้งค่า Workspace & โฟลเดอร์"
-              onClick={() => setConnectionModalOpen(true)}
+              aria-label="เปิด Workspace & Settings"
+              onClick={() => openConnectionModal()}
             >
-              <Icon name="bell" size={16} />
+              <Icon name="sliders" size={16} />
             </button>
           </div>
         </div>
@@ -949,19 +1499,30 @@ function App() {
             </div>
           </div>
           <div className="topbar-right">
-            <button type="button" className={pillClass} onClick={() => setConnectionModalOpen(true)}>
-              <span className="pulse-dot" />
-              {pillLabel}
-            </button>
-            <button className="icon-button top-search" aria-label="ค้นหา packet" onClick={() => navigate("traffic")}>
-              <Icon name="search" />
+            <button
+              type="button"
+              className={`privacy-pill ${privacyMode ? "privacy-pill-on" : ""}`}
+              aria-pressed={privacyMode}
+              title="Pseudonymize IPs, domains, hashes, paths, and filenames across the entire workbench and exports"
+              onClick={() => setPrivacyMode((prev) => !prev)}
+            >
+              <Icon name="shield" size={13} />
+              <span>{privacyMode ? "Privacy ON" : "Privacy OFF"}</span>
             </button>
             <button
               type="button"
-              className="secondary-button top-connect"
-              onClick={() => setConnectionModalOpen(true)}
+              className={pillClass}
+              title="เปิด Workspace Settings (AI Models, Storage & Connection)"
+              onClick={() => openConnectionModal()}
             >
-              Workspace &amp; Folders
+              <span className="pulse-dot" />
+              <span>{pillLabel}</span>
+              <span className="pill-divider" aria-hidden="true" />
+              <Icon name="sliders" size={12} />
+              <span className="pill-action">Settings</span>
+            </button>
+            <button className="icon-button top-search" aria-label="ค้นหา packet" onClick={() => navigate("traffic")}>
+              <Icon name="search" />
             </button>
             <button className="primary-button top-new" onClick={() => navigate("analyze")}>
               <Icon name="upload" size={16} /> วิเคราะห์ใหม่
@@ -970,38 +1531,153 @@ function App() {
         </header>
 
         <main className="main-content">
-          {activeReport.origin === "empty" ? (
-            <div className="status-banner status-empty" role="status">
-              <Icon name="info" size={16} />
-              <span><b>ยังไม่ได้เลือกผลวิเคราะห์</b> — เริ่มจากอัปโหลด PCAP/PCAPNG หรือเลือกงานที่เสร็จแล้วจากคิวงาน</span>
-              <button onClick={() => navigate("analyze")} aria-label="ไปยังหน้าวิเคราะห์ไฟล์">
-                <Icon name="arrow" size={15} />
+          {displayReport.origin === "empty" ? (
+            <div className="capture-context-bar">
+              <button
+                type="button"
+                className="capture-context-trigger"
+                onClick={() => navigate("analyze")}
+              >
+                <span className="capture-context-badge">
+                  <Icon name="info" size={12} /> NO ACTIVE CASE
+                </span>
+                <div className="capture-context-main">
+                  <strong>ยังไม่ได้เลือกผลวิเคราะห์</strong>
+                  <small>อัปโหลด PCAP/CSV หรือเลือกงานที่เสร็จแล้วจากคิวเพื่อเปิด Workbench</small>
+                </div>
+                <span className="capture-context-cta">
+                  เลือกไฟล์วิเคราะห์ <Icon name="arrow" size={13} />
+                </span>
               </button>
+              {(jobsTotal > 0 || jobs.length > 0) && (
+                <div className="capture-context-quick">
+                  <button type="button" className="context-chip-btn" onClick={() => navigate("jobs")}>
+                    คิวงาน ({jobsTotal || jobs.length})
+                  </button>
+                </div>
+              )}
             </div>
-          ) : activeReport.origin === "local-csv" ? (
-            <div className="status-banner banner-local">
-              <Icon name="check" size={16} />
-              <span>
-                <b>Browser CSV Streaming Result</b> — วิเคราะห์ <code>{activeReport.fileName}</code> ({formatCompactCount(activeReport.packetsAnalyzed)} packets) ในเบราว์เซอร์แบบไม่ส่งออกข้อมูล
-              </span>
-              <button onClick={() => navigate("findings")} aria-label="ดู findings">
-                <Icon name="arrow" size={15} />
+          ) : displayReport.origin === "local-csv" ? (
+            <div className="capture-context-bar capture-context-local">
+              <button
+                type="button"
+                className="capture-context-trigger"
+                onClick={() => navigate("findings")}
+              >
+                <span className="capture-context-badge">
+                  <Icon name="shield" size={12} /> LOCAL CSV
+                </span>
+                <div className="capture-context-main">
+                  <strong>{displayReport.fileName}</strong>
+                  <div className="capture-context-chips mono">
+                    <span>{displayReport.sizeLabel}</span>
+                    <span>{formatCompactCount(displayReport.packetsAnalyzed)} pkts</span>
+                    <span>{displayReport.findings.length} findings</span>
+                    <span>Browser Offline</span>
+                  </div>
+                </div>
+                <span className="capture-context-cta">
+                  ดู Findings <Icon name="arrow" size={13} />
+                </span>
               </button>
+              <div className="capture-context-quick">
+                <button type="button" className="context-chip-btn" onClick={() => navigate("traffic")}>
+                  Packets
+                </button>
+                <button type="button" className="context-chip-btn" onClick={() => navigate("reports")}>
+                  รายงาน
+                </button>
+              </div>
             </div>
           ) : (
-            <div className="status-banner banner-live">
-              <Icon name="check" size={16} />
-              <span>
-                <b>Live Capture Analysis</b> — <code>{activeReport.fileName}</code> ({activeReport.sizeLabel} · {formatCompactCount(activeReport.packetsAnalyzed)} packets · {activeReport.parsedPct} coverage)
-              </span>
-              <button onClick={() => navigate("reports")} aria-label="ดูรายงาน">
-                <Icon name="arrow" size={15} />
+            <div className="capture-context-bar capture-context-live">
+              <button
+                type="button"
+                className="capture-context-trigger"
+                onClick={() => navigate("reports")}
+              >
+                <span className="capture-context-badge">
+                  <Icon name="check" size={12} /> LIVE CASE
+                </span>
+                <div className="capture-context-main">
+                  <strong>{displayReport.fileName}</strong>
+                  <div className="capture-context-chips mono">
+                    <span>{displayReport.sizeLabel}</span>
+                    <span>{formatCompactCount(displayReport.packetsAnalyzed)} pkts</span>
+                    <span>{displayReport.parsedPct} coverage</span>
+                    <span>{displayReport.findings.length} findings</span>
+                  </div>
+                </div>
+                <span className="capture-context-cta">
+                  เปิดรายงาน <Icon name="arrow" size={13} />
+                </span>
               </button>
+              <div className="capture-context-quick">
+                <button type="button" className="context-chip-btn" onClick={() => navigate("findings")}>
+                  Findings ({displayReport.findings.length})
+                </button>
+                <button type="button" className="context-chip-btn" onClick={() => navigate("traffic")}>
+                  Packets
+                </button>
+                <button type="button" className="context-chip-btn" onClick={() => navigate("analyze")}>
+                  เปลี่ยนไฟล์
+                </button>
+              </div>
             </div>
           )}
 
           {screen === "overview" && (
-            <OverviewPage report={activeReport} onNavigate={navigate} onSelectFinding={openEvidence} />
+            <OverviewPage
+              report={displayReport}
+              privacyRedactor={redactor}
+              onNavigate={navigate}
+              onSelectFinding={openEvidence}
+              onSelectTimelineBucket={(bucket) => {
+                jumpToTrafficEvidence(
+                  {
+                    packetNo: bucket.targetPacketNo,
+                    flowId: bucket.targetFlowId,
+                    evidenceId: bucket.targetEvidenceId,
+                    bucketIndex: bucket.index,
+                    preferView: bucket.targetKind === "flow" ? "flows" : "packets",
+                    reasonLabel: `${bucket.label} · ${bucket.dominantProtocol}`,
+                  },
+                  { clearFilters: true },
+                );
+              }}
+              onFilterByIp={(ip) => {
+                jumpToTrafficEvidence(
+                  {
+                    preferView: "packets",
+                    reasonLabel: `IP ${redactor.redactIp(ip)}`,
+                  },
+                  { search: ip, protocol: "All protocols" },
+                );
+              }}
+              onFilterByProtocol={(proto) => {
+                const upper = proto.toUpperCase();
+                const matched =
+                  displayReport.packets.find((p) => p.protocol.toUpperCase() === upper)?.protocol ??
+                  displayReport.flows.find((f) => f.protocol.toUpperCase() === upper)?.protocol ??
+                  proto;
+                jumpToTrafficEvidence(
+                  {
+                    preferView: "packets",
+                    reasonLabel: `Protocol ${matched}`,
+                  },
+                  { search: "", protocol: matched },
+                );
+              }}
+              onFilterBySearch={(query, label) => {
+                jumpToTrafficEvidence(
+                  {
+                    preferView: "packets",
+                    reasonLabel: label ?? (query ? `Search ${query}` : "Traffic evidence"),
+                  },
+                  { search: query, protocol: "All protocols" },
+                );
+              }}
+            />
           )}
 
           {screen === "analyze" && (
@@ -1044,20 +1720,25 @@ function App() {
               }}
               aiConsent={aiConsent}
               setAiConsent={setAiConsent}
+              consentPromptNonce={consentPromptNonce}
               uploadProgress={uploadProgress}
               uploadPaused={uploadPaused}
               isSubmitting={isSubmitting}
               isPickingPath={isPickingPath}
               resumeUploadId={resumeUploadId}
               localCsvProgress={localCsvProgress}
+              privacyRedactor={redactor}
               onUploadAndAnalyze={handleUploadAndAnalyze}
               onPauseUpload={handlePauseUpload}
               onAbortUpload={handleAbortUpload}
               onQuickCsvAnalyze={handleQuickCsvAnalyze}
               onRegisterLocalCapture={handleRegisterLocalCapture}
               onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
+              onClearModelPath={() => void handleClearModelPath()}
               onRemoveLocalRoot={(root) => void handleRemoveLocalRoot(root)}
-              onOpenConnectionModal={() => setConnectionModalOpen(true)}
+              onSaveAiConfig={handleSaveAiConfig}
+              onProbeAiModels={handleProbeAiModels}
+              onOpenConnectionModal={openConnectionModal}
               batchMaxFiles={batchMaxFiles}
               batchMaxTotalBytes={batchMaxTotalBytes}
               batchMaxFileBytes={batchMaxFileBytes}
@@ -1070,11 +1751,19 @@ function App() {
               connectionStatus={connectionStatus}
               capabilities={capabilities}
               jobs={jobs}
+              jobsTotal={jobsTotal}
+              jobsPage={jobsPage}
+              jobsPageSize={JOBS_PAGE_SIZE}
+              jobsMutating={jobsMutating}
               activeJobId={activeJobId}
-              report={activeReport}
+              report={displayReport}
               aiEnabled={aiEnabled}
+              privacyRedactor={redactor}
               onNavigate={navigate}
               onCancelJob={handleCancelJob}
+              onDeleteJob={handleDeleteJob}
+              onPruneJobs={handlePruneJobs}
+              onChangeJobsPage={(p) => void loadJobsPage(p)}
               onOpenJobReport={(id, target) => void loadBackendReport(id, target)}
               onRefreshJobs={() => void refreshWorkspace(false)}
             />
@@ -1082,18 +1771,27 @@ function App() {
 
           {screen === "findings" && (
             <FindingsPage
-              report={activeReport}
+              report={displayReport}
+              rawReport={activeReport}
               severityFilter={severityFilter}
               setSeverityFilter={setSeverityFilter}
+              protocolFilter={protocolFilter}
+              setProtocolFilter={setProtocolFilter}
+              packetSearch={packetSearch}
+              setPacketSearch={setPacketSearch}
               selectedFinding={selectedFinding}
               setSelectedFinding={setSelectedFindingId}
+              privacyRedactor={redactor}
               onOpenEvidence={openEvidence}
             />
           )}
 
           {screen === "traffic" && (
             <TrafficPage
-              report={activeReport}
+              report={displayReport}
+              rawReport={activeReport}
+              severityFilter={severityFilter}
+              setSeverityFilter={setSeverityFilter}
               protocolFilter={protocolFilter}
               setProtocolFilter={setProtocolFilter}
               packetSearch={packetSearch}
@@ -1101,16 +1799,48 @@ function App() {
               selectedFinding={selectedFinding}
               trafficView={trafficView}
               setTrafficView={setTrafficView}
+              privacyRedactor={redactor}
               onOpenEvidence={openEvidence}
+              pendingJump={trafficJump}
+              onConsumePendingJump={() => setTrafficJump(null)}
             />
           )}
 
           {screen === "reports" && (
             <ReportsPage
-              report={activeReport}
+              report={displayReport}
+              apiClient={api}
+              connected={connectionStatus === "connected"}
+              aiConfig={aiConfig}
+              aiModels={aiModels}
+              privacyMode={privacyMode}
+              onTogglePrivacyMode={() => setPrivacyMode((prev) => !prev)}
+              privacyRedactor={redactor}
+              onSaveAiConfig={handleSaveAiConfig}
+              onProbeAiModels={handleProbeAiModels}
               onExport={(kind) => void handleExport(kind)}
+              onChat={(question, consent, options) => {
+                if (activeReport.origin !== "live" || connectionStatus !== "connected") {
+                  return Promise.reject(new Error("live_backend_required"));
+                }
+                return api.askGroundedQuestion(activeReport.analysisId, question, consent, options);
+              }}
+              onRefreshReport={async () => {
+                await loadBackendReport(activeReport.analysisId);
+              }}
               onNavigate={navigate}
               onOpenEvidence={openEvidence}
+              onOpenConnectionModal={openConnectionModal}
+            />
+          )}
+
+          {screen === "cases" && (
+            <CasesPage
+              apiClient={api}
+              connected={connectionStatus === "connected"}
+              jobs={jobs}
+              privacyRedactor={redactor}
+              onOpenAnalysis={(id) => void loadBackendReport(id, "reports")}
             />
           )}
 
@@ -1125,16 +1855,26 @@ function App() {
 
       {connectionModalOpen && (
         <ConnectionModal
+          initialTab={connectionModalTab}
           initialUrl={backendUrl}
           initialToken={bearerToken}
           status={connectionStatus}
           statusError={connectionError}
           capabilities={capabilities}
           workspaceConfig={workspaceConfig}
+          aiConfig={aiConfig}
+          aiModels={aiModels}
+          aiProviders={aiProviders}
           isPickingPath={isPickingPath}
           onPickNativePath={(purpose) => void handlePickNativePath(purpose)}
           onUpdateDataDir={(dir) => void handleUpdateDataDir(dir)}
+          onUpdateModelPath={(path) => void handleUpdateModelPath(path)}
+          onClearModelPath={() => void handleClearModelPath()}
           onRemoveRoot={(root) => void handleRemoveLocalRoot(root)}
+          onSaveAiConfig={handleSaveAiConfig}
+          onSetAiCredentials={handleSetAiCredentials}
+          onClearAiCredentials={handleClearAiCredentials}
+          onProbeAiModels={handleProbeAiModels}
           onClose={() => setConnectionModalOpen(false)}
           onSave={saveConnectionSettings}
           onDisconnect={handleDisconnect}
@@ -1142,66 +1882,235 @@ function App() {
         />
       )}
 
-      {toast && (
-        <div className="toast" role="status">
-          <Icon name="check" size={16} />
-          {toast}
-        </div>
-      )}
+      <ToastStack items={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
 
+function ToastStack({
+  items,
+  onDismiss,
+}: {
+  items: ToastItem[];
+  onDismiss: (id: number) => void;
+}) {
+  if (items.length === 0) return null;
+  const iconMap: Record<ToastTone, IconName> = {
+    success: "check",
+    info: "info",
+    warn: "alert",
+    error: "alert",
+  };
+  return (
+    <div className="toast-stack" aria-live="polite" aria-atomic="false">
+      {items.map((item) => (
+        <div
+          key={item.id}
+          className={`toast-item toast-${item.tone}`}
+          role={item.tone === "error" || item.tone === "warn" ? "alert" : "status"}
+        >
+          <div className="toast-item-icon">
+            <Icon name={iconMap[item.tone]} size={14} />
+          </div>
+          <div className="toast-item-body">
+            <strong>{item.title}</strong>
+            {item.detail && <small>{item.detail}</small>}
+          </div>
+          <button
+            type="button"
+            className="toast-close"
+            aria-label="ปิดการแจ้งเตือน"
+            onClick={() => onDismiss(item.id)}
+          >
+            <Icon name="close" size={13} />
+          </button>
+          <div
+            className="toast-progress"
+            style={{ "--toast-duration": `${item.durationMs ?? 4500}ms` } as CSSProperties}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function normalizeOriginToken(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  if (!trimmed) return null;
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return null;
+  }
+}
+
+const MANUS_DEFAULT_BASE_URL = "https://api.manus.ai";
+function buildAllowedOriginsList(
+  rawOrigins: string,
+  baseUrlDraft: string,
+  provider: AIProviderName,
+  dataBoundary: "local" | "remote",
+): string[] {
+  const origins = new Set<string>();
+  for (const token of rawOrigins.split(",")) {
+    const normalized = normalizeOriginToken(token);
+    if (normalized) origins.add(normalized);
+  }
+  const cleanUrl = baseUrlDraft.trim();
+  if (cleanUrl) {
+    const baseOrigin = normalizeOriginToken(cleanUrl);
+    if (baseOrigin) origins.add(baseOrigin);
+  } else if (provider === "openai_compatible" && dataBoundary === "local") {
+    origins.add("http://127.0.0.1:11434");
+  } else if (provider === "manus") {
+    origins.add(MANUS_DEFAULT_BASE_URL);
+  }
+  return Array.from(origins);
+}
+
+function asAIProviderName(value?: string | null): AIProviderName {
+  if (value === "anthropic" || value === "manus" || value === "openai_compatible") return value;
+  return "openai_compatible";
+}
+
+function buildQuickAiSavePayload(
+  aiConfig: AIConfigResponse | null,
+  patch: Partial<AIConfigUpdatePayload>,
+): AIConfigUpdatePayload {
+  const payload: AIConfigUpdatePayload = { enabled: true, ...patch };
+  const cfg = aiConfig?.configuration;
+  const isDefaultLocalCompatible =
+    !cfg ||
+    (cfg.provider === "openai_compatible" &&
+      !cfg.base_url &&
+      (cfg.data_boundary !== "local" || (cfg.allowed_origins?.length ?? 0) === 0));
+  if (payload.enabled && isDefaultLocalCompatible) {
+    if (payload.data_boundary === undefined) payload.data_boundary = "local";
+    if (payload.allowed_origins === undefined) payload.allowed_origins = ["http://127.0.0.1:11434"];
+  }
+  return payload;
+}
+
+function buildQuickAiProbePayload(aiConfig: AIConfigResponse | null): AIModelProbePayload {
+  const cfg = aiConfig?.configuration;
+  const provider = asAIProviderName(cfg?.provider);
+  const data_boundary = cfg?.data_boundary ?? "local";
+  const base_url = cfg?.base_url ?? null;
+  const allowed_origins =
+    cfg?.allowed_origins && cfg.allowed_origins.length > 0
+      ? cfg.allowed_origins
+      : buildAllowedOriginsList("", base_url ?? "", provider, data_boundary);
+  return {
+    provider,
+    ...(cfg?.preset ? { preset: cfg.preset } : {}),
+    base_url,
+    allowed_origins,
+    api_key_env: cfg?.api_key_env ?? null,
+    data_boundary,
+  };
+}
+
+function pillClassFromTone(tone: PillTone): string {
+  if (tone === "ok") return "ai-env-pill env-ok";
+  if (tone === "warn") return "ai-env-pill env-missing";
+  if (tone === "info") return "ai-env-pill env-info";
+  return "ai-env-pill env-neutral";
+}
+
 function ConnectionModal({
+  initialTab,
   initialUrl,
   initialToken,
   status,
   statusError,
   capabilities,
   workspaceConfig,
+  aiConfig,
+  aiModels,
+  aiProviders,
   isPickingPath,
   onPickNativePath,
   onUpdateDataDir,
+  onUpdateModelPath,
+  onClearModelPath,
   onRemoveRoot,
+  onSaveAiConfig,
+  onSetAiCredentials,
+  onClearAiCredentials,
+  onProbeAiModels,
   onClose,
   onSave,
   onDisconnect,
   onRetest,
 }: {
+  initialTab?: SettingsTab;
   initialUrl: string;
   initialToken: string;
   status: ConnectionStatus;
   statusError: string;
   capabilities: SystemCapabilities | null;
   workspaceConfig: WorkspaceConfigState | null;
+  aiConfig: AIConfigResponse | null;
+  aiModels: AIModelsResponse | null;
+  aiProviders: AIProviderPreset[] | null;
   isPickingPath: boolean;
   onPickNativePath: (purpose: NativePickPurpose) => void;
   onUpdateDataDir: (dir: string) => void;
+  onUpdateModelPath: (path: string) => void;
+  onClearModelPath: () => void;
   onRemoveRoot: (root: string) => void;
+  onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
+  onSetAiCredentials: (slot: string, apiKey: string) => Promise<AIConfigResponse>;
+  onClearAiCredentials: (slot: string) => Promise<AIConfigResponse>;
+  onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
   onClose: () => void;
   onSave: (url: string, token: string) => void;
   onDisconnect: () => void;
   onRetest: () => void;
 }) {
+  const [activeTab, setActiveTab] = useState<SettingsTab>(
+    initialTab ?? (status === "connected" ? "ai" : "connection"),
+  );
   const [urlInput, setUrlInput] = useState(initialUrl);
   const [tokenInput, setTokenInput] = useState(initialToken);
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
+  const resolvedModelPath = (
+    workspaceConfig != null
+      ? (workspaceConfig.etbert_checkpoint_path ?? "")
+      : (capabilities?.triage.etbert_checkpoint_path ?? "")
+  ).trim();
   const [dataDirDraft, setDataDirDraft] = useState(resolvedDataDir);
+  const [modelPathDraft, setModelPathDraft] = useState(resolvedModelPath);
+
+  const [aiPanelStatus, setAiPanelStatus] = useState<ModelSettingsStatus>({ warn: false, active: false });
+
+  useEffect(() => {
+    if (initialTab) setActiveTab(initialTab);
+  }, [initialTab]);
 
   useEffect(() => {
     setDataDirDraft(workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "");
   }, [workspaceConfig?.data_dir, capabilities?.limits.data_dir]);
 
+  useEffect(() => {
+    setModelPathDraft(resolvedModelPath);
+  }, [resolvedModelPath]);
+
   const roots = workspaceConfig?.local_ingest_roots ?? capabilities?.limits.local_ingest_roots ?? [];
   const pickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? true;
+  const layer1Status = resolveLayer1Status({ capabilities, workspaceConfig, aiConfig });
+  const dataDirDirty = Boolean(dataDirDraft.trim()) && dataDirDraft.trim() !== resolvedDataDir;
+  const modelPathDirty = Boolean(modelPathDraft.trim()) && modelPathDraft.trim() !== resolvedModelPath;
+  const aiTabWarn = status !== "connected" || aiPanelStatus.warn;
+  const storageTabWarn = status !== "connected" || layer1Status.binMissing || dataDirDirty || modelPathDirty;
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="conn-modal-title">
       <div className="panel connection-modal">
         <div className="modal-head">
           <div>
-            <div className="section-kicker">WORKSPACE, FOLDERS &amp; BACKEND</div>
-            <h2 id="conn-modal-title">จัดการ Data Directory, โฟลเดอร์ &amp; การเชื่อมต่อ</h2>
+            <div className="section-kicker">WORKSPACE SETTINGS</div>
+            <h2 id="conn-modal-title">ตั้งค่า AI Models, พื้นที่จัดเก็บ และ การเชื่อมต่อ</h2>
           </div>
           <button type="button" className="icon-button" aria-label="ปิดหน้าต่าง" onClick={onClose}>
             <Icon name="close" size={18} />
@@ -1232,111 +2141,315 @@ function ConnectionModal({
             </div>
           </div>
 
-          {status === "connected" && (
-            <div className="workspace-picker-card">
-              <div className="workspace-picker-head">
-                <div>
-                  <strong>Data Directory (`PCAP_DATA_DIR`)</strong>
-                  <small>โฟลเดอร์เก็บ SQLite metadata และไฟล์ที่อัปโหลด — สลับได้จาก Finder / File Manager โดยไม่ต้องรีสตาร์ท</small>
-                </div>
-                <button
-                  type="button"
-                  className="primary-button tiny-btn"
-                  disabled={isPickingPath || !pickerAvailable}
-                  onClick={() => onPickNativePath("data_dir")}
-                >
-                  <Icon name="file" size={13} />{" "}
-                  {isPickingPath ? "รอเลือกใน File Manager..." : "เลือกผ่าน Popup..."}
-                </button>
-              </div>
-              <div className="local-path-row">
-                <input
-                  type="text"
-                  value={dataDirDraft}
-                  onChange={(e) => setDataDirDraft(e.target.value)}
-                  placeholder="เช่น ~/.pcapscanner/data หรือ /Volumes/SSD/pcap-data"
-                />
-                <button
-                  type="button"
-                  className="secondary-button tiny-btn"
-                  disabled={!dataDirDraft.trim() || dataDirDraft.trim() === resolvedDataDir}
-                  onClick={() => onUpdateDataDir(dataDirDraft)}
-                >
-                  Apply Path
-                </button>
-              </div>
+          <div className="modal-tabs" role="tablist" aria-label="Workspace settings tabs">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "ai"}
+              className={`modal-tab-btn ${activeTab === "ai" ? "modal-tab-active" : ""}`}
+              onClick={() => setActiveTab("ai")}
+            >
+              <Icon name="spark" size={13} /> AI &amp; Models
+              {(aiTabWarn || aiPanelStatus.active) && (
+                <i className={`modal-tab-dot ${aiTabWarn ? "dot-warn" : ""}`} />
+              )}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "storage"}
+              className={`modal-tab-btn ${activeTab === "storage" ? "modal-tab-active" : ""}`}
+              onClick={() => setActiveTab("storage")}
+            >
+              <Icon name="file" size={13} /> Storage &amp; ET-BERT
+              <i className={`modal-tab-dot ${storageTabWarn ? "dot-warn" : ""}`} />
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "connection"}
+              className={`modal-tab-btn ${activeTab === "connection" ? "modal-tab-active" : ""}`}
+              onClick={() => setActiveTab("connection")}
+            >
+              <Icon name="shield" size={13} /> Connection
+              <i className={`modal-tab-dot ${status !== "connected" ? "dot-warn" : ""}`} />
+            </button>
+          </div>
 
-              <div className="workspace-picker-head workspace-roots-head">
-                <div>
-                  <strong>Authorized Local Capture Folders (`PCAP_LOCAL_INGEST_ROOTS`)</strong>
-                  <small>โฟลเดอร์ที่อนุญาตให้ backend ลงทะเบียน capture; worker จะสร้าง private verified snapshot ก่อน parse</small>
+          {activeTab === "ai" && (
+            status !== "connected" ? (
+              <div className="alert-box alert-warn">
+                <Icon name="alert" size={16} />
+                <div style={{ display: "grid", gap: "8px" }}>
+                  <strong>ต้องเชื่อมต่อ Backend API ก่อนตั้งค่า Layer-2 AI Providers</strong>
+                  <span>ไปที่แท็บ Connection เพื่อใส่ URL / Bearer Token แล้วทดสอบการเชื่อมต่อ</span>
+                  <div>
+                    <button
+                      type="button"
+                      className="primary-button tiny-btn"
+                      onClick={() => setActiveTab("connection")}
+                    >
+                      เปิดแท็บ Connection <Icon name="arrow" size={12} />
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  className="secondary-button tiny-btn"
-                  disabled={isPickingPath || !pickerAvailable}
-                  onClick={() => onPickNativePath("capture_root")}
-                >
-                  <Icon name="upload" size={13} />{" "}
-                  {isPickingPath ? "รอเลือก..." : "+ เพิ่มโฟลเดอร์ (Popup)"}
-                </button>
               </div>
-              {roots.length === 0 ? (
-                <small className="muted">ยังไม่มีโฟลเดอร์ PCAP ที่เพิ่มไว้ — กดปุ่ม &quot;+ เพิ่มโฟลเดอร์ (Popup)&quot; เพื่อเลือกจาก Finder</small>
-              ) : (
-                <div className="local-roots-bar mono">
-                  {roots.map((r) => (
-                    <b key={r} className="root-chip">
-                      <span>{r}</span>
+            ) : (
+              <>
+                <ModelSettingsPanel
+                  aiConfig={aiConfig}
+                  aiModels={aiModels}
+                  providers={aiProviders}
+                  onSaveAiConfig={onSaveAiConfig}
+                  onSetAiCredentials={onSetAiCredentials}
+                  onClearAiCredentials={onClearAiCredentials}
+                  onProbeAiModels={onProbeAiModels}
+                  onStatusChange={setAiPanelStatus}
+                />
+
+                <div className="workspace-picker-card">
+                  <div className="workspace-picker-head">
+                    <div>
+                      <strong>Layer-1 Offline Tier-1 &amp; ET-BERT Model (.bin)</strong>
+                      <small>{layer1Status.analyzeCardDetail}</small>
+                    </div>
+                    <div className="layer-head-actions">
+                      <span className={pillClassFromTone(layer1Status.pillTone)}>{layer1Status.badgeLabel}</span>
                       <button
                         type="button"
-                        className="root-remove-btn"
-                        aria-label={`ลบโฟลเดอร์ ${r}`}
-                        onClick={() => onRemoveRoot(r)}
+                        className="secondary-button tiny-btn"
+                        onClick={() => setActiveTab("storage")}
                       >
-                        ×
+                        จัดการ .bin &amp; Paths <Icon name="arrow" size={12} />
                       </button>
-                    </b>
-                  ))}
+                    </div>
+                  </div>
                 </div>
-              )}
-              {!pickerAvailable && (
-                <small className="muted">
-                  * ระบบกำลังรันบน headless environment ไม่มีหน้าต่าง File Manager — พิมพ์ path แล้วกด Apply ได้เลย
-                </small>
-              )}
-            </div>
+              </>
+            )
           )}
 
-          <label className="modal-field">
-            <span>Backend URL (เว้นว่างเมื่อเปิดจาก Start PCAPSCANNER.command / Vite proxy)</span>
-            <input
-              type="url"
-              value={urlInput}
-              onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="http://127.0.0.1:8000"
-            />
-          </label>
+          {activeTab === "storage" && (
+            status !== "connected" ? (
+              <div className="alert-box alert-warn">
+                <Icon name="alert" size={16} />
+                <div style={{ display: "grid", gap: "8px" }}>
+                  <strong>ต้องเชื่อมต่อ Backend API ก่อนจัดการ Data Directory และไฟล์โมเดล ET-BERT (.bin)</strong>
+                  <span>ไปที่แท็บ Connection เพื่อเชื่อมต่อ FastAPI Backend</span>
+                  <div>
+                    <button
+                      type="button"
+                      className="primary-button tiny-btn"
+                      onClick={() => setActiveTab("connection")}
+                    >
+                      เปิดแท็บ Connection <Icon name="arrow" size={12} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="workspace-picker-card">
+                  <div className="workspace-picker-head">
+                    <div>
+                      <strong>
+                        Data Directory <code className="env-chip">PCAP_DATA_DIR</code>
+                      </strong>
+                      <small>โฟลเดอร์เก็บ SQLite metadata และไฟล์ที่อัปโหลด — สลับได้โดยไม่ต้องรีสตาร์ท</small>
+                    </div>
+                    <div className="layer-head-actions">
+                      <span className={dataDirDirty ? "ai-env-pill env-missing" : "ai-env-pill env-ok"}>
+                        {dataDirDirty ? "ยังไม่บันทึก — กด Apply Path" : "Active"}
+                      </span>
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={isPickingPath || !pickerAvailable}
+                        onClick={() => onPickNativePath("data_dir")}
+                      >
+                        <Icon name="file" size={13} />{" "}
+                        {isPickingPath ? "รอเลือก..." : "เลือกผ่าน Popup..."}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="local-path-row">
+                    <input
+                      type="text"
+                      value={dataDirDraft}
+                      onChange={(e) => setDataDirDraft(e.target.value)}
+                      placeholder="เช่น ~/.pcapscanner/data หรือ /Volumes/SSD/pcap-data"
+                    />
+                    <button
+                      type="button"
+                      className={dataDirDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
+                      disabled={!dataDirDirty}
+                      onClick={() => onUpdateDataDir(dataDirDraft)}
+                    >
+                      Apply Path
+                    </button>
+                  </div>
 
-          <label className="modal-field">
-            <span>Operator Bearer Token (`PCAP_API_TOKEN`, auto-filled เมื่อเปิดผ่าน 1-click launcher)</span>
-            <input
-              type="password"
-              value={tokenInput}
-              onChange={(e) => setTokenInput(e.target.value)}
-              placeholder="ใส่ PCAP_API_TOKEN ที่ตั้งใน backend"
-            />
-          </label>
+                  <div className="workspace-picker-head workspace-roots-head">
+                    <div>
+                      <strong>
+                        Authorized Local Capture Folders <code className="env-chip">PCAP_LOCAL_INGEST_ROOTS</code>
+                      </strong>
+                      <small>
+                        ทางเลือกเสริมสำหรับสแกนไฟล์ขนาดใหญ่บนเครื่องตรง ๆ — ถ้าอัปโหลด PCAP ผ่านหน้าเว็บตามปกติปล่อยว่างได้
+                      </small>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-button tiny-btn"
+                      disabled={isPickingPath || !pickerAvailable}
+                      onClick={() => onPickNativePath("capture_root")}
+                    >
+                      <Icon name="upload" size={13} />{" "}
+                      {isPickingPath ? "รอเลือก..." : "+ เพิ่มโฟลเดอร์ (Popup)"}
+                    </button>
+                  </div>
+                  {roots.length === 0 ? (
+                    <small className="muted">ยังไม่มีโฟลเดอร์ PCAP ที่อนุญาต (ปล่อยว่างได้หากใช้อัปโหลดผ่านหน้าเว็บ)</small>
+                  ) : (
+                    <div className="local-roots-bar mono">
+                      {roots.map((r) => (
+                        <b key={r} className="root-chip">
+                          <span>{r}</span>
+                          <button
+                            type="button"
+                            className="root-remove-btn"
+                            aria-label={`ลบโฟลเดอร์ ${r}`}
+                            onClick={() => onRemoveRoot(r)}
+                          >
+                            ×
+                          </button>
+                        </b>
+                      ))}
+                    </div>
+                  )}
+                  {!pickerAvailable && (
+                    <small className="muted">
+                      * ระบบกำลังรันบน headless environment ไม่มีหน้าต่าง File Manager — พิมพ์ path แล้วกด Apply ได้เลย
+                    </small>
+                  )}
+                </div>
 
-          <div className="modal-help">
-            <strong>วิธีเปิดใช้งานแบบคลิกเดียว (ไม่ต้องพิมพ์หลายคำสั่ง):</strong>
-            <span>• macOS Finder: ดับเบิลคลิกไฟล์ <code>Start PCAPSCANNER.command</code> ในโฟลเดอร์โปรเจกต์</span>
-            <span>• Terminal (คำสั่งเดียว): <code>python -m backend.app.launcher</code> (ระบบสร้าง token, สตาร์ท worker และเปิดหน้าเว็บให้อัตโนมัติ)</span>
-          </div>
+                <div className="layer1-runtime-card">
+                  <div className="workspace-picker-head">
+                    <div>
+                      <strong>Layer-1 · Tier-1 Triage &amp; ET-BERT (Offline / Local)</strong>
+                      <small>ทำงานตรวจจับและคัดกรองแพ็กเก็ตในเครื่องโดยอัตโนมัติ แม้ปิด Layer-2 LLM</small>
+                    </div>
+                    <span className={pillClassFromTone(layer1Status.pillTone)}>{layer1Status.badgeLabel}</span>
+                  </div>
+
+                  <div className="layer1-subblock">
+                    <div className="layer1-subhead">
+                      <strong>1) Neural Sidecar (tier1-inference · models/etbert-l7)</strong>
+                      <span className={layer1Status.sidecarConfigured ? "ai-env-pill env-ok" : "ai-env-pill env-neutral"}>
+                        {layer1Status.sidecarBadgeLabel}
+                      </span>
+                    </div>
+                    <small>{layer1Status.sidecarHint}</small>
+                  </div>
+
+                  <div className="layer1-subblock">
+                    <div className="layer1-subhead">
+                      <strong>
+                        2) Local .bin Checkpoint Fallback <code className="env-chip">PCAP_ETBERT_MODEL_BIN</code>
+                      </strong>
+                      <div className="layer-head-actions">
+                        <span
+                          className={pillClassFromTone(
+                            layer1Status.binMissing
+                              ? "warn"
+                              : layer1Status.binReady
+                                ? layer1Status.binHasClassifierHead
+                                  ? "ok"
+                                  : "info"
+                                : "neutral",
+                          )}
+                        >
+                          {layer1Status.binBadgeLabel}
+                        </span>
+                        <button
+                          type="button"
+                          className="secondary-button tiny-btn"
+                          disabled={isPickingPath || !pickerAvailable}
+                          onClick={() => onPickNativePath("model_file")}
+                        >
+                          <Icon name="spark" size={13} />{" "}
+                          {isPickingPath ? "รอเลือก..." : "เลือกไฟล์ .bin (Popup)"}
+                        </button>
+                      </div>
+                    </div>
+                    <small>{layer1Status.binHint}</small>
+                    <div className="local-path-row">
+                      <input
+                        type="text"
+                        value={modelPathDraft}
+                        onChange={(e) => setModelPathDraft(e.target.value)}
+                        placeholder="ปล่อยว่าง (Optional) หรือใส่ path ไปยังไฟล์ .bin / .pt"
+                      />
+                      <button
+                        type="button"
+                        className={modelPathDirty ? "primary-button tiny-btn" : "secondary-button tiny-btn"}
+                        disabled={!modelPathDirty}
+                        onClick={() => onUpdateModelPath(modelPathDraft)}
+                      >
+                        Bind .bin Model
+                      </button>
+                      {layer1Status.binBound && (
+                        <button
+                          type="button"
+                          className="secondary-button tiny-btn"
+                          onClick={onClearModelPath}
+                        >
+                          Unbind
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )
+          )}
+
+          {activeTab === "connection" && (
+            <>
+              <label className="modal-field">
+                <span>Backend URL (เว้นว่างเมื่อเปิดจาก Start PCAPSCANNER.command / Vite proxy)</span>
+                <input
+                  type="url"
+                  value={urlInput}
+                  onChange={(e) => setUrlInput(e.target.value)}
+                  placeholder="http://127.0.0.1:8000"
+                />
+              </label>
+
+              <label className="modal-field">
+                <span>
+                  Operator Bearer Token <code className="env-chip">PCAP_API_TOKEN</code> (auto-filled เมื่อเปิดผ่าน 1-click launcher)
+                </span>
+                <input
+                  type="password"
+                  value={tokenInput}
+                  onChange={(e) => setTokenInput(e.target.value)}
+                  placeholder="ใส่ PCAP_API_TOKEN ที่ตั้งใน backend"
+                />
+              </label>
+
+              <div className="modal-help">
+                <strong>วิธีเปิดใช้งานแบบคลิกเดียว (ไม่ต้องพิมพ์หลายคำสั่ง):</strong>
+                <span>• macOS Finder: ดับเบิลคลิกไฟล์ <code>Start PCAPSCANNER.command</code> ในโฟลเดอร์โปรเจกต์</span>
+                <span>• Terminal (คำสั่งเดียว): <code>python -m backend.app.launcher</code> (ระบบสร้าง token, สตาร์ท worker และเปิดหน้าเว็บให้อัตโนมัติ)</span>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="modal-actions">
-          {initialToken && (
+          {activeTab === "connection" && initialToken && (
             <button type="button" className="secondary-button" onClick={onDisconnect}>
               Disconnect Token
             </button>
@@ -1344,13 +2457,19 @@ function ConnectionModal({
           <button type="button" className="secondary-button" onClick={onRetest}>
             Test Health
           </button>
-          <button
-            type="button"
-            className="primary-button"
-            onClick={() => onSave(urlInput, tokenInput)}
-          >
-            <Icon name="check" size={15} /> Save &amp; Connect
-          </button>
+          {activeTab === "connection" ? (
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => onSave(urlInput, tokenInput)}
+            >
+              <Icon name="check" size={15} /> Save &amp; Connect
+            </button>
+          ) : (
+            <button type="button" className="secondary-button" onClick={onClose}>
+              ปิดหน้าต่าง
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -1418,7 +2537,7 @@ function StageRow({ stage, index }: { stage: WorkspaceStage; index: number }) {
           <small>{stage.detail}</small>
         </div>
         <span className={`stage-state ${stage.status}`}>
-          {stage.status === "done" ? "DONE" : stage.status.toUpperCase()}
+          {stage.status === "done" ? "DONE" : stage.status === "awaiting_consent" ? "AWAITING CONSENT" : stage.status.toUpperCase()}
         </span>
       </div>
     </div>
@@ -1436,12 +2555,22 @@ function Receipt({ label, value, mono = false }: { label: string; value: string;
 
 function OverviewPage({
   report,
+  privacyRedactor,
   onNavigate,
   onSelectFinding,
+  onSelectTimelineBucket,
+  onFilterByIp,
+  onFilterByProtocol,
+  onFilterBySearch,
 }: {
   report: WorkspaceReport;
+  privacyRedactor?: PrivacyRedactor;
   onNavigate: (screen: Screen) => void;
   onSelectFinding: (finding: WorkspaceFinding) => void;
+  onSelectTimelineBucket?: (bucket: TimelineBucketDetail) => void;
+  onFilterByIp?: (ip: string) => void;
+  onFilterByProtocol?: (proto: string) => void;
+  onFilterBySearch?: (query: string, label?: string) => void;
 }) {
   const highCount = report.findings.filter((f) => f.severity === "high" || f.severity === "critical").length;
   const medCount = report.findings.filter((f) => f.severity === "medium").length;
@@ -1517,7 +2646,7 @@ function OverviewPage({
         </div>
       </section>
 
-      <section className="metric-grid">
+      <section className="metric-grid stagger-grid">
         <MetricCard
           label="PACKETS ANALYZED"
           value={formatCompactCount(report.packetsAnalyzed)}
@@ -1552,48 +2681,75 @@ function OverviewPage({
         />
       </section>
 
-      {report.triage && (
-        <section className="panel triage-panel">
-          <div className="triage-panel-head">
-            <div>
-              <div className="section-kicker">TIER-1 CLASSIFIER · EVIDENCE BUDGET</div>
-              <h2>
-                {report.triage.model} <span className="mono">({report.triage.mode})</span>
-              </h2>
-            </div>
-            <div className="triage-kpis mono">
-              <span>Evaluated: {formatCompactCount(report.triage.total_evaluated)}</span>
-              <span>Mean Conf: {(report.triage.mean_confidence * 100).toFixed(1)}%</span>
-              <span>Mean PPL: {report.triage.mean_ppl.toFixed(2)}</span>
-              <span className="triage-kpi-accent">
-                Filtered {Math.round(report.triage.reduction_ratio * 100)}% Benign
-              </span>
-            </div>
-          </div>
-          <div className="triage-bars">
-            {report.triage.top_classes.slice(0, 5).map((cls) => {
-              const pct = report.triage!.total_evaluated > 0 ? Math.max(4, Math.round((cls.count / report.triage!.total_evaluated) * 100)) : 0;
-              return (
-                <div className="triage-class-row" key={cls.label}>
-                  <span className="mono">{cls.label}</span>
-                  <div className="triage-bar-track">
-                    <div
-                      className={`triage-bar-fill ${cls.label === "Benign" ? "triage-benign" : "triage-attack"}`}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                  <small className="mono">
-                    {formatCompactCount(cls.count)} ({Math.round(cls.avg_confidence * 100)}%)
-                  </small>
+      {report.triage && (() => {
+        const etStatus = describeEtbertExecution(report.triage);
+        const etClasses = report.triage.etbert_top_classes ?? [];
+        return (
+          <section className="panel triage-panel panel-enter">
+            <div className="triage-panel-head">
+              <div>
+                <div className="section-kicker">TIER-1 CLASSIFIER · EVIDENCE BUDGET</div>
+                <div className="triage-title-row">
+                  <h2>
+                    {report.triage.model} <span className="mono">({report.triage.mode})</span>
+                  </h2>
+                  <span
+                    className={`triage-engine-pill mono tone-${etStatus.tone}`}
+                    title={etStatus.reportLine}
+                  >
+                    <i /> {etStatus.badge}
+                  </span>
                 </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
+              </div>
+              <div className="triage-kpis mono">
+                <span>Evaluated: {formatCompactCount(report.triage.total_evaluated)}</span>
+                <span>Mean Conf: {(report.triage.mean_confidence * 100).toFixed(1)}%</span>
+                <span>Mean PPL: {report.triage.mean_ppl.toFixed(2)}</span>
+                <span className="triage-kpi-accent">
+                  Filtered {Math.round(report.triage.reduction_ratio * 100)}% Benign
+                </span>
+              </div>
+            </div>
+            <div className="triage-bars">
+              {report.triage.top_classes.slice(0, 5).map((cls) => {
+                const pct = report.triage!.total_evaluated > 0 ? Math.max(4, Math.round((cls.count / report.triage!.total_evaluated) * 100)) : 0;
+                return (
+                  <div className="triage-class-row" key={cls.label}>
+                    <span className="mono">{cls.label}</span>
+                    <div className="triage-bar-track">
+                      <div
+                        className={`triage-bar-fill ${cls.label === "Benign" ? "triage-benign" : "triage-attack"}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <small className="mono">
+                      {formatCompactCount(cls.count)} ({Math.round(cls.avg_confidence * 100)}%)
+                    </small>
+                  </div>
+                );
+              })}
+            </div>
+            {etClasses.length > 0 && (
+              <div className="triage-etbert-strip">
+                <span className="triage-etbert-label mono">
+                  ET-BERT L7 PREDICTIONS ({formatCompactCount(report.triage.etbert_scored_count ?? 0)} SCORED)
+                </span>
+                {etClasses.slice(0, 8).map((cls) => (
+                  <span className="triage-etbert-chip mono" key={`et-${cls.label}`}>
+                    <b>{cls.label}</b>
+                    <small>
+                      {formatCompactCount(cls.count)} · {Math.round(cls.avg_confidence * 100)}%
+                    </small>
+                  </span>
+                ))}
+              </div>
+            )}
+          </section>
+        );
+      })()}
 
       <div className="overview-grid">
-        <section className="panel stage-panel">
+        <section className="panel stage-panel panel-enter">
           <PanelTitle
             title="Pipeline coverage"
             detail="ทุก stage มีสถานะ ไม่ซ่อนขั้นที่ข้ามหรือผิดพลาด"
@@ -1613,7 +2769,7 @@ function OverviewPage({
           </button>
         </section>
 
-        <section className="panel findings-panel">
+        <section className="panel findings-panel panel-enter">
           <PanelTitle
             title="Findings ที่ควรดู"
             detail="เรียงตาม severity & Tier-1 priority"
@@ -1658,10 +2814,10 @@ function OverviewPage({
       </div>
 
       <div className="overview-grid bottom-grid">
-        <section className="panel timeline-panel">
+        <section className="panel timeline-panel panel-enter">
           <PanelTitle
             title="Packet activity"
-            detail="ปริมาณ packets ตามเวลาใน capture"
+            detail="ชี้เพื่อดูรายละเอียด event · คลิกเพื่อข้ามไปยัง Packet / Flow"
             action={
               <div className="legend">
                 <i />
@@ -1669,24 +2825,16 @@ function OverviewPage({
               </div>
             }
           />
-          <div className="timeline-chart" role="img" aria-label="กราฟปริมาณ packet ตามเวลา">
-            {report.timeline.map((value, index) => (
-              <div className="timeline-bar-wrap" key={index}>
-                <div
-                  className={`timeline-bar ${value >= 75 ? "timeline-bar-highlight" : ""}`}
-                  style={{ height: `${Math.max(5, Math.min(100, value))}%` }}
-                />
-              </div>
-            ))}
-          </div>
-          <div className="timeline-axis">
-            {report.timelineLabels.map((lbl, idx) => (
-              <span key={idx}>{lbl}</span>
-            ))}
-          </div>
+          <InteractiveTimelineChart
+            report={report}
+            variant="overview"
+            onSelectBucket={(bucket) =>
+              onSelectTimelineBucket ? onSelectTimelineBucket(bucket) : onNavigate("traffic")
+            }
+          />
         </section>
 
-        <section className="panel capture-panel">
+        <section className="panel capture-panel panel-enter">
           <PanelTitle title="Capture receipt" detail="แหล่งที่มาและข้อมูลที่ใช้วิเคราะห์" />
           <div className="capture-file">
             <div className="file-icon">
@@ -1720,6 +2868,35 @@ function OverviewPage({
           </div>
         </section>
       </div>
+
+      {report.rawBundle?.flow_analytics && (
+        <section className="panel analytics-section-panel panel-enter">
+          <PanelTitle
+            title="Flow Analytics & Topology"
+            detail="Capped Top Talkers, Protocol Breakdown, Packet Size / IAT Histograms, Sankey & Topology"
+          />
+          <AnalyticsVisuals
+            analytics={report.rawBundle.flow_analytics}
+            protocolCounts={report.rawBundle.telemetry?.protocol_counts}
+            privacyRedactor={privacyRedactor}
+            onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
+            onSelectProtocolFilter={(proto) => (onFilterByProtocol ? onFilterByProtocol(proto) : onNavigate("traffic"))}
+            onSelectSearchFilter={(query, label) =>
+              onFilterBySearch ? onFilterBySearch(query, label) : onNavigate("traffic")
+            }
+          />
+        </section>
+      )}
+
+      {report.rawBundle?.geoip && (
+        <section className="panel geomap-section-panel panel-enter">
+          <WorldFlowMap
+            geoip={report.rawBundle.geoip}
+            privacyRedactor={privacyRedactor}
+            onSelectIpFilter={(ip) => (onFilterByIp ? onFilterByIp(ip) : onNavigate("traffic"))}
+          />
+        </section>
+      )}
     </>
   );
 }
@@ -1751,19 +2928,24 @@ function AnalyzePage({
   setAiEnabled,
   aiConsent,
   setAiConsent,
+  consentPromptNonce,
   uploadProgress,
   uploadPaused,
   isSubmitting,
   isPickingPath,
   resumeUploadId,
   localCsvProgress,
+  privacyRedactor,
   onUploadAndAnalyze,
   onPauseUpload,
   onAbortUpload,
   onQuickCsvAnalyze,
   onRegisterLocalCapture,
   onPickNativePath,
+  onClearModelPath,
   onRemoveLocalRoot,
+  onSaveAiConfig,
+  onProbeAiModels,
   onOpenConnectionModal,
   batchMaxFiles,
   batchMaxTotalBytes,
@@ -1796,42 +2978,137 @@ function AnalyzePage({
   setAiEnabled: (val: boolean) => void;
   aiConsent: boolean;
   setAiConsent: (val: boolean) => void;
+  consentPromptNonce: number;
   uploadProgress: UploadProgress | null;
   uploadPaused: boolean;
   isSubmitting: boolean;
   isPickingPath: boolean;
   resumeUploadId: string | null;
   localCsvProgress: number | null;
-  onUploadAndAnalyze: () => void;
+  privacyRedactor?: PrivacyRedactor;
+  onUploadAndAnalyze: (options?: { forceOffline?: boolean }) => void;
   onPauseUpload: () => void;
   onAbortUpload: () => void;
   onQuickCsvAnalyze: (file: File) => void;
-  onRegisterLocalCapture: () => void;
+  onRegisterLocalCapture: (options?: { forceOffline?: boolean }) => void;
   onPickNativePath: (purpose: NativePickPurpose) => void;
+  onClearModelPath: () => void;
   onRemoveLocalRoot: (root: string) => void;
-  onOpenConnectionModal: () => void;
+  onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
+  onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
+  onOpenConnectionModal: (tab?: SettingsTab) => void;
   batchMaxFiles: number | null;
   batchMaxTotalBytes: number | null;
   batchMaxFileBytes: number | null;
   onOpenBatchJob: (analysisId: string) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const consentSummaryRef = useRef<HTMLDivElement | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [quickAiBusy, setQuickAiBusy] = useState(false);
+  const [consentHighlighted, setConsentHighlighted] = useState(false);
+  const [localPathFocused, setLocalPathFocused] = useState(false);
+
+  const maskFilename = (value: string) => (privacyRedactor ? privacyRedactor.redactFilename(value) : value);
+  const maskPath = (value: string) => (privacyRedactor ? privacyRedactor.redactPath(value) : value);
+  const maskEndpoint = (value: string) => (privacyRedactor ? privacyRedactor.redactEndpoint(value) : value);
+
+  useEffect(() => {
+    if (consentPromptNonce === 0) return;
+    setConsentHighlighted(true);
+    consentSummaryRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const timer = window.setTimeout(() => setConsentHighlighted(false), 1800);
+    return () => window.clearTimeout(timer);
+  }, [consentPromptNonce]);
+
+  const handleQuickEnableAi = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      const updated = await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true }));
+      if (updated.configuration.enabled && updated.configuration.model && !aiEnabled) {
+        setAiEnabled(true);
+      }
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickSelectModel = async (modelId: string) => {
+    const clean = modelId.trim();
+    if (!clean || quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      const updated = await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true, model: clean }));
+      if (updated.configuration.enabled && updated.configuration.model && !aiEnabled) {
+        setAiEnabled(true);
+      }
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickDetectModels = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onProbeAiModels(buildQuickAiProbePayload(aiConfig));
+    } catch {
+      // Error toast is already surfaced by handleProbeAiModels.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
 
   const profiles = capabilities?.profiles ?? null;
   const activeProfile = profiles?.[resourceMode] ?? null;
   const isCsvSelected = fileInspection?.detectedFormat === "csv" || fileInspection?.detectedFormat === "tsv";
   const effectiveChunkSize = activeProfile?.chunk_size_bytes ?? capabilities?.limits.chunk_size_bytes ?? null;
-  const canStartBackendAi = Boolean(aiConfig?.configuration.enabled && aiConfig?.configuration.model);
+  const canStartBackendAi = Boolean(
+    aiConfig?.configuration.enabled &&
+      (aiConfig?.configuration.model || aiConfig?.configuration.provider === "manus"),
+  );
+  const layer1Status = resolveLayer1Status({ capabilities, workspaceConfig, aiConfig });
   const triageEndpointConfigured = Boolean(
-    aiConfig?.triage?.endpoint_configured || aiConfig?.triage?.etbert_endpoint_configured,
+    aiConfig?.triage?.endpoint_configured ||
+      aiConfig?.triage?.etbert_endpoint_configured ||
+      capabilities?.triage.endpoint_configured ||
+      capabilities?.triage.etbert_endpoint_configured,
   );
   const triageEndpointTargets = [
-    aiConfig?.triage?.endpoint_url ? `OpenJev ${safeEndpointOrigin(aiConfig.triage.endpoint_url) ?? "configured endpoint"}` : null,
-    aiConfig?.triage?.etbert_endpoint_url ? `ET-BERT ${safeEndpointOrigin(aiConfig.triage.etbert_endpoint_url) ?? "configured endpoint"}` : null,
+    aiConfig?.triage?.endpoint_url
+      ? `OpenJev ${maskEndpoint(safeEndpointOrigin(aiConfig.triage.endpoint_url) ?? "configured endpoint")}`
+      : null,
+    aiConfig?.triage?.etbert_endpoint_url
+      ? `ET-BERT ${maskEndpoint(safeEndpointOrigin(aiConfig.triage.etbert_endpoint_url) ?? "configured endpoint")}`
+      : null,
   ].filter((value): value is string => Boolean(value));
   const resolvedDataDir = workspaceConfig?.data_dir ?? capabilities?.limits.data_dir ?? "";
+  const displayDataDir = resolvedDataDir ? maskPath(resolvedDataDir) : "";
+  const displayLocalPathInput =
+    !localPathFocused && privacyRedactor?.isEnabled() && localPathInput.trim()
+      ? hasLocalFileGrant
+        ? maskFilename(localPathInput)
+        : maskPath(localPathInput)
+      : localPathInput;
   const nativePickerAvailable = workspaceConfig?.native_picker_available ?? capabilities?.limits.native_picker_available ?? false;
+
+  const consentState = resolveRunConsentState({
+    connected: connectionStatus === "connected",
+    isCsvSelected: Boolean(sourceTab === "upload" && selectedFile && isCsvSelected),
+    triageEnabled,
+    triageEndpointConfigured,
+    triageEndpointConsent,
+    layer1Kind: layer1Status.kind,
+    aiEnabled,
+    aiConsent,
+    canStartBackendAi,
+    aiBackendEnabled: aiConfig?.configuration.enabled,
+  });
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -1845,15 +3122,148 @@ function AnalyzePage({
     if (file) void onFileSelect(file);
   };
 
+  const renderInlineConsentCard = (placement: "source" | "summary") => {
+    if (sourceTab === "batch") return null;
+    if (sourceTab === "upload" && selectedFile && isCsvSelected) {
+      if (placement === "summary") {
+        return (
+          <div className="inline-consent-card">
+            <div className="inline-consent-head">
+              <strong>
+                <Icon name="shield" size={13} /> Browser CSV (100% Offline)
+              </strong>
+              <small>No Consent Needed</small>
+            </div>
+            <span className="muted">
+              สแกน Wireshark CSV ในเบราว์เซอร์โดยตรง ไม่ส่งข้อมูลออกจากเครื่อง
+            </span>
+          </div>
+        );
+      }
+      return null;
+    }
+
+    const showTier1Checkbox = triageEnabled && triageEndpointConfigured;
+    const showAiBlock = aiEnabled;
+    if (!showTier1Checkbox && !showAiBlock) return null;
+    if (placement === "source" && !consentState.hasAnyConsentPrompt) return null;
+
+    return (
+      <div
+        className={`inline-consent-card ${placement === "source" ? "consent-source" : ""} ${consentState.hasAnyConsentPrompt ? "consent-pending" : ""} ${consentHighlighted ? "consent-highlight-pulse" : ""}`}
+      >
+        <div className="inline-consent-head">
+          <strong>
+            <Icon name={consentState.hasAnyConsentPrompt ? "alert" : "check"} size={13} />{" "}
+            {consentState.needsAiSetup
+              ? "ตั้งค่า Layer-2 AI หรือสลับ Offline"
+              : consentState.hasAnyConsentPrompt
+                ? "กรุณายืนยัน Consent ก่อนส่งงาน"
+                : "ยืนยัน Consent พร้อมส่งงาน"}
+          </strong>
+          <small className="mono">{consentState.hasAnyConsentPrompt ? "ACTION NEEDED" : "READY"}</small>
+        </div>
+
+        {consentState.needsAiSetup && (
+          <>
+            <span style={{ color: "#e8cb83" }}>
+              {aiConfig && !aiConfig.configuration.enabled
+                ? "เปิดใช้ Layer-2 AI อยู่ แต่ Backend ปิดไว้ (ai.enabled = false) — เปิดใช้งานหรือปิด LLM ชั่วคราวเพื่อวิเคราะห์ทันที"
+                : "เปิดใช้ Layer-2 AI อยู่ แต่ยังไม่ได้เลือก Model บน Backend"}
+            </span>
+            <div className="inline-consent-actions">
+              <button
+                type="button"
+                className="primary-button tiny-btn"
+                onClick={() => onOpenConnectionModal("ai")}
+              >
+                <Icon name="spark" size={12} /> ตั้งค่า / เลือก Model
+              </button>
+              <button
+                type="button"
+                className="secondary-button tiny-btn"
+                onClick={() => setAiEnabled(false)}
+              >
+                ปิด LLM (ใช้ Offline ทันที)
+              </button>
+            </div>
+          </>
+        )}
+
+        {showAiBlock && !consentState.needsAiSetup && (
+          <>
+            <label className="inline-consent-row">
+              <input
+                type="checkbox"
+                checked={aiConsent}
+                onChange={(e) => setAiConsent(e.target.checked)}
+              />
+              <span>
+                <b>Layer-2 AI:</b> ยินยอมส่ง Redacted Summary ไปยัง{" "}
+                {aiConfig?.configuration.provider ?? "LLM"} ({aiConfig?.configuration.model ?? "model"})
+                <small>ไม่ส่ง raw packet/payload · {aiConsent ? "ยืนยันแล้ว" : "ติ๊กเพื่อเปิดสรุป AI"}</small>
+              </span>
+            </label>
+            {!aiConsent && (
+              <div className="inline-consent-actions">
+                <button
+                  type="button"
+                  className="secondary-button tiny-btn"
+                  onClick={() => setAiEnabled(false)}
+                >
+                  ไม่ใช้ LLM รอบนี้ (รัน Offline ทันที)
+                </button>
+              </div>
+            )}
+          </>
+        )}
+
+        {showTier1Checkbox && (
+          <label className="inline-consent-row">
+            <input
+              type="checkbox"
+              checked={triageEndpointConsent}
+              onChange={(e) => setTriageEndpointConsent(e.target.checked)}
+            />
+            <span>
+              <b>Tier-1 Sidecar (ทางเลือก):</b> ยินยอมเรียก {triageEndpointTargets.join(" / ") || "Sidecar Endpoint"}
+              <small>
+                ไม่ส่ง payload · หากไม่ติ๊ก ใช้ {layer1Status.binReady ? "ET-BERT .bin ในเครื่อง" : "Heuristic Tier-1"} อัตโนมัติ
+              </small>
+            </span>
+          </label>
+        )}
+      </div>
+    );
+  };
+
+  const binarySubmitLabel = uploadPaused
+    ? "Resume Upload & Analyze"
+    : isSubmitting
+      ? "กำลังอัปโหลด..."
+      : consentState.submitBlockedReason === "ai_setup"
+        ? "ตั้งค่า LLM หรือปิดเพื่อส่งงาน"
+        : consentState.submitBlockedReason === "ai_consent"
+          ? "ติ๊ก Consent ด้านบนเพื่อส่งงาน"
+          : "Upload & Queue Job";
+
+  const localSubmitLabel = isSubmitting
+    ? "กำลังลงทะเบียน..."
+    : consentState.submitBlockedReason === "ai_setup"
+      ? "ตั้งค่า LLM หรือปิดเพื่อส่งงาน"
+      : consentState.submitBlockedReason === "ai_consent"
+        ? "ติ๊ก Consent ด้านบนเพื่อส่งงาน"
+        : "Analyze Local Capture";
+
   return (
     <>
       <PageHeading
         eyebrow="ANALYSIS / NEW RUN"
         title="วิเคราะห์ network capture"
-        detail="รองรับ bounded resumable upload, private local-capture snapshots และการวิเคราะห์ Wireshark CSV/TSV ในเบราว์เซอร์"
+        detail="รองรับ bounded resumable upload, private local-capture snapshots, batch intake และ Wireshark CSV/TSV ในเบราว์เซอร์"
         actions={
-          <button type="button" className="secondary-button" onClick={onOpenConnectionModal}>
-            <Icon name="activity" size={15} /> {connectionStatus === "connected" ? "Workspace & Folders" : "Connect Backend"}
+          <button type="button" className="secondary-button" onClick={() => onOpenConnectionModal("ai")}>
+            <Icon name="sliders" size={15} /> {connectionStatus === "connected" ? "Settings & Models" : "Connect Backend"}
           </button>
         }
       />
@@ -1869,7 +3279,7 @@ function AnalyzePage({
           <small>
             {capabilities?.host.cgroup_memory_limit_mb
               ? `cgroup capped (${capabilities.host.cgroup_memory_limit_mb} MB)`
-              : "ยังไม่มีข้อมูล resource จาก Backend"}
+              : "Adaptive streaming bounds"}
           </small>
         </div>
         <div className="hw-item">
@@ -1877,15 +3287,15 @@ function AnalyzePage({
           <strong>
             {capabilities
               ? capabilities.limits.unlimited_upload_enabled
-                ? `ไม่กำหนดเพดานตายตัว · พื้นที่พร้อมใช้งาน ${formatBytes(capabilities.limits.effective_storage_max_bytes)}`
+                ? `พร้อมใช้งาน ${formatBytes(capabilities.limits.effective_storage_max_bytes)}`
                 : formatBytes(capabilities.limits.effective_upload_max_bytes)
               : "เชื่อมต่อ API เพื่ออ่าน upload limits"}
           </strong>
           <small className="hw-subline">
-            <span className="mono" title={resolvedDataDir || undefined}>
-              {resolvedDataDir
-                ? `Data: ${resolvedDataDir} · Chunk ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`
-                : `Chunk size: ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"} · Disk reserve status from Backend`}
+            <span className="mono" title={displayDataDir || undefined}>
+              {displayDataDir
+                ? `Data: ${displayDataDir} · Chunk ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`
+                : `Chunk: ${effectiveChunkSize ? formatBytes(effectiveChunkSize) : "unavailable"}`}
             </span>
             {connectionStatus === "connected" && nativePickerAvailable && (
               <button
@@ -1894,19 +3304,28 @@ function AnalyzePage({
                 disabled={isPickingPath}
                 onClick={() => onPickNativePath("data_dir")}
               >
-                {isPickingPath ? "รอเลือก..." : "เปลี่ยน Data Dir (Popup)"}
+                {isPickingPath ? "รอเลือก..." : "เปลี่ยน Data Dir"}
               </button>
             )}
           </small>
         </div>
         <div className="hw-item">
-          <span>PARSERS &amp; TIER-1</span>
+          <span>PARSERS, ET-BERT &amp; LAYER-2 LLM</span>
           <strong>
             {capabilities
               ? `TShark ${capabilities.host.tshark_available ? "Ready" : "Missing"} · Zeek ${capabilities.host.zeek_available ? "Ready" : "Off"} · YARA ${capabilities.host.yara_available ? "Ready" : "Off"}`
               : "CSV Engine Ready · TShark via API"}
           </strong>
-          <small>Tier-1 classifier: {capabilities?.triage.model_name ?? "openjev-cal-tier1"}</small>
+          <small className="hw-subline">
+            <span className={layer1Status.hardwareBadgeOk ? "hw-badge-ok" : layer1Status.hardwareBadgeWarn ? "hw-badge-warn" : "muted"}>
+              {layer1Status.hardwareBadgeLabel}
+            </span>
+            <span className={canStartBackendAi ? "hw-badge-ok" : "muted"}>
+              {canStartBackendAi
+                ? `LLM Ready (${aiConfig?.configuration.model || "standard"})`
+                : "LLM Standby"}
+            </span>
+          </small>
         </div>
       </section>
 
@@ -1927,7 +3346,7 @@ function AnalyzePage({
                   className={sourceTab === "upload" ? "segment-active" : ""}
                   onClick={() => setSourceTab("upload")}
                 >
-                  File Upload / CSV
+                  Upload / CSV
                 </button>
                 <button
                   type="button"
@@ -1936,7 +3355,16 @@ function AnalyzePage({
                   className={sourceTab === "local" ? "segment-active" : ""}
                   onClick={() => setSourceTab("local")}
                 >
-                  Local Capture (Verified Snapshot)
+                  Local Capture
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sourceTab === "batch"}
+                  className={sourceTab === "batch" ? "segment-active" : ""}
+                  onClick={() => setSourceTab("batch")}
+                >
+                  Batch Intake
                 </button>
               </div>
             </div>
@@ -1951,7 +3379,7 @@ function AnalyzePage({
                   onChange={handleFileInput}
                 />
                 <div
-                  className={`dropzone ${dragging ? "dropzone-active" : ""}`}
+                  className={`dropzone ${dragging ? "dropzone-active" : ""} ${selectedFile && fileInspection && !fileInspection.valid ? "dropzone-error" : ""}`}
                   onDragOver={(e) => {
                     e.preventDefault();
                     setDragging(true);
@@ -1964,7 +3392,7 @@ function AnalyzePage({
                   </div>
                   <strong>
                     {selectedFile
-                      ? `${selectedFile.name} (${formatBytes(selectedFile.size)})`
+                      ? `${maskFilename(selectedFile.name)} (${formatBytes(selectedFile.size)})`
                       : "ลากไฟล์ .pcap / .pcapng / .cap / .csv / .tsv มาวาง หรือคลิกเลือก"}
                   </strong>
                   <span>
@@ -1993,18 +3421,6 @@ function AnalyzePage({
                         {localCsvProgress !== null ? `กำลังสแกน CSV ${localCsvProgress}%` : "สแกน CSV ในเบราว์เซอร์ทันที"}
                       </button>
                     )}
-
-                    {selectedFile && (
-                      <button
-                        type="button"
-                        className={isCsvSelected ? "secondary-button" : "primary-button"}
-                        disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
-                        onClick={onUploadAndAnalyze}
-                      >
-                        <Icon name="upload" size={15} />{" "}
-                        {uploadPaused ? "Resume Upload & Analyze" : isSubmitting ? "กำลังอัปโหลด..." : "Upload & Run Full Pipeline"}
-                      </button>
-                    )}
                   </div>
 
                   {selectedFile && fileInspection && !fileInspection.valid && (
@@ -2017,6 +3433,8 @@ function AnalyzePage({
                     <div className="dropzone-empty-hint">ยังไม่มีไฟล์ — เลือก PCAP/PCAPNG หรือ Wireshark CSV/TSV เพื่อเริ่ม</div>
                   )}
                 </div>
+
+                {selectedFile && !isCsvSelected && renderInlineConsentCard("source")}
 
                 {(uploadProgress || uploadPaused) && (
                   <div className="upload-progress-card">
@@ -2051,7 +3469,7 @@ function AnalyzePage({
                           </button>
                         )}
                         {uploadPaused && (
-                          <button type="button" className="primary-button tiny-btn" onClick={onUploadAndAnalyze}>
+                          <button type="button" className="primary-button tiny-btn" onClick={() => onUploadAndAnalyze()}>
                             Resume
                           </button>
                         )}
@@ -2063,12 +3481,12 @@ function AnalyzePage({
                   </div>
                 )}
               </>
-            ) : (
+            ) : sourceTab === "local" ? (
               <div className="local-ingest-box">
                 {connectionStatus !== "connected" ? (
                   <div className="consent-required">
                     ต้องเชื่อมต่อ Backend API ก่อนจึงจะเลือกไฟล์ local และสร้าง private snapshot เพื่อวิเคราะห์ได้{" "}
-                    <button type="button" className="text-button" onClick={onOpenConnectionModal}>
+                    <button type="button" className="text-button" onClick={() => onOpenConnectionModal("connection")}>
                       ตั้งค่าการเชื่อมต่อ <Icon name="arrow" size={13} />
                     </button>
                   </div>
@@ -2090,44 +3508,30 @@ function AnalyzePage({
                         disabled={isPickingPath || !nativePickerAvailable}
                         onClick={() => onPickNativePath("capture_root")}
                       >
-                        <Icon name="upload" size={14} /> + เพิ่มโฟลเดอร์ PCAP (Popup)
+                        <Icon name="upload" size={14} /> + เพิ่มโฟลเดอร์ PCAP
                       </button>
-                      <button
-                        type="button"
-                        className="secondary-button tiny-btn"
-                        disabled={isPickingPath || !nativePickerAvailable}
-                        onClick={() => onPickNativePath("data_dir")}
-                      >
-                        เปลี่ยน Data Dir (Popup)
-                      </button>
-                      <button type="button" className="text-button tiny-btn" onClick={onOpenConnectionModal}>
-                        ตั้งค่า Workspace / Path
+                      <button type="button" className="text-button tiny-btn" onClick={() => onOpenConnectionModal("storage")}>
+                        จัดการ Storage &amp; Paths
                       </button>
                     </div>
 
                     {!localBrowse?.enabled ? (
                       <div className="consent-required">
-                        <strong>ยังไม่มี local capture folder — กด &quot;เลือกไฟล์ Capture (Popup)&quot; หรือ &quot;+ เพิ่มโฟลเดอร์ PCAP (Popup)&quot; ด้านบนได้เลย</strong>
+                        <strong>ยังไม่มี local capture folder — กด &quot;เลือกไฟล์ Capture (Popup)&quot; หรือ &quot;+ เพิ่มโฟลเดอร์ PCAP&quot; ด้านบนได้เลย</strong>
                         <span>
                           {nativePickerAvailable
                             ? "การเลือกไฟล์ให้สิทธิ์อ่านเฉพาะไฟล์นั้นครั้งเดียว นาน 5 นาที; จะไม่เพิ่มโฟลเดอร์แม่ใน allowlist"
-                            : "Environment ปัจจุบันไม่มีหน้าต่าง GUI Picker — กรอก path ใน Workspace & Folders หรือตั้ง env ก่อนสตาร์ทเซิร์ฟเวอร์"}
+                            : "Environment ปัจจุบันไม่มีหน้าต่าง GUI Picker — กรอก path ใน Settings หรือเพิ่ม allowlisted root"}
                         </span>
                         <div className="local-path-row">
                           <input
                             type="text"
-                            value={localPathInput}
+                            value={displayLocalPathInput}
+                            onFocus={() => setLocalPathFocused(true)}
+                            onBlur={() => setLocalPathFocused(false)}
                             onChange={(e) => setLocalPathInput(e.target.value)}
                             placeholder={hasLocalFileGrant ? "ไฟล์ที่เลือกผ่าน native picker" : "เลือกไฟล์ผ่าน Popup หรือเพิ่ม allowlisted folder ก่อนกรอก path"}
                           />
-                          <button
-                            type="button"
-                            className="primary-button"
-                            disabled={(!hasLocalFileGrant && !localPathInput.trim()) || isSubmitting}
-                            onClick={onRegisterLocalCapture}
-                          >
-                            <Icon name="play" size={15} /> Register &amp; Analyze
-                          </button>
                         </div>
                         {!nativePickerAvailable && (
                           <code>export PCAP_LOCAL_INGEST_ROOTS="/data/pcaps,/home/user/captures"</code>
@@ -2139,11 +3543,11 @@ function AnalyzePage({
                           <span>Allowed roots:</span>
                           {localBrowse.roots.map((r) => (
                             <b key={r} className="root-chip">
-                              <span>{r}</span>
+                              <span>{maskPath(r)}</span>
                               <button
                                 type="button"
                                 className="root-remove-btn"
-                                aria-label={`ลบโฟลเดอร์ ${r}`}
+                                aria-label={`ลบโฟลเดอร์ ${maskPath(r)}`}
                                 onClick={() => onRemoveLocalRoot(r)}
                               >
                                 ×
@@ -2154,23 +3558,17 @@ function AnalyzePage({
                         <div className="local-path-row">
                           <input
                             type="text"
-                            value={localPathInput}
+                            value={displayLocalPathInput}
+                            onFocus={() => setLocalPathFocused(true)}
+                            onBlur={() => setLocalPathFocused(false)}
                             onChange={(e) => setLocalPathInput(e.target.value)}
                             placeholder="เลือกจาก Popup ด้านบน หรือวาง path ไฟล์ PCAP/PCAPNG/CSV บนเครื่อง"
                           />
-                          <button
-                            type="button"
-                            className="primary-button"
-                            disabled={!localPathInput.trim() || isSubmitting}
-                            onClick={onRegisterLocalCapture}
-                          >
-                            <Icon name="play" size={15} /> Register &amp; Analyze
-                          </button>
                         </div>
                         <div className="local-file-list">
                           {localBrowse.files.length === 0 ? (
                             <div className="empty-state">
-                              ไม่พบไฟล์ .pcap/.pcapng/.cap/.csv/.tsv ในโฟลเดอร์ที่เลือก — กด &quot;+ เพิ่มโฟลเดอร์ PCAP (Popup)&quot; ด้านบน
+                              ไม่พบไฟล์ .pcap/.pcapng/.cap/.csv/.tsv ในโฟลเดอร์ที่เลือก — กด &quot;+ เพิ่มโฟลเดอร์ PCAP&quot; ด้านบน
                             </div>
                           ) : (
                             localBrowse.files.map((item) => (
@@ -2182,8 +3580,8 @@ function AnalyzePage({
                               >
                                 <Icon name="file" size={15} />
                                 <div>
-                                  <strong>{item.name}</strong>
-                                  <small className="mono">{item.path}</small>
+                                  <strong>{maskFilename(item.name)}</strong>
+                                  <small className="mono">{maskPath(item.path)}</small>
                                 </div>
                                 <span className="mono">{formatBytes(item.size_bytes)}</span>
                               </button>
@@ -2192,179 +3590,352 @@ function AnalyzePage({
                         </div>
                       </>
                     )}
+                    {(hasLocalFileGrant || Boolean(localPathInput.trim())) && renderInlineConsentCard("source")}
                   </>
                 )}
               </div>
+            ) : (
+              <BatchIntakePanel
+                api={apiClient}
+                connected={connectionStatus === "connected"}
+                maxFiles={batchMaxFiles}
+                maxTotalBytes={batchMaxTotalBytes}
+                maxFileBytes={batchMaxFileBytes}
+                privacyRedactor={privacyRedactor}
+                onOpenJob={onOpenBatchJob}
+              />
             )}
 
-          <div className="upload-foot">
-              <span>
-                <Icon name="shield" size={15} /> พาสเวิร์ด, cookies และ raw payloads จะไม่ถูกส่งออกจาก parser หรือส่งเข้า AI LLM
-              </span>
-              <span className="muted">
-                {connectionStatus !== "connected" && connectionError ? connectionError : "SHA-256 provenance tracked per capture"}
-              </span>
-          </div>
-        </section>
-
-        <BatchIntakePanel
-          api={apiClient}
-          connected={connectionStatus === "connected"}
-          maxFiles={batchMaxFiles}
-          maxTotalBytes={batchMaxTotalBytes}
-          maxFileBytes={batchMaxFileBytes}
-          onOpenJob={onOpenBatchJob}
-        />
-
-          <section className="panel options-panel">
-            <div className="upload-head">
-              <div>
-                <div className="section-kicker">02 / RESOURCE LIMITS &amp; OPTIONAL AI</div>
-                <h2>ควบคุม resource และข้อมูลก่อนส่ง provider</h2>
-                <p>Tier-1 ใช้ local classifier เป็นค่าเริ่มต้น; HTTP endpoint ต้องผ่าน allowlist และ consent ต่อ analysis; AI narrator แยก consent อีกชั้นและรับเฉพาะ minimized structured evidence</p>
-              </div>
-              <span className="step-tag">PIPELINE</span>
-            </div>
-
-            <div className="profile-grid" role="radiogroup" aria-label="Resource execution profile">
-              {(["auto", "fast", "deep", "unlimited"] as ResourceMode[]).map((mode) => {
-                const prof = profiles?.[mode] ?? null;
-                const titleMap: Record<ResourceMode, string> = {
-                  auto: "Auto (Device-Adaptive)",
-                  fast: "Fast Triage",
-                  deep: "Deep Capture",
-                  unlimited: "Max Server-Bounded",
-                };
-                return (
-                  <button
-                    type="button"
-                    key={mode}
-                    role="radio"
-                    aria-checked={Boolean(prof) && resourceMode === mode}
-                    className={`profile-option ${resourceMode === mode ? "profile-option-active" : ""}`}
-                    disabled={!prof}
-                    onClick={() => setResourceMode(mode)}
-                  >
-                    <div className="profile-option-head">
-                      <strong>{titleMap[mode]}</strong>
-                      <span className="mono">{mode.toUpperCase()}</span>
-                    </div>
-                    <small className="mono">
-                      {prof
-                        ? `${prof.packet_limit === 0 ? "All packets (∞ stream)" : `${formatCompactCount(prof.packet_limit)} pkts`} · ${formatCompactCount(prof.flow_limit)} flows`
-                        : "Limits unavailable until Backend capabilities load"}
-                    </small>
-                    <small>
-                      {prof ? `RAM ${prof.parser_memory_mb} MB · Timeout ${formatDuration(prof.timeout_seconds)}` : "No estimate is shown without server data"}
-                    </small>
-                  </button>
-                );
-              })}
-            </div>
-
-            <div className="option-row">
-              <div className="option-symbol intel-symbol">
-                <Icon name="nodes" size={18} />
-              </div>
-              <div className="option-copy">
-                <strong id="triage-label">Tier-1 local classifier + Pre-AI Compactor</strong>
-                <span id="triage-help">
-                  ใช้ local heuristic เมื่อเปิดใช้; network endpoint แยก consent ต่อ analysis และไม่เปิดโดยปริยาย
+            {sourceTab !== "batch" && (
+              <div className="upload-foot">
+                <span>
+                  <Icon name="shield" size={15} /> พาสเวิร์ด, cookies และ raw payloads จะไม่ถูกส่งออกจาก parser หรือส่งเข้า AI LLM
                 </span>
-              </div>
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  aria-labelledby="triage-label"
-                  aria-describedby="triage-help"
-                  checked={triageEnabled}
-                  onChange={(e) => setTriageEnabled(e.target.checked)}
-                />
-                <span />
-              </label>
-            </div>
-
-            {triageEnabled && triageEndpointConfigured && (
-              <div className="ai-config-callout">
-                <div className="consent-required">
-                  <strong>Tier-1 endpoint configured</strong>
-                  <span>ค่าเริ่มต้นจะไม่ส่ง network request. เมื่อยินยอม จะส่งเฉพาะ pseudonymized, allowlisted flow features ไปยัง endpoint ที่ผู้ดูแลกำหนด — ไม่ส่งไฟล์ PCAP หรือ packet payload.</span>
-                  <span className="mono">ปลายทาง: {triageEndpointTargets.join(" · ") || "configured endpoint"}</span>
-                </div>
-                <label className="consent-choice">
-                  <input
-                    type="checkbox"
-                    checked={triageEndpointConsent}
-                    onChange={(e) => setTriageEndpointConsent(e.target.checked)}
-                  />
-                  <span>ยินยอมให้ analysis นี้เรียก Tier-1 endpoint ที่กำหนดไว้</span>
-                </label>
-              </div>
-            )}
-
-            <div className="option-row option-row-last">
-              <div className="option-symbol ai-symbol">
-                <Icon name="spark" size={18} />
-              </div>
-              <div className="option-copy">
-                <strong id="ai-narrative-label">สร้าง AI-Assisted Narrative (Opt-in)</strong>
-                <span id="ai-narrative-help">
-                  {aiConfig?.configuration.enabled
-                    ? `เชื่อมต่อกับ ${aiConfig.configuration.provider} (${aiConfig.configuration.model ?? "unselected"} · boundary: ${aiConfig.configuration.data_boundary})`
-                    : "ส่งเฉพาะ Redacted Escalated Evidence Summary — ไม่ส่ง raw payload หรือ IPs จริง"}
+                <span className="muted">
+                  {connectionStatus !== "connected" && connectionError ? connectionError : "SHA-256 provenance tracked per capture"}
                 </span>
-              </div>
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  aria-labelledby="ai-narrative-label"
-                  aria-describedby="ai-narrative-help"
-                  checked={aiEnabled}
-                  onChange={(e) => setAiEnabled(e.target.checked)}
-                />
-                <span />
-              </label>
-            </div>
-
-            {aiEnabled && (
-              <div className="ai-config-callout">
-                {connectionStatus === "connected" && !canStartBackendAi ? (
-                  <div className="consent-required">
-                    Backend ตั้งค่า <code>ai.enabled = false</code> หรือยังไม่ได้กำหนด <code>ai.model</code> — deterministic detectors และ Tier-1 classifier ยังทำงานได้เต็มรูปแบบ
-                  </div>
-                ) : (
-                  <>
-                    <div className="ai-meta-grid mono">
-                  <span>Provider: {aiConfig?.configuration.provider ?? "server-configured"}</span>
-                      <span>Model: {aiConfig?.configuration.model ?? "server PCAP_AI_MODEL"}</span>
-                      <span>
-                        Context Budget: {aiConfig?.configuration.context_window_tokens ?? "unreported"} tok /{" "}
-                        {aiConfig?.configuration.input_max_bytes ? formatBytes(aiConfig.configuration.input_max_bytes) : "unreported"}
-                      </span>
-                      {aiModels && <span>Discovered models: {aiModels.items.length}</span>}
-                    </div>
-                    <label className="consent-choice">
-                      <input
-                        type="checkbox"
-                        checked={aiConsent}
-                        onChange={(e) => setAiConsent(e.target.checked)}
-                      />
-                      <span>
-                        ยืนยันส่งเฉพาะ Redacted &amp; Tier-1 Compacted Evidence Summary ไปยัง endpoint (
-                        {aiConfig?.configuration.data_boundary ?? "configured boundary"})
-                      </span>
-                    </label>
-                  </>
-                )}
               </div>
             )}
           </section>
+
+          {sourceTab !== "batch" && (
+            <section className="panel options-panel">
+              <div className="upload-head">
+                <div>
+                  <div className="section-kicker">02 / RESOURCE LIMITS &amp; OPTIONAL AI</div>
+                  <h2>ควบคุม resource และโมเดลวิเคราะห์</h2>
+                  <p>เลือก Profile และเปิด/ปิด Tier-1 Sidecar หรือ Layer-2 LLM — ช่องยินยอม Consent อยู่เหนือปุ่มส่งงานด้านขวาเสมอ</p>
+                </div>
+                <span className="step-tag">PIPELINE</span>
+              </div>
+
+              <div className="profile-grid" role="radiogroup" aria-label="Resource execution profile">
+                {(["auto", "fast", "deep", "unlimited"] as ResourceMode[]).map((mode) => {
+                  const prof = profiles?.[mode] ?? null;
+                  const titleMap: Record<ResourceMode, string> = {
+                    auto: "Auto (Device-Adaptive)",
+                    fast: "Fast Triage",
+                    deep: "Deep Capture",
+                    unlimited: "Max Server-Bounded",
+                  };
+                  return (
+                    <button
+                      type="button"
+                      key={mode}
+                      role="radio"
+                      aria-checked={Boolean(prof) && resourceMode === mode}
+                      className={`profile-option ${resourceMode === mode ? "profile-option-active" : ""}`}
+                      disabled={!prof}
+                      onClick={() => setResourceMode(mode)}
+                    >
+                      <div className="profile-option-head">
+                        <strong>{titleMap[mode]}</strong>
+                        <span className="mono">{mode.toUpperCase()}</span>
+                      </div>
+                      <small className="mono">
+                        {prof
+                          ? `${prof.packet_limit === 0 ? "All packets (∞ stream)" : `${formatCompactCount(prof.packet_limit)} pkts`} · ${formatCompactCount(prof.flow_limit)} flows`
+                          : "Limits unavailable until Backend capabilities load"}
+                      </small>
+                      <small>
+                        {prof ? `RAM ${prof.parser_memory_mb} MB · Timeout ${formatDuration(prof.timeout_seconds)}` : "No estimate is shown without server data"}
+                      </small>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="ai-layer-status-grid">
+                <div className="ai-layer-card">
+                  <div className="ai-layer-card-head">
+                    <strong>Layer 1 · Offline Tier-1 + ET-BERT</strong>
+                    <span className={pillClassFromTone(layer1Status.pillTone)}>
+                      {layer1Status.badgeLabel}
+                    </span>
+                  </div>
+                  <small>{layer1Status.analyzeCardDetail}</small>
+                  <div className="layer1-quick-actions">
+                    {connectionStatus === "connected" && nativePickerAvailable && (
+                      <button
+                        type="button"
+                        className="hw-action-btn"
+                        disabled={isPickingPath}
+                        onClick={() => onPickNativePath("model_file")}
+                      >
+                        {isPickingPath ? "รอเลือก..." : "เลือก .bin (Popup)"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="hw-action-btn"
+                      onClick={() => onOpenConnectionModal("storage")}
+                    >
+                      ตั้งค่า ET-BERT
+                    </button>
+                    {connectionStatus === "connected" && layer1Status.binBound && (
+                      <button
+                        type="button"
+                        className="hw-action-btn"
+                        onClick={onClearModelPath}
+                      >
+                        Unbind .bin
+                      </button>
+                    )}
+                    <span className="layer1-offline-pill">100% Offline</span>
+                  </div>
+                </div>
+                <div className="ai-layer-card">
+                  <div className="ai-layer-card-head">
+                    <strong>Layer 2 · Optional LLM Narrator</strong>
+                    <button
+                      type="button"
+                      className="hw-action-btn"
+                      onClick={() => onOpenConnectionModal("ai")}
+                    >
+                      {canStartBackendAi ? "แก้ไข LLM" : "ตั้งค่า LLM"}
+                    </button>
+                  </div>
+                  <small>
+                    {canStartBackendAi
+                      ? `พร้อมใช้งาน: ${aiConfig?.configuration.provider} (${aiConfig?.configuration.model})`
+                      : connectionStatus === "connected" && aiConfig && !aiConfig.configuration.enabled
+                        ? "Layer-2 AI ถูกปิดอยู่ (ai.enabled = false) — กดเปิดหรือวิเคราะห์แบบ Offline ได้เลย"
+                        : connectionStatus === "connected" && aiConfig?.configuration.enabled
+                          ? `เปิดใช้งานแล้ว (${aiConfig.configuration.provider}) — เลือก Model หรือกด Detect Models`
+                          : "Standby — เชื่อมต่อ Backend แล้วเลือกโมเดล Local Ollama หรือ API Endpoint"}
+                  </small>
+                  {connectionStatus === "connected" && !canStartBackendAi && (
+                    <div className="ai-quick-models">
+                      {aiConfig && !aiConfig.configuration.enabled ? (
+                        <button
+                          type="button"
+                          className="ai-model-chip"
+                          disabled={quickAiBusy}
+                          onClick={() => void handleQuickEnableAi()}
+                        >
+                          <Icon name="spark" size={11} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                        </button>
+                      ) : (
+                        <>
+                          {(aiModels?.items ?? []).slice(0, 4).map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              className="ai-model-chip"
+                              disabled={quickAiBusy}
+                              onClick={() => void handleQuickSelectModel(item.id)}
+                            >
+                              <Icon name="spark" size={11} /> ใช้ {item.id}
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            className="ai-model-chip"
+                            disabled={quickAiBusy}
+                            onClick={() => void handleQuickDetectModels()}
+                          >
+                            <Icon name="search" size={11} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="option-row">
+                <div className="option-symbol intel-symbol">
+                  <Icon name="nodes" size={18} />
+                </div>
+                <div className="option-copy">
+                  <strong id="triage-label">Tier-1 Classifier + Pre-AI Compactor</strong>
+                  <span id="triage-help">
+                    ใช้ local heuristic / .bin อัตโนมัติ; ถ้าเปิด Tier-1 sidecar ต้องติ๊กยินยอมก่อนเรียก endpoint
+                  </span>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    aria-labelledby="triage-label"
+                    aria-describedby="triage-help"
+                    checked={triageEnabled}
+                    onChange={(e) => setTriageEnabled(e.target.checked)}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              {triageEnabled && triageEndpointConfigured && (
+                <div className="ai-config-callout">
+                  <div className="consent-required">
+                    <strong>Tier-1 Sidecar endpoint configured</strong>
+                    <span>ส่งเฉพาะ pseudonymized flow features เมื่อยินยอม — ไม่ส่ง PCAP หรือ payload ({triageEndpointTargets.join(" · ") || "configured endpoint"})</span>
+                  </div>
+                  <label className="consent-choice">
+                    <input
+                      type="checkbox"
+                      checked={triageEndpointConsent}
+                      onChange={(e) => setTriageEndpointConsent(e.target.checked)}
+                    />
+                    <span>ยินยอมให้ analysis นี้เรียก Tier-1 Sidecar endpoint</span>
+                  </label>
+                </div>
+              )}
+
+              <div className="option-row option-row-last">
+                <div className="option-symbol ai-symbol">
+                  <Icon name="spark" size={18} />
+                </div>
+                <div className="option-copy">
+                  <strong id="ai-narrative-label">สร้าง AI-Assisted Narrative (Opt-in)</strong>
+                  <span id="ai-narrative-help">
+                    {aiConfig?.configuration.enabled
+                      ? `เชื่อมต่อกับ ${aiConfig.configuration.provider} (${aiConfig.configuration.model ?? "unselected"} · boundary: ${aiConfig.configuration.data_boundary})`
+                      : "ส่งเฉพาะ Redacted Escalated Evidence Summary — ไม่ส่ง raw payload หรือ IPs จริง"}
+                  </span>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    aria-labelledby="ai-narrative-label"
+                    aria-describedby="ai-narrative-help"
+                    checked={aiEnabled}
+                    onChange={(e) => setAiEnabled(e.target.checked)}
+                  />
+                  <span />
+                </label>
+              </div>
+
+              {aiEnabled && (
+                <div className="ai-config-callout">
+                  {connectionStatus === "connected" && !canStartBackendAi ? (
+                    <div className="consent-required">
+                      {aiConfig && !aiConfig.configuration.enabled ? (
+                        <>
+                          <strong>Layer-2 AI ถูกปิดอยู่บน Backend (ai.enabled = false)</strong>
+                          <span>
+                            กดเปิดใช้งานทันทีหรือตั้งค่า Model ใน Settings — หรือปิดสวิตช์ LLM เพื่อใช้เฉพาะ Offline Tier-1
+                          </span>
+                          <div className="consent-cta">
+                            <button
+                              type="button"
+                              className="primary-button tiny-btn"
+                              disabled={quickAiBusy}
+                              onClick={() => void handleQuickEnableAi()}
+                            >
+                              <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button tiny-btn"
+                              onClick={() => onOpenConnectionModal("ai")}
+                            >
+                              ตั้งค่า AI Provider
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <strong>กรุณาเลือก Layer-2 Model</strong>
+                          <span>คลิกเลือกโมเดลที่พบหรือกด Detect Models ด้านล่าง</span>
+                          {aiModels && aiModels.items.length > 0 && (
+                            <div className="ai-quick-models">
+                              {aiModels.items.slice(0, 6).map((item) => (
+                                <button
+                                  key={item.id}
+                                  type="button"
+                                  className="ai-model-chip"
+                                  disabled={quickAiBusy}
+                                  onClick={() => void handleQuickSelectModel(item.id)}
+                                >
+                                  <Icon name="spark" size={11} /> {item.id}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          <div className="consent-cta">
+                            <button
+                              type="button"
+                              className="primary-button tiny-btn"
+                              disabled={quickAiBusy}
+                              onClick={() => void handleQuickDetectModels()}
+                            >
+                              <Icon name="search" size={13} /> {quickAiBusy ? "กำลังตรวจจับ…" : "Detect Models"}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button tiny-btn"
+                              onClick={() => onOpenConnectionModal("ai")}
+                            >
+                              ตั้งค่า AI Provider
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="ai-meta-grid mono">
+                        <span>Provider: {aiConfig?.configuration.provider ?? "server-configured"}</span>
+                        <span>Model: {aiConfig?.configuration.model ?? "server PCAP_AI_MODEL"}</span>
+                        <span>
+                          Budget: {aiConfig?.configuration.context_window_tokens ?? "unreported"} tok /{" "}
+                          {aiConfig?.configuration.input_max_bytes ? formatBytes(aiConfig.configuration.input_max_bytes) : "unreported"}
+                        </span>
+                      </div>
+                      <label className="consent-choice">
+                        <input
+                          type="checkbox"
+                          checked={aiConsent}
+                          onChange={(e) => setAiConsent(e.target.checked)}
+                        />
+                        <span>
+                          ยืนยันส่งเฉพาะ Redacted &amp; Tier-1 Compacted Evidence Summary ไปยัง endpoint (
+                          {aiConfig?.configuration.data_boundary ?? "configured boundary"})
+                        </span>
+                      </label>
+                    </>
+                  )}
+                </div>
+              )}
+            </section>
+          )}
         </div>
 
         <aside className="panel run-summary">
           <div className="summary-kicker">ACTIVE EXECUTION PLAN</div>
-          <h2>{activeProfile ? `${resourceMode.toUpperCase()} Profile` : "Resource limits unavailable"}</h2>
-          <p className="summary-description">Pipeline แบบ Asynchronous + Streaming Priority Eviction</p>
+          <h2>
+            {sourceTab === "batch"
+              ? "Batch Safe Intake"
+              : activeProfile
+                ? `${resourceMode.toUpperCase()} Profile`
+                : "Resource limits unavailable"}
+          </h2>
+          <p className="summary-description">
+            {sourceTab === "batch"
+              ? "แต่ละไฟล์สร้าง analysis job แยกกันอัตโนมัติ (Offline Tier-1 + Auto profile)"
+              : "Pipeline แบบ Asynchronous + Streaming Priority Eviction"}
+          </p>
           <div className="profile-stage-list">
             <div>
               <span className="profile-index">01</span>
@@ -2376,7 +3947,7 @@ function AnalyzePage({
               <span>
                 {activeProfile
                   ? activeProfile.packet_limit === 0 ? "∞ Streaming TShark/CSV" : `≤ ${formatCompactCount(activeProfile.packet_limit)} pkts`
-                  : "Packet limit unavailable until Backend capabilities load"}
+                  : "Packet limit pending Backend"}
               </span>
               <span className="profile-required">STREAM</span>
             </div>
@@ -2385,17 +3956,15 @@ function AnalyzePage({
               <span>L2–L7 Detectors (ARP/DNS/TLS/TCP)</span>
               <span className="profile-required">REQUIRED</span>
             </div>
-            <div>
+            <div title={consentState.stage04Note}>
               <span className="profile-index">04</span>
-              <span>Tier-1 local heuristics / optional endpoint</span>
-              <span className={triageEnabled ? "profile-required" : "profile-optional"}>
-                {triageEnabled ? "ON" : "OFF"}
-              </span>
+              <span>Tier-1 ({consentState.stage04Note})</span>
+              <span className={`profile-${consentState.stage04Tone}`}>{consentState.stage04Label}</span>
             </div>
-            <div>
+            <div title={consentState.stage05Note}>
               <span className="profile-index">05</span>
-              <span>AI Summary (Pack ≤ Budget)</span>
-              <span className="profile-optional">{aiEnabled && aiConsent ? "OPT-IN" : "OFF"}</span>
+              <span>AI Summary ({consentState.stage05Note})</span>
+              <span className={`profile-${consentState.stage05Tone}`}>{consentState.stage05Label}</span>
             </div>
           </div>
 
@@ -2411,35 +3980,87 @@ function AnalyzePage({
             </div>
           </div>
 
-          {sourceTab === "upload" && selectedFile ? (
+          {sourceTab !== "batch" && (
+            <div ref={consentSummaryRef}>
+              {renderInlineConsentCard("summary")}
+            </div>
+          )}
+
+          {sourceTab === "batch" ? (
+            <div className="empty-state">ส่งไฟล์ได้โดยตรงในแท็บ Batch Intake ด้านซ้าย</div>
+          ) : sourceTab === "upload" && selectedFile ? (
             isCsvSelected ? (
-              <button
-                type="button"
-                className="primary-button full-button"
-                disabled={localCsvProgress !== null}
-                onClick={() => onQuickCsvAnalyze(selectedFile)}
-              >
-                <Icon name="play" size={15} /> Scan CSV Now
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="primary-button full-button"
+                  disabled={localCsvProgress !== null}
+                  onClick={() => onQuickCsvAnalyze(selectedFile)}
+                >
+                  <Icon name="play" size={15} /> Scan CSV Now
+                </button>
+                {connectionStatus === "connected" && (
+                  <button
+                    type="button"
+                    className="secondary-button full-button offline-run-button"
+                    disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
+                    onClick={() => onUploadAndAnalyze({ forceOffline: true })}
+                  >
+                    <Icon name="upload" size={14} /> Upload CSV ไปยัง Backend Pipeline
+                  </button>
+                )}
+              </>
             ) : (
+              <>
+                <button
+                  type="button"
+                  className={
+                    consentState.submitBlockedReason !== "none"
+                      ? "primary-button full-button btn-needs-consent"
+                      : "primary-button full-button"
+                  }
+                  disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
+                  onClick={() => onUploadAndAnalyze()}
+                >
+                  <Icon name="upload" size={15} /> {binarySubmitLabel}
+                </button>
+                {(consentState.hasAnyConsentPrompt || aiEnabled || triageEndpointConsent) && (
+                  <button
+                    type="button"
+                    className="secondary-button full-button offline-run-button"
+                    disabled={isSubmitting || (fileInspection !== null && !fileInspection.valid)}
+                    onClick={() => onUploadAndAnalyze({ forceOffline: true })}
+                  >
+                    <Icon name="shield" size={14} /> วิเคราะห์แบบ Offline ทันที (ไม่ใช้ LLM / Sidecar)
+                  </button>
+                )}
+              </>
+            )
+          ) : sourceTab === "local" && (localPathInput.trim() || hasLocalFileGrant) ? (
+            <>
               <button
                 type="button"
-                className="primary-button full-button"
+                className={
+                  consentState.submitBlockedReason !== "none"
+                    ? "primary-button full-button btn-needs-consent"
+                    : "primary-button full-button"
+                }
                 disabled={isSubmitting}
-                onClick={onUploadAndAnalyze}
+                onClick={() => onRegisterLocalCapture()}
               >
-                <Icon name="upload" size={15} /> Upload &amp; Queue Job
+                <Icon name="play" size={15} /> {localSubmitLabel}
               </button>
-            )
-          ) : sourceTab === "local" && localPathInput.trim() ? (
-            <button
-              type="button"
-              className="primary-button full-button"
-              disabled={isSubmitting}
-              onClick={onRegisterLocalCapture}
-            >
-              <Icon name="play" size={15} /> Analyze Local Capture
-            </button>
+              {(consentState.hasAnyConsentPrompt || aiEnabled || triageEndpointConsent) && (
+                <button
+                  type="button"
+                  className="secondary-button full-button offline-run-button"
+                  disabled={isSubmitting}
+                  onClick={() => onRegisterLocalCapture({ forceOffline: true })}
+                >
+                  <Icon name="shield" size={14} /> วิเคราะห์แบบ Offline ทันที (ไม่ใช้ LLM / Sidecar)
+                </button>
+              )}
+            </>
           ) : (
             <div className="empty-state">เลือก capture จริงก่อนเริ่มวิเคราะห์</div>
           )}
@@ -2453,27 +4074,46 @@ function JobsPage({
   connectionStatus,
   capabilities,
   jobs,
+  jobsTotal,
+  jobsPage,
+  jobsPageSize,
+  jobsMutating,
   activeJobId,
   report,
   aiEnabled,
+  privacyRedactor,
   onNavigate,
   onCancelJob,
+  onDeleteJob,
+  onPruneJobs,
+  onChangeJobsPage,
   onOpenJobReport,
   onRefreshJobs,
 }: {
   connectionStatus: ConnectionStatus;
   capabilities: SystemCapabilities | null;
   jobs: JobSummary[];
+  jobsTotal: number;
+  jobsPage: number;
+  jobsPageSize: number;
+  jobsMutating: boolean;
   activeJobId: string | null;
   report: WorkspaceReport;
   aiEnabled: boolean;
+  privacyRedactor?: PrivacyRedactor;
   onNavigate: (screen: Screen) => void;
   onCancelJob: (id: string) => Promise<void>;
+  onDeleteJob: (id: string) => Promise<void>;
+  onPruneJobs: () => Promise<void>;
+  onChangeJobsPage: (page: number) => void;
   onOpenJobReport: (id: string, target: Screen) => void;
   onRefreshJobs: () => void;
 }) {
+  const maskFilename = (value: string) => (privacyRedactor ? privacyRedactor.redactFilename(value) : value);
   const activeCount = jobs.filter((j) => ACTIVE_STATES.has(j.state)).length;
   const completedCount = jobs.filter((j) => j.state === "completed" || j.state === "partial").length;
+  const totalCount = jobsTotal || jobs.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / jobsPageSize));
 
   const focusedJob = jobs.find((j) => j.id === activeJobId) ?? jobs[0] ?? null;
 
@@ -2512,6 +4152,16 @@ function JobsPage({
                 Refresh Queue
               </button>
             )}
+            {connectionStatus === "connected" && totalCount > jobsPageSize && (
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={jobsMutating}
+                onClick={() => void onPruneJobs()}
+              >
+                ล้างงานเก่า (&gt;{jobsPageSize})
+              </button>
+            )}
             <button className="primary-button" onClick={() => onNavigate("analyze")}>
               <Icon name="upload" size={16} /> วิเคราะห์ capture ใหม่
             </button>
@@ -2519,7 +4169,7 @@ function JobsPage({
         }
       />
 
-      <div className="jobs-summary">
+      <div className="jobs-summary stagger-grid">
         <div className="queue-stat">
           <span>ACTIVE JOBS</span>
           <strong>{String(activeCount).padStart(2, "0")}</strong>
@@ -2528,7 +4178,7 @@ function JobsPage({
         <div className="queue-stat">
           <span>COMPLETED / PARTIAL</span>
           <strong>{String(completedCount).padStart(2, "0")}</strong>
-          <small>{jobs.length} total persisted in SQLite</small>
+          <small>{totalCount} total persisted in SQLite</small>
         </div>
         <div className="queue-stat queue-capacity">
           <span>FREE DISK HEADROOM</span>
@@ -2541,13 +4191,13 @@ function JobsPage({
         </div>
       </div>
 
-      <section className="panel lifecycle-panel" aria-label="Job lifecycle">
+      <section className="panel lifecycle-panel panel-enter" aria-label="Job lifecycle">
         <div className="lifecycle-heading">
           <div>
             <span className="section-kicker">ASYNC JOB LIFECYCLE</span>
             <h2>
               {focusedJob
-                ? `${focusedJob.capture_filename ?? focusedJob.id.slice(0, 8)} (${focusedJob.resource_mode ?? "auto"})`
+                ? `${maskFilename(focusedJob.capture_filename ?? focusedJob.id.slice(0, 8))} (${focusedJob.resource_mode ?? "auto"})`
                 : report.origin === "empty" ? "ยังไม่มี active job" : report.fileName}
             </h2>
           </div>
@@ -2557,14 +4207,18 @@ function JobsPage({
           {focusedJob ? lifecycleSteps.map((label, index) => {
             const optionalOff = index === 5 && !(focusedJob ? focusedJob.ai_enabled : aiEnabled);
             const state = optionalOff
-              ? "skipped"
+              ? "standby"
               : index < lifecycleCurrent
                 ? "done"
                 : index === lifecycleCurrent
                   ? "current"
                   : "queued";
             return (
-              <div className={`lifecycle-step lifecycle-${state}`} key={label}>
+              <div
+                className={`lifecycle-step lifecycle-${state}`}
+                key={label}
+                title={optionalOff ? "Layer-2 AI optional (Standby สำหรับ job นี้)" : undefined}
+              >
                 <span className="lifecycle-dot">{state === "done" ? <Icon name="check" size={11} /> : index + 1}</span>
                 <span>{label}</span>
               </div>
@@ -2582,13 +4236,13 @@ function JobsPage({
 
       <section className="panel job-panel">
         <PanelTitle
-          title={jobs.length > 0 ? "Analysis job history (Live SQLite)" : "Analysis job history"}
+          title={totalCount > 0 ? "Analysis job history (Live SQLite)" : "Analysis job history"}
           detail={
-            jobs.length > 0
+            totalCount > 0
               ? "คลิก Open เพื่อโหลดรายงานและ packet explorer ของงานนั้น"
               : "ยังไม่มีงานจาก backend — กด Analyze Capture หรือสแกน CSV ได้ทันที"
           }
-          action={<span className="table-caption">{jobs.length} JOBS</span>}
+          action={<span className="table-caption">{totalCount} JOBS</span>}
         />
         <div className="job-table-wrap">
           <table className="data-table job-table">
@@ -2626,7 +4280,7 @@ function JobsPage({
                             <Icon name="file" size={17} />
                           </div>
                           <span>
-                            <strong>{job.capture_filename ?? `capture-${job.capture_id.slice(0, 8)}`}</strong>
+                            <strong>{maskFilename(job.capture_filename ?? `capture-${job.capture_id.slice(0, 8)}`)}</strong>
                             <small className="mono">
                               {job.id.slice(0, 8)} ·{" "}
                               {job.capture_size_bytes ? formatBytes(job.capture_size_bytes) : "capture"}
@@ -2674,6 +4328,16 @@ function JobsPage({
                               Open
                             </button>
                           )}
+                          {!active && (
+                            <button
+                              type="button"
+                              className="secondary-button tiny-btn"
+                              disabled={jobsMutating}
+                              onClick={() => void onDeleteJob(job.id)}
+                            >
+                              Delete
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -2683,6 +4347,30 @@ function JobsPage({
             </tbody>
           </table>
         </div>
+        {totalCount > jobsPageSize && (
+          <div className="jobs-pagination">
+            <button
+              type="button"
+              className="secondary-button tiny-btn"
+              disabled={jobsPage <= 0 || jobsMutating}
+              onClick={() => onChangeJobsPage(jobsPage - 1)}
+            >
+              ← ก่อนหน้า
+            </button>
+            <span className="jobs-pagination-info mono">
+              หน้า {jobsPage + 1} / {totalPages} · แสดง {jobsPage * jobsPageSize + 1}–
+              {Math.min(totalCount, jobsPage * jobsPageSize + jobs.length)} จาก {totalCount}
+            </span>
+            <button
+              type="button"
+              className="secondary-button tiny-btn"
+              disabled={jobsPage + 1 >= totalPages || jobsMutating}
+              onClick={() => onChangeJobsPage(jobsPage + 1)}
+            >
+              ถัดไป →
+            </button>
+          </div>
+        )}
       </section>
 
       <section className="panel stage-monitor">
@@ -2714,17 +4402,29 @@ function JobsPage({
 
 function FindingsPage({
   report,
+  rawReport,
   severityFilter,
   setSeverityFilter,
+  protocolFilter,
+  setProtocolFilter,
+  packetSearch,
+  setPacketSearch,
   selectedFinding,
   setSelectedFinding,
+  privacyRedactor,
   onOpenEvidence,
 }: {
   report: WorkspaceReport;
+  rawReport: WorkspaceReport;
   severityFilter: "all" | Severity;
   setSeverityFilter: (value: "all" | Severity) => void;
+  protocolFilter: string;
+  setProtocolFilter: (value: string) => void;
+  packetSearch: string;
+  setPacketSearch: (value: string) => void;
   selectedFinding: WorkspaceFinding | null;
   setSelectedFinding: (id: string) => void;
+  privacyRedactor?: PrivacyRedactor;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
 }) {
   const highCount = report.findings.filter((f) => f.severity === "high" || f.severity === "critical").length;
@@ -2732,10 +4432,48 @@ function FindingsPage({
   const lowCount = report.findings.filter((f) => f.severity === "low").length;
   const doneStages = report.stages.filter((s) => s.status === "done").length;
 
-  const filtered =
-    severityFilter === "all"
-      ? report.findings
-      : report.findings.filter((f) => f.severity === severityFilter);
+  const rawFindingById = useMemo(
+    () => new Map(rawReport.findings.map((item) => [item.id, item])),
+    [rawReport.findings],
+  );
+  const evidenceById = useMemo(
+    () => new Map((report.rawBundle?.evidence ?? []).map((item) => [item.evidence_id, item])),
+    [report.rawBundle?.evidence],
+  );
+  const rawEvidenceById = useMemo(
+    () => new Map((rawReport.rawBundle?.evidence ?? []).map((item) => [item.evidence_id, item])),
+    [rawReport.rawBundle?.evidence],
+  );
+  const maskedPacketSearch = privacyRedactor ? privacyRedactor.redactFreeText(packetSearch) : packetSearch;
+  const rawQuery = packetSearch.trim().toLowerCase();
+  const maskedQuery = maskedPacketSearch.trim().toLowerCase();
+  const hasActiveFilters = severityFilter !== "all" || protocolFilter !== "All protocols" || Boolean(rawQuery);
+
+  const filtered = report.findings.filter((finding) => {
+    if (severityFilter !== "all" && finding.severity !== severityFilter) return false;
+    const cited = finding.evidence.map((id) => evidenceById.get(id)).filter((item) => item !== undefined);
+    if (
+      protocolFilter !== "All protocols" &&
+      !cited.some((item) => String(item.attributes.protocol ?? "").toLowerCase() === protocolFilter.toLowerCase())
+    ) {
+      return false;
+    }
+    if (rawQuery || maskedQuery) {
+      const displayText = `${finding.id} ${finding.title} ${finding.category} ${finding.destination} ${finding.summary} ${finding.why} ${finding.evidence.join(" ")} ${cited.map((item) => item.summary).join(" ")}`.toLowerCase();
+      const rawFinding = rawFindingById.get(finding.id);
+      const rawCited = (rawFinding?.evidence ?? finding.evidence)
+        .map((id) => rawEvidenceById.get(id))
+        .filter((item) => item !== undefined);
+      const rawText = rawFinding
+        ? `${rawFinding.id} ${rawFinding.title} ${rawFinding.category} ${rawFinding.destination} ${rawFinding.summary} ${rawFinding.why} ${rawFinding.evidence.join(" ")} ${rawCited.map((item) => item.summary).join(" ")}`.toLowerCase()
+        : "";
+      const matched =
+        (rawQuery && (displayText.includes(rawQuery) || rawText.includes(rawQuery))) ||
+        (maskedQuery && (displayText.includes(maskedQuery) || rawText.includes(maskedQuery)));
+      if (!matched) return false;
+    }
+    return true;
+  });
 
   return (
     <>
@@ -2812,46 +4550,81 @@ function FindingsPage({
                   onChange={(event) => setSeverityFilter(event.target.value as "all" | Severity)}
                 >
                   <option value="all">All severity</option>
+                  <option value="critical">Critical</option>
                   <option value="high">High</option>
                   <option value="medium">Medium</option>
                   <option value="low">Low</option>
                 </select>
               </div>
             </div>
-            <div className="finding-rows">
-              {filtered.map((finding) => (
+            {hasActiveFilters && (
+              <div className="active-filter-chips" role="region" aria-label="ตัวกรองที่ใช้งานอยู่">
+                {severityFilter !== "all" && (
+                  <button type="button" className="filter-chip" onClick={() => setSeverityFilter("all")}>
+                    Severity: {severityFilter} ×
+                  </button>
+                )}
+                {protocolFilter !== "All protocols" && (
+                  <button type="button" className="filter-chip" onClick={() => setProtocolFilter("All protocols")}>
+                    Protocol: {protocolFilter} ×
+                  </button>
+                )}
+                {rawQuery && (
+                  <button type="button" className="filter-chip" onClick={() => setPacketSearch("")}>
+                    Search: {maskedPacketSearch} ×
+                  </button>
+                )}
                 <button
-                  key={finding.id}
-                  onClick={() => setSelectedFinding(finding.id)}
-                  className={`finding-row ${selectedFinding?.id === finding.id ? "finding-selected" : ""}`}
+                  type="button"
+                  className="filter-chip-clear"
+                  onClick={() => {
+                    setSeverityFilter("all");
+                    setProtocolFilter("All protocols");
+                    setPacketSearch("");
+                  }}
                 >
-                  <span className={`finding-mark mark-${finding.severity}`}>
-                    <Icon name={finding.severity === "high" ? "activity" : "alert"} size={16} />
-                  </span>
-                  <span className="finding-row-copy">
-                    <span>
-                      <strong>{finding.title}</strong>
-                      <small className="mono">
-                        {finding.id} · {finding.category}
+                  ล้างตัวกรอง
+                </button>
+              </div>
+            )}
+            <div className="finding-rows">
+              {filtered.length === 0 ? (
+                <div className="empty-state">ไม่พบ finding ที่ตรงกับตัวกรองปัจจุบัน</div>
+              ) : (
+                filtered.map((finding) => (
+                  <button
+                    key={finding.id}
+                    onClick={() => setSelectedFinding(finding.id)}
+                    className={`finding-row ${selectedFinding?.id === finding.id ? "finding-selected" : ""}`}
+                  >
+                    <span className={`finding-mark mark-${finding.severity}`}>
+                      <Icon name={finding.severity === "high" ? "activity" : "alert"} size={16} />
+                    </span>
+                    <span className="finding-row-copy">
+                      <span>
+                        <strong>{finding.title}</strong>
+                        <small className="mono">
+                          {finding.id} · {finding.category}
+                        </small>
+                      </span>
+                      <small>
+                        {finding.destination} <i>·</i> {finding.timestamp}
                       </small>
                     </span>
-                    <small>
-                      {finding.destination} <i>·</i> {finding.timestamp}
-                    </small>
-                  </span>
-                  <span className="finding-row-meta">
-                    <SeverityPill severity={finding.severity} />
-                    <Confidence
-                      value={
-                        finding.triageConfidence !== undefined
-                          ? `${finding.confidence} (${Math.round(finding.triageConfidence * 100)}%)`
-                          : finding.confidence
-                      }
-                    />
-                    <span className="evidence-count">{finding.evidence.length} evidence</span>
-                  </span>
-                </button>
-              ))}
+                    <span className="finding-row-meta">
+                      <SeverityPill severity={finding.severity} />
+                      <Confidence
+                        value={
+                          finding.triageConfidence !== undefined
+                            ? `${finding.confidence} (${Math.round(finding.triageConfidence * 100)}%)`
+                            : finding.confidence
+                        }
+                      />
+                      <span className="evidence-count">{finding.evidence.length} evidence</span>
+                    </span>
+                  </button>
+                ))
+              )}
             </div>
             <div className="finding-disclaimer">
               <Icon name="info" size={15} />
@@ -2928,6 +4701,9 @@ function FindingsPage({
 
 function TrafficPage({
   report,
+  rawReport,
+  severityFilter,
+  setSeverityFilter,
   protocolFilter,
   setProtocolFilter,
   packetSearch,
@@ -2935,9 +4711,15 @@ function TrafficPage({
   selectedFinding,
   trafficView,
   setTrafficView,
+  privacyRedactor,
   onOpenEvidence,
+  pendingJump,
+  onConsumePendingJump,
 }: {
   report: WorkspaceReport;
+  rawReport: WorkspaceReport;
+  severityFilter: "all" | Severity;
+  setSeverityFilter: (value: "all" | Severity) => void;
   protocolFilter: string;
   setProtocolFilter: (value: string) => void;
   packetSearch: string;
@@ -2945,67 +4727,346 @@ function TrafficPage({
   selectedFinding: WorkspaceFinding | null;
   trafficView: "packets" | "flows";
   setTrafficView: (value: "packets" | "flows") => void;
+  privacyRedactor?: PrivacyRedactor;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
+  pendingJump?: TrafficJumpRequest | null;
+  onConsumePendingJump?: () => void;
 }) {
-  const [selectedPacketNo, setSelectedPacketNo] = useState<number | null>(() => report.packets[0]?.no ?? null);
-  const [selectedFlowId, setSelectedFlowId] = useState<string>(() => report.flows[0]?.id ?? "");
+  const [selectedPacketNo, setSelectedPacketNo] = useState<number | null>(
+    () => pendingJump?.packetNo ?? report.packets[0]?.no ?? null,
+  );
+  const [selectedFlowId, setSelectedFlowId] = useState<string>(
+    () => pendingJump?.flowId ?? report.flows[0]?.id ?? "",
+  );
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [activeBucketIndex, setActiveBucketIndex] = useState<number | null>(() => pendingJump?.bucketIndex ?? null);
+  const [jumpFlash, setJumpFlash] = useState<{ key: string; nonce: number } | null>(null);
+  const [jumpBanner, setJumpBanner] = useState<{ label: string; detail: string } | null>(null);
+
+  const packetPanelRef = useRef<HTMLElement | null>(null);
+  const inspectorRef = useRef<HTMLElement | null>(null);
+  const pinnedTargetRef = useRef<{ packetNo?: number | null; flowId?: string | null } | null>(null);
+  const lastSelectionContextRef = useRef<string>("");
+  const jumpTimerRef = useRef<number | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
+  const cancelScrollRef = useRef<(() => void) | null>(null);
+
+  const maskedPacketSearch = privacyRedactor ? privacyRedactor.redactFreeText(packetSearch) : packetSearch;
+  const rawQuery = packetSearch.trim().toLowerCase();
+  const maskedQuery = maskedPacketSearch.trim().toLowerCase();
+  const hasActiveFilters = severityFilter !== "all" || protocolFilter !== "All protocols" || Boolean(rawQuery);
 
   useEffect(() => {
+    return () => {
+      if (jumpTimerRef.current !== null) window.clearTimeout(jumpTimerRef.current);
+      if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+      cancelScrollRef.current?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const contextKey = `${report.analysisId}::${selectedFinding?.id ?? ""}::${packetSearch}`;
+    if (pinnedTargetRef.current) {
+      const pinned = pinnedTargetRef.current;
+      pinnedTargetRef.current = null;
+      lastSelectionContextRef.current = contextKey;
+      if (pinned.packetNo !== undefined && pinned.packetNo !== null) {
+        setSelectedPacketNo(pinned.packetNo);
+      }
+      if (pinned.flowId) {
+        setSelectedFlowId(pinned.flowId);
+      }
+      return;
+    }
+    if (pendingJump) {
+      lastSelectionContextRef.current = contextKey;
+      return;
+    }
+    if (lastSelectionContextRef.current === contextKey) {
+      return;
+    }
+    lastSelectionContextRef.current = contextKey;
+
     const query = packetSearch.trim().toLowerCase();
     const pktMatch =
-      report.packets.find((p) => (p.evidence ?? "").toLowerCase() === query) ??
+      (query
+        ? report.packets.find(
+            (p) =>
+              (p.evidence ?? "").toLowerCase() === query ||
+              `${p.no} ${p.source} ${p.destination} ${p.protocol} ${p.info} ${p.evidence ?? ""}`
+                .toLowerCase()
+                .includes(query),
+          )
+        : undefined) ??
       report.packets.find((p) => selectedFinding && p.evidence === selectedFinding.evidence[0]) ??
       report.packets[0];
     setSelectedPacketNo(pktMatch?.no ?? null);
 
     const flowMatch =
-      report.flows.find((f) => f.evidence.toLowerCase() === query || f.id.toLowerCase() === query) ??
+      (query
+        ? report.flows.find(
+            (f) =>
+              f.evidence.toLowerCase() === query ||
+              f.id.toLowerCase() === query ||
+              `${f.id} ${f.source} ${f.destination} ${f.protocol} ${f.evidence} ${f.note}`
+                .toLowerCase()
+                .includes(query),
+          )
+        : undefined) ??
       report.flows.find((f) => selectedFinding && f.evidence === selectedFinding.evidence[0]) ??
       report.flows[0];
     setSelectedFlowId(flowMatch?.id ?? "");
-  }, [report, selectedFinding, packetSearch]);
+  }, [report.analysisId, report.packets, report.flows, selectedFinding, packetSearch, pendingJump]);
 
   const protocolOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of report.packets) if (p.protocol) set.add(p.protocol);
-    for (const f of report.flows) if (f.protocol) set.add(f.protocol);
-    return ["All protocols", ...Array.from(set).sort()];
-  }, [report.packets, report.flows]);
+    const map = new Map<string, string>();
+    for (const p of report.packets) if (p.protocol) map.set(p.protocol.toUpperCase(), p.protocol);
+    for (const f of report.flows) if (f.protocol) map.set(f.protocol.toUpperCase(), f.protocol);
+    if (protocolFilter !== "All protocols" && !map.has(protocolFilter.toUpperCase())) {
+      map.set(protocolFilter.toUpperCase(), protocolFilter);
+    }
+    return ["All protocols", ...Array.from(map.values()).sort()];
+  }, [report.packets, report.flows, protocolFilter]);
 
-  const visiblePackets = useMemo(
-    () =>
-      report.packets.filter((packet) => {
-        const matchesProtocol = protocolFilter === "All protocols" || packet.protocol === protocolFilter;
-        const query = packetSearch.toLowerCase().trim();
-        const matchesSearch =
-          !query ||
-          `${packet.no} ${packet.time} ${packet.source} ${packet.destination} ${packet.protocol} ${packet.info} ${packet.evidence ?? ""} ${packet.triageLabel ?? ""}`
-            .toLowerCase()
-            .includes(query);
-        return matchesProtocol && matchesSearch;
-      }),
-    [report.packets, protocolFilter, packetSearch],
-  );
+  const severityEvidence = useMemo(() => {
+    if (severityFilter === "all") return null;
+    return new Set(report.findings.filter((finding) => finding.severity === severityFilter).flatMap((finding) => finding.evidence));
+  }, [report.findings, severityFilter]);
 
-  const visibleFlows = useMemo(
-    () =>
-      report.flows.filter((flow) => {
-        const matchesProtocol = protocolFilter === "All protocols" || flow.protocol === protocolFilter;
-        const query = packetSearch.toLowerCase().trim();
-        const matchesSearch =
-          !query ||
-          `${flow.id} ${flow.firstSeen} ${flow.source} ${flow.destination} ${flow.protocol} ${flow.evidence} ${flow.note}`
-            .toLowerCase()
-            .includes(query);
-        return matchesProtocol && matchesSearch;
-      }),
-    [report.flows, protocolFilter, packetSearch],
-  );
+  const visiblePackets = useMemo(() => {
+    const normalizedProto = protocolFilter.toUpperCase();
+    return report.packets.filter((packet, index) => {
+      if (severityEvidence && (!packet.evidence || !severityEvidence.has(packet.evidence))) return false;
+      const matchesProtocol = protocolFilter === "All protocols" || packet.protocol.toUpperCase() === normalizedProto;
+      if (!matchesProtocol) return false;
+      if (!rawQuery && !maskedQuery) return true;
+      const displayHaystack =
+        `${packet.no} ${packet.time} ${packet.source} ${packet.destination} ${packet.protocol} ${packet.info} ${packet.evidence ?? ""} ${packet.triageLabel ?? ""}`.toLowerCase();
+      const rawPkt = rawReport.packets[index];
+      const rawHaystack =
+        rawPkt && rawPkt.no === packet.no
+          ? `${rawPkt.no} ${rawPkt.time} ${rawPkt.source} ${rawPkt.destination} ${rawPkt.protocol} ${rawPkt.info} ${rawPkt.evidence ?? ""} ${rawPkt.triageLabel ?? ""}`.toLowerCase()
+          : "";
+      return (
+        (Boolean(rawQuery) && (displayHaystack.includes(rawQuery) || rawHaystack.includes(rawQuery))) ||
+        (Boolean(maskedQuery) && (displayHaystack.includes(maskedQuery) || rawHaystack.includes(maskedQuery)))
+      );
+    });
+  }, [report.packets, rawReport.packets, protocolFilter, rawQuery, maskedQuery, severityEvidence]);
+
+  const visibleFlows = useMemo(() => {
+    const normalizedProto = protocolFilter.toUpperCase();
+    return report.flows.filter((flow, index) => {
+      if (severityEvidence && !severityEvidence.has(flow.evidence)) return false;
+      const matchesProtocol = protocolFilter === "All protocols" || flow.protocol.toUpperCase() === normalizedProto;
+      if (!matchesProtocol) return false;
+      if (!rawQuery && !maskedQuery) return true;
+      const displayHaystack =
+        `${flow.id} ${flow.firstSeen} ${flow.source} ${flow.destination} ${flow.protocol} ${flow.evidence} ${flow.note}`.toLowerCase();
+      const rawFlow = rawReport.flows[index];
+      const rawHaystack =
+        rawFlow && rawFlow.id === flow.id
+          ? `${rawFlow.id} ${rawFlow.firstSeen} ${rawFlow.source} ${rawFlow.destination} ${rawFlow.protocol} ${rawFlow.evidence} ${rawFlow.note}`.toLowerCase()
+          : "";
+      return (
+        (Boolean(rawQuery) && (displayHaystack.includes(rawQuery) || rawHaystack.includes(rawQuery))) ||
+        (Boolean(maskedQuery) && (displayHaystack.includes(maskedQuery) || rawHaystack.includes(maskedQuery)))
+      );
+    });
+  }, [report.flows, rawReport.flows, protocolFilter, rawQuery, maskedQuery, severityEvidence]);
 
   const selectedPacket: WorkspacePacket | null =
     visiblePackets.find((p) => p.no === selectedPacketNo) ?? visiblePackets[0] ?? report.packets[0] ?? null;
   const selectedFlow: WorkspaceFlow | null =
     visibleFlows.find((f) => f.id === selectedFlowId) ?? visibleFlows[0] ?? report.flows[0] ?? null;
+
+  const triggerJumpScroll = useCallback(
+    (opts: { packetNo?: number | null; flowId?: string | null; view: "packets" | "flows"; delayMs?: number }) => {
+      if (jumpTimerRef.current !== null) {
+        window.clearTimeout(jumpTimerRef.current);
+        jumpTimerRef.current = null;
+      }
+      cancelScrollRef.current?.();
+
+      const delayMs = opts.delayMs ?? 45;
+      jumpTimerRef.current = window.setTimeout(() => {
+        jumpTimerRef.current = null;
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            const panel = packetPanelRef.current;
+            let rowEl: HTMLElement | null = null;
+            let flashKey = "panel";
+
+            if (panel) {
+              if (opts.view === "packets" && opts.packetNo != null) {
+                const targetNo = String(opts.packetNo);
+                rowEl =
+                  Array.from(panel.querySelectorAll<HTMLElement>("tr[data-packet-no]")).find(
+                    (el) => el.dataset.packetNo === targetNo,
+                  ) ?? null;
+                flashKey = `packet-${targetNo}`;
+              } else if (opts.view === "flows" && opts.flowId) {
+                rowEl =
+                  Array.from(panel.querySelectorAll<HTMLElement>("tr[data-flow-id]")).find(
+                    (el) => el.dataset.flowId === opts.flowId,
+                  ) ?? null;
+                flashKey = `flow-${opts.flowId}`;
+              }
+              if (!rowEl) {
+                rowEl = panel.querySelector<HTMLElement>("tr.packet-selected") ?? null;
+                if (rowEl?.dataset.packetNo) flashKey = `packet-${rowEl.dataset.packetNo}`;
+                else if (rowEl?.dataset.flowId) flashKey = `flow-${rowEl.dataset.flowId}`;
+              }
+            }
+
+            const scrollTarget = rowEl ?? panel;
+            if (!scrollTarget) return;
+
+            cancelScrollRef.current = animateScrollToElement(scrollTarget, {
+              offset: 92,
+              align: "center",
+              minDuration: 600,
+              maxDuration: 960,
+              onComplete: () => {
+                if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+                setJumpFlash({ key: flashKey, nonce: Date.now() });
+                flashTimerRef.current = window.setTimeout(() => {
+                  setJumpFlash(null);
+                  flashTimerRef.current = null;
+                }, 1850);
+              },
+            });
+          });
+        });
+      }, delayMs);
+    },
+    [],
+  );
+
+  const handleSelectTimelineBucket = useCallback(
+    (bucket: TimelineBucketDetail) => {
+      setActiveBucketIndex(bucket.index);
+      const nextView: "packets" | "flows" =
+        bucket.targetKind === "flow"
+          ? "flows"
+          : bucket.targetKind === "packet"
+            ? "packets"
+            : bucket.targetPacketNo !== null
+              ? "packets"
+              : bucket.targetFlowId
+                ? "flows"
+                : trafficView;
+
+      const targetVisible =
+        nextView === "packets"
+          ? bucket.targetPacketNo !== null && visiblePackets.some((p) => p.no === bucket.targetPacketNo)
+          : Boolean(bucket.targetFlowId) && visibleFlows.some((f) => f.id === bucket.targetFlowId);
+
+      if (!targetVisible && hasActiveFilters) {
+        pinnedTargetRef.current = {
+          packetNo: bucket.targetPacketNo,
+          flowId: bucket.targetFlowId,
+        };
+        setPacketSearch("");
+        setProtocolFilter("All protocols");
+        setSeverityFilter("all");
+      }
+
+      if (nextView !== trafficView) setTrafficView(nextView);
+      if (bucket.targetPacketNo !== null) setSelectedPacketNo(bucket.targetPacketNo);
+      if (bucket.targetFlowId) setSelectedFlowId(bucket.targetFlowId);
+
+      const targetTag =
+        nextView === "flows" && bucket.targetFlowId
+          ? bucket.targetFlowId
+          : bucket.targetPacketNo !== null
+            ? `Frame #${bucket.targetPacketNo}`
+            : bucket.targetFlowId ?? "Evidence";
+      setJumpBanner({
+        label: `${bucket.label} · ${bucket.dominantProtocol}`,
+        detail: `${targetTag} · ${bucket.headline}`,
+      });
+
+      triggerJumpScroll({
+        packetNo: nextView === "packets" ? bucket.targetPacketNo : null,
+        flowId: nextView === "flows" ? bucket.targetFlowId : null,
+        view: nextView,
+        delayMs: 55,
+      });
+    },
+    [
+      hasActiveFilters,
+      setPacketSearch,
+      setProtocolFilter,
+      setSeverityFilter,
+      setTrafficView,
+      trafficView,
+      triggerJumpScroll,
+      visibleFlows,
+      visiblePackets,
+    ],
+  );
+
+  useEffect(() => {
+    if (!pendingJump) return;
+    if (pendingJump.bucketIndex !== undefined) {
+      setActiveBucketIndex(pendingJump.bucketIndex ?? null);
+    }
+
+    const evLower = (pendingJump.evidenceId ?? "").toLowerCase();
+    const resolvedPacket =
+      (pendingJump.packetNo != null
+        ? report.packets.find((p) => p.no === pendingJump.packetNo)
+        : undefined) ??
+      (evLower ? report.packets.find((p) => (p.evidence ?? "").toLowerCase() === evLower) : undefined) ??
+      null;
+    const resolvedFlow =
+      (pendingJump.flowId ? report.flows.find((f) => f.id === pendingJump.flowId) : undefined) ??
+      (evLower ? report.flows.find((f) => f.evidence.toLowerCase() === evLower) : undefined) ??
+      null;
+
+    const targetView: "packets" | "flows" =
+      pendingJump.preferView ??
+      (resolvedPacket ? "packets" : resolvedFlow ? "flows" : trafficView);
+
+    if (targetView !== trafficView) {
+      setTrafficView(targetView);
+    }
+
+    if (resolvedPacket || resolvedFlow) {
+      pinnedTargetRef.current = {
+        packetNo: resolvedPacket?.no ?? null,
+        flowId: resolvedFlow?.id ?? null,
+      };
+      if (resolvedPacket) setSelectedPacketNo(resolvedPacket.no);
+      if (resolvedFlow) setSelectedFlowId(resolvedFlow.id);
+    }
+
+    if (pendingJump.reasonLabel) {
+      const targetTag =
+        targetView === "flows" && resolvedFlow
+          ? `${resolvedFlow.id} · ${resolvedFlow.source} → ${resolvedFlow.destination}`
+          : resolvedPacket
+            ? `Frame #${resolvedPacket.no} · ${resolvedPacket.source} → ${resolvedPacket.destination}`
+            : resolvedFlow
+              ? `${resolvedFlow.id} · ${resolvedFlow.source} → ${resolvedFlow.destination}`
+              : "เลื่อนไปยังหลักฐานที่ตรงกัน";
+      setJumpBanner({
+        label: pendingJump.reasonLabel,
+        detail: targetTag,
+      });
+    }
+
+    triggerJumpScroll({
+      packetNo: targetView === "packets" ? (resolvedPacket?.no ?? null) : null,
+      flowId: targetView === "flows" ? (resolvedFlow?.id ?? null) : null,
+      view: targetView,
+      delayMs: 120,
+    });
+    onConsumePendingJump?.();
+  }, [pendingJump, report.flows, report.packets, setTrafficView, trafficView, triggerJumpScroll, onConsumePendingJump]);
+
+  const inspectorHighlighted = Boolean(jumpFlash);
 
   return (
     <>
@@ -3019,6 +5080,9 @@ function TrafficPage({
             onClick={() => {
               setPacketSearch("");
               setProtocolFilter("All protocols");
+              setSeverityFilter("all");
+              setActiveBucketIndex(null);
+              setJumpBanner(null);
             }}
           >
             <Icon name="filter" size={15} /> ล้างตัวกรอง
@@ -3037,43 +5101,18 @@ function TrafficPage({
             {report.durationLabel} · {formatCompactCount(report.packetsAnalyzed)} pkts
           </div>
         </div>
-        <div className="traffic-chart">
-          <div className="chart-y-labels">
-            <span>Peak</span>
-            <span>50%</span>
-            <span>0</span>
-          </div>
-          <div className="traffic-chart-inner">
-            <div className="chart-gridlines">
-              <i />
-              <i />
-              <i />
-            </div>
-            <div className="traffic-chart-bars">
-              {report.timeline.map((value, index) => (
-                <div key={index} className={`chart-column ${value >= 75 ? "chart-column-active" : ""}`}>
-                  <i style={{ height: `${Math.max(5, Math.min(100, value))}%` }} />
-                </div>
-              ))}
-            </div>
-            <div className="chart-x-labels">
-              {report.timelineLabels.map((lbl, idx) => (
-                <span key={idx}>{lbl}</span>
-              ))}
-            </div>
-          </div>
-        </div>
-        <div className="chart-legend">
-          <span>
-            <i className="legend-tcp" /> Packet activity
-          </span>
-          <span>
-            <i className="legend-marker" /> Peak / anomaly bucket
-          </span>
-        </div>
+        <InteractiveTimelineChart
+          report={report}
+          variant="traffic"
+          activeBucketIndex={activeBucketIndex}
+          onSelectBucket={handleSelectTimelineBucket}
+        />
       </section>
 
-      <section className="panel packet-panel">
+      <section
+        ref={packetPanelRef}
+        className={`panel packet-panel ${jumpFlash?.key === "panel" ? "panel-jump-pulse" : ""}`}
+      >
         <div className="packet-toolbar">
           <div>
             <div className="section-kicker">{trafficView === "packets" ? "SAMPLED PACKET LIST" : "NORMALIZED FLOW LIST"}</div>
@@ -3099,12 +5138,21 @@ function TrafficPage({
             <div className="search-field">
               <Icon name="search" size={15} />
               <input
-                value={packetSearch}
+                value={searchFocused ? packetSearch : maskedPacketSearch}
+                onFocus={() => setSearchFocused(true)}
+                onBlur={() => setSearchFocused(false)}
                 onChange={(event) => setPacketSearch(event.target.value)}
                 placeholder={trafficView === "packets" ? "ค้นหา packet, IP, evidence ID" : "ค้นหา flow, IP, evidence ID"}
                 aria-label={trafficView === "packets" ? "ค้นหา packet" : "ค้นหา flow"}
               />
             </div>
+            <select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value as "all" | Severity)} aria-label="กรองตาม severity ที่เชื่อมกับ findings">
+              <option value="all">All severity</option>
+              <option value="critical">Critical findings</option>
+              <option value="high">High findings</option>
+              <option value="medium">Medium findings</option>
+              <option value="low">Low findings</option>
+            </select>
             <select value={protocolFilter} onChange={(event) => setProtocolFilter(event.target.value)} aria-label="กรอง protocol">
               {protocolOptions.map((proto) => (
                 <option key={proto} value={proto}>
@@ -3114,6 +5162,54 @@ function TrafficPage({
             </select>
           </div>
         </div>
+        {jumpBanner && (
+          <div className="jump-context-strip" role="status" aria-live="polite">
+            <span className="jump-context-dot" aria-hidden="true" />
+            <span className="jump-context-label mono">{jumpBanner.label}</span>
+            <span className="jump-context-detail">{jumpBanner.detail}</span>
+            <button
+              type="button"
+              className="jump-context-dismiss"
+              aria-label="ซ่อนแถบตำแหน่งกราฟ"
+              onClick={() => {
+                setJumpBanner(null);
+                setActiveBucketIndex(null);
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
+        {hasActiveFilters && (
+          <div className="active-filter-chips" role="region" aria-label="ตัวกรองที่ใช้งานอยู่">
+            {severityFilter !== "all" && (
+              <button type="button" className="filter-chip" onClick={() => setSeverityFilter("all")}>
+                Severity: {severityFilter} ×
+              </button>
+            )}
+            {protocolFilter !== "All protocols" && (
+              <button type="button" className="filter-chip" onClick={() => setProtocolFilter("All protocols")}>
+                Protocol: {protocolFilter} ×
+              </button>
+            )}
+            {rawQuery && (
+              <button type="button" className="filter-chip" onClick={() => setPacketSearch("")}>
+                Search: {maskedPacketSearch} ×
+              </button>
+            )}
+            <button
+              type="button"
+              className="filter-chip-clear"
+              onClick={() => {
+                setSeverityFilter("all");
+                setProtocolFilter("All protocols");
+                setPacketSearch("");
+              }}
+            >
+              ล้างตัวกรอง
+            </button>
+          </div>
+        )}
 
         {trafficView === "packets" ? (
           <>
@@ -3134,12 +5230,15 @@ function TrafficPage({
                 <tbody>
                   {visiblePackets.map((packet) => {
                     const pClass = `protocol-${packet.protocol.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
+                    const isSelected = selectedPacket?.no === packet.no;
+                    const isFlashing = jumpFlash?.key === `packet-${packet.no}`;
                     return (
                       <tr
                         key={`${packet.no}-${packet.time}`}
+                        data-packet-no={String(packet.no)}
                         tabIndex={0}
                         aria-label={`เลือก frame ${packet.no}`}
-                        aria-selected={selectedPacket?.no === packet.no}
+                        aria-selected={isSelected}
                         onClick={() => setSelectedPacketNo(packet.no)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
@@ -3147,7 +5246,12 @@ function TrafficPage({
                             setSelectedPacketNo(packet.no);
                           }
                         }}
-                        className={selectedPacket?.no === packet.no ? "packet-selected" : ""}
+                        className={[
+                          isSelected ? "packet-selected" : "",
+                          isFlashing ? "evidence-row-jump-flash" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
                       >
                         <td className="mono packet-number">{packet.no}</td>
                         <td className="mono">{packet.time}</td>
@@ -3195,12 +5299,15 @@ function TrafficPage({
                 <tbody>
                   {visibleFlows.map((flow) => {
                     const pClass = `protocol-${flow.protocol.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
+                    const isSelected = selectedFlow?.id === flow.id;
+                    const isFlashing = jumpFlash?.key === `flow-${flow.id}`;
                     return (
                       <tr
                         key={flow.id}
+                        data-flow-id={flow.id}
                         tabIndex={0}
                         aria-label={`เลือก flow ${flow.id}`}
-                        aria-selected={selectedFlow?.id === flow.id}
+                        aria-selected={isSelected}
                         onClick={() => setSelectedFlowId(flow.id)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
@@ -3208,7 +5315,12 @@ function TrafficPage({
                             setSelectedFlowId(flow.id);
                           }
                         }}
-                        className={selectedFlow?.id === flow.id ? "packet-selected" : ""}
+                        className={[
+                          isSelected ? "packet-selected" : "",
+                          isFlashing ? "evidence-row-jump-flash" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
                       >
                         <td className="mono packet-number">{flow.id}</td>
                         <td className="mono">{flow.firstSeen}</td>
@@ -3238,7 +5350,10 @@ function TrafficPage({
       </section>
 
       {trafficView === "packets" && selectedPacket && (
-        <section className="panel packet-inspector">
+        <section
+          ref={inspectorRef}
+          className={`panel packet-inspector ${inspectorHighlighted ? "inspector-jump-pulse" : ""}`}
+        >
           <div className="inspector-header">
             <div>
               <span className="section-kicker">FRAME INSPECTOR</span>
@@ -3280,7 +5395,10 @@ function TrafficPage({
       )}
 
       {trafficView === "flows" && selectedFlow && (
-        <section className="panel flow-inspector">
+        <section
+          ref={inspectorRef}
+          className={`panel flow-inspector ${inspectorHighlighted ? "inspector-jump-pulse" : ""}`}
+        >
           <div className="inspector-header">
             <div>
               <span className="section-kicker">FLOW INSPECTOR</span>
@@ -3323,17 +5441,242 @@ function TrafficPage({
 
 function ReportsPage({
   report,
+  apiClient,
+  connected,
+  aiConfig,
+  aiModels,
+  privacyMode,
+  onTogglePrivacyMode,
+  privacyRedactor,
+  onSaveAiConfig,
+  onProbeAiModels,
   onExport,
+  onChat,
+  onRefreshReport,
   onNavigate,
   onOpenEvidence,
+  onOpenConnectionModal,
 }: {
   report: WorkspaceReport;
-  onExport: (kind: "json" | "markdown" | "triage-jsonl") => void;
+  apiClient: PcapApiClient;
+  connected: boolean;
+  aiConfig: AIConfigResponse | null;
+  aiModels: AIModelsResponse | null;
+  privacyMode: boolean;
+  onTogglePrivacyMode: () => void;
+  privacyRedactor: PrivacyRedactor;
+  onSaveAiConfig: (payload: AIConfigUpdatePayload) => Promise<AIConfigResponse>;
+  onProbeAiModels: (payload: AIModelProbePayload) => Promise<AIModelsResponse>;
+  onExport: (
+    kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
+  ) => void;
+  onChat: (
+    question: string,
+    consent: boolean,
+    options?: { timeout_seconds?: number; max_output_tokens?: number },
+  ) => Promise<GroundedChatResponse>;
+  onRefreshReport?: () => Promise<void>;
   onNavigate: (screen: Screen) => void;
   onOpenEvidence: (finding: WorkspaceFinding | null, evidenceId?: string) => void;
+  onOpenConnectionModal: (tab?: SettingsTab) => void;
 }) {
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   const aiActive = report.ai?.state === "completed" && Boolean(report.ai.report);
+  const aiBackendEnabled = Boolean(aiConfig?.configuration.enabled);
+  const aiBackendModel = aiConfig?.configuration.model ?? null;
+  const aiBackendReady = Boolean(aiBackendEnabled && aiBackendModel);
+  const redactor = privacyRedactor;
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+  const [chatQuestion, setChatQuestion] = useState("");
+  const [chatConsent, setChatConsent] = useState(false);
+  const [chatPending, setChatPending] = useState(false);
+  const [chatError, setChatError] = useState("");
+  const [chatTurns, setChatTurns] = useState<{ question: string; claims: GroundedChatResponse["claims"] }[]>([]);
+  const [quickModelInput, setQuickModelInput] = useState("");
+  const [quickAiBusy, setQuickAiBusy] = useState(false);
+  const [generatingSummary, setGeneratingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [promptTimeoutSec, setPromptTimeoutSec] = useState<number>(() =>
+    Math.min(600, Math.max(5, aiConfig?.configuration.timeout_seconds ?? 120)),
+  );
+  const [promptMaxTokens, setPromptMaxTokens] = useState<number>(() =>
+    Math.min(16384, Math.max(4096, aiConfig?.configuration.max_output_tokens ?? 4096)),
+  );
+  const chatTargetId = useRef(report.analysisId);
+
+  useEffect(() => {
+    if (aiConfig?.configuration.timeout_seconds) {
+      setPromptTimeoutSec((prev) =>
+        prev === 120 ? Math.min(600, Math.max(5, aiConfig.configuration.timeout_seconds)) : prev,
+      );
+    }
+    if (aiConfig?.configuration.max_output_tokens) {
+      setPromptMaxTokens((prev) =>
+        prev === 4096 ? Math.min(16384, Math.max(4096, aiConfig.configuration.max_output_tokens)) : prev,
+      );
+    }
+  }, [aiConfig?.configuration.timeout_seconds, aiConfig?.configuration.max_output_tokens]);
+
+  const describeAiError = (errCode: string): string => {
+    const humanDesc: Record<string, string> = {
+      output_length:
+        "โมเดลสร้างคำตอบเกินขีดจำกัด Max tokens ก่อนเขียน JSON จบ (มักเกิดจาก thinking/reasoning ยาว) — ลองเพิ่ม Max tokens ด้านล่างหรือตั้ง Timeout เพิ่มขึ้น",
+      output_budget_exceeded: "ขนาดคำตอบเกิน Max output budget — ลองเพิ่ม Max tokens แล้วส่งใหม่",
+      output_token_budget_exceeded: "จำนวน token คำตอบเกิน Max tokens ที่ตั้งไว้ — ลองเพิ่ม Max tokens แล้วส่งใหม่",
+      provider_timeout: "AI ตอบกลับไม่ทันเวลา (Timeout) — ลองเพิ่ม Timeout (วินาที) ก่อนส่งคำถามใหม่",
+      timeout: "AI ตอบกลับไม่ทันเวลา (Timeout) — ลองเพิ่ม Timeout (วินาที) ก่อนส่งใหม่",
+      provider_error: "AI Provider ตอบกลับผิดพลาด: ตรวจสอบสถานะของโมเดลหรือ endpoint (llama.cpp / Ollama)",
+      rate_limited: "AI Provider จำกัดอัตราการเรียกใช้งาน (Rate Limited) — กรุณารอสักครู่แล้วลองใหม่",
+      budget_exceeded: "ขนาดคำถามหรือ evidence เกิน Context budget ของโมเดล",
+      context_budget_exceeded: "ขนาด Context เกิน Token budget ที่ตั้งไว้",
+      prompt_budget_exceeded: "ขนาด Prompt เกิน Token budget ที่ตั้งไว้",
+      invalid_output: "รูปแบบคำตอบจาก AI ไม่ตรงกับ JSON Schema (กรุณาลองใหม่อีกครั้ง)",
+      invalid_json: "AI ไม่ได้ส่งคำตอบเป็น JSON หรือ format ผิดพลาด",
+      unknown_citation: "AI อ้างอิง evidence ID ที่ไม่มีใน capture นี้",
+      refused: "AI ปฏิเสธการตอบคำถามเกี่ยวกับ capture นี้",
+      provider_refused: "AI ปฏิเสธการตอบคำถามเกี่ยวกับ capture นี้",
+    };
+    return humanDesc[errCode] ?? `เกิดข้อผิดพลาด (${errCode})`;
+  };
+
+  const normalizedPromptOptions = () => ({
+    timeout_seconds: Math.min(600, Math.max(5, Math.round(promptTimeoutSec) || 120)),
+    max_output_tokens: Math.min(16384, Math.max(256, Math.round(promptMaxTokens) || 4096)),
+  });
+
+  const handleGenerateSummary = async () => {
+    if (generatingSummary || !connected || !aiBackendReady) return;
+    setGeneratingSummary(true);
+    setSummaryError(null);
+    try {
+      const res = await apiClient.generateAnalysisSummary(report.analysisId, normalizedPromptOptions());
+      if (onRefreshReport) {
+        await onRefreshReport();
+      }
+      const state = typeof res.state === "string" ? res.state : "completed";
+      if (state !== "completed") {
+        const code = typeof res.error_code === "string" ? res.error_code : state;
+        setSummaryError(describeAiError(code));
+      }
+    } catch (err) {
+      setSummaryError(safeFormatError(err));
+    } finally {
+      setGeneratingSummary(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const onPointerDown = (ev: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(ev.target as Node)) {
+        setExportMenuOpen(false);
+      }
+    };
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setExportMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [exportMenuOpen]);
+
+  const handleQuickEnableAi = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true }));
+      setChatError("");
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickSelectModel = async (modelId: string) => {
+    const clean = modelId.trim();
+    if (!clean || quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onSaveAiConfig(buildQuickAiSavePayload(aiConfig, { enabled: true, model: clean }));
+      setQuickModelInput("");
+      setChatError("");
+    } catch {
+      // Error toast is already surfaced by handleSaveAiConfig.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+
+  const handleQuickDetectModels = async () => {
+    if (quickAiBusy) return;
+    setQuickAiBusy(true);
+    try {
+      await onProbeAiModels(buildQuickAiProbePayload(aiConfig));
+    } catch {
+      // Error toast is already surfaced by handleProbeAiModels.
+    } finally {
+      setQuickAiBusy(false);
+    }
+  };
+  useEffect(() => {
+    chatTargetId.current = report.analysisId;
+    setChatTurns([]);
+    setChatQuestion("");
+    setChatConsent(false);
+    setChatError("");
+    setChatPending(false);
+  }, [report.analysisId]);
+  const submitChat = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!chatConsent) {
+      setChatError("ต้องยืนยัน consent สำหรับคำถามนี้ก่อนส่งให้ AI");
+      return;
+    }
+    if (!chatQuestion.trim() || chatPending) return;
+    const targetAnalysisId = report.analysisId;
+    setChatPending(true);
+    setChatError("");
+    try {
+      const result = await onChat(chatQuestion, true, normalizedPromptOptions());
+      if (chatTargetId.current !== targetAnalysisId) return;
+      if (result.state !== "completed" || result.claims.length === 0) {
+        const errCode = result.error_code ?? `chat_${result.state}`;
+        setChatError(describeAiError(errCode));
+        return;
+      }
+      setChatTurns((current) => [...current, { question: chatQuestion.trim(), claims: result.claims }].slice(-12));
+      setChatQuestion("");
+      setChatConsent(false);
+    } catch (error) {
+      if (chatTargetId.current === targetAnalysisId) setChatError(safeFormatError(error));
+    } finally {
+      if (chatTargetId.current === targetAnalysisId) setChatPending(false);
+    }
+  };
+
+  const triggerExport = (
+    kind: "json" | "markdown" | "triage-jsonl" | "stix" | "csv" | "cef" | "navigator" | "pdf",
+  ) => {
+    setExportMenuOpen(false);
+    onExport(kind);
+  };
+
+  const mitreTechniques = report.rawBundle?.mitre_attack?.techniques ?? [];
+  const carvedArtifacts = report.rawBundle?.artifacts ?? [];
+  const chatDisabledReason = !connected
+    ? "ต้องเชื่อมต่อ Backend ก่อนใช้งาน Grounded Chat"
+    : aiConfig && !aiBackendReady
+      ? "กรุณาเปิดใช้งานและเลือก Layer-2 Model ด้านบนก่อนถาม"
+      : !chatQuestion.trim()
+        ? "พิมพ์คำถามที่ต้องการถามจาก evidence ของรายงานนี้"
+        : !chatConsent
+          ? "ติ๊กช่องยืนยัน consent ด้านบนเพื่อส่งคำถามรอบนี้"
+          : "";
 
   return (
     <>
@@ -3342,16 +5685,66 @@ function ReportsPage({
         title="Analysis report"
         detail="แยกผล detector ที่อิง packet evidence, การคัดกรอง Tier-1 และคำอธิบาย AI อย่างชัดเจน"
         actions={
-          <div className="heading-actions">
-            <button type="button" className="secondary-button" onClick={() => onExport("triage-jsonl")}>
-              <Icon name="download" size={15} /> Export JSONL
+          <div className="heading-actions" style={{ flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={onTogglePrivacyMode}
+              title="Pseudonymize IPs, domains, and hashes for documentation screenshots without exporting reverse maps"
+            >
+              <Icon name="shield" size={15} /> {privacyMode ? "Privacy Redaction: ON" : "Privacy Redaction: OFF"}
             </button>
-            <button type="button" className="secondary-button" onClick={() => onExport("markdown")}>
-              <Icon name="download" size={15} /> Export MD
-            </button>
-            <button type="button" className="primary-button" onClick={() => onExport("json")}>
+            {report.origin === "live" && (
+              <button type="button" className="secondary-button" onClick={() => triggerExport("pdf")}>
+                <Icon name="download" size={15} /> Export PDF
+              </button>
+            )}
+            <button type="button" className="primary-button" onClick={() => triggerExport("json")}>
               <Icon name="download" size={15} /> Export JSON
             </button>
+            <div className="export-menu-wrap" ref={exportMenuRef}>
+              <button
+                type="button"
+                className="secondary-button"
+                aria-expanded={exportMenuOpen}
+                aria-haspopup="menu"
+                onClick={() => setExportMenuOpen((v) => !v)}
+              >
+                More Formats <Icon name="chevron" size={13} />
+              </button>
+              {exportMenuOpen && (
+                <div className="export-dropdown" role="menu" aria-label="Additional export formats">
+                  <button type="button" role="menuitem" onClick={() => triggerExport("markdown")}>
+                    <span>Markdown Report</span>
+                    <small>.md</small>
+                  </button>
+                  <button type="button" role="menuitem" onClick={() => triggerExport("triage-jsonl")}>
+                    <span>Tier-1 Evidence</span>
+                    <small>.jsonl</small>
+                  </button>
+                  {report.origin === "live" && (
+                    <>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("csv")}>
+                        <span>Findings &amp; Flows</span>
+                        <small>.csv</small>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("cef")}>
+                        <span>SIEM Syslog</span>
+                        <small>.cef</small>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("navigator")}>
+                        <span>ATT&amp;CK Navigator</span>
+                        <small>.json</small>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => triggerExport("stix")}>
+                        <span>STIX 2.1 Bundle</span>
+                        <small>.stix</small>
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         }
       />
@@ -3415,11 +5808,11 @@ function ReportsPage({
                     <SeverityPill severity={finding.severity} />
                     <div>
                       <strong>
-                        {finding.id} — {finding.title}
+                        {finding.id} — {redactor.redactFreeText(finding.title)}
                       </strong>
-                      <small>{finding.summary}</small>
+                      <small>{redactor.redactFreeText(finding.summary)}</small>
                       <span className="mono">
-                        Target: {finding.destination} · Evidence:{" "}
+                        Target: {redactor.redactEndpoint(finding.destination)} · Evidence:{" "}
                         {finding.evidence.map((ev, i) => (
                           <span key={ev}>
                             {i > 0 ? ", " : ""}
@@ -3436,40 +5829,100 @@ function ReportsPage({
             )}
           </div>
 
+          {mitreTechniques.length > 0 && (
+            <div className="report-section" id="report-mitre">
+              <span className="section-kicker">
+                02B / MITRE ATT&amp;CK v19.1 CANDIDATES ({mitreTechniques.length})
+              </span>
+              <h3>Candidate Techniques (Analyst Verification Required)</h3>
+              <div className="report-finding-list">
+                {mitreTechniques.map((tech) => (
+                  <div className="report-finding" key={`${tech.technique_id}-${tech.tactic}`}>
+                    <span className="triage-chip mono">{tech.technique_id}</span>
+                    <div>
+                      <strong>
+                        {tech.technique_name} <span className="mono">({tech.tactic})</span>
+                      </strong>
+                      <small>{redactor.redactFreeText((tech.evidence ?? []).join(" · "))}</small>
+                      <span className="mono">
+                        Candidate Confidence: {Math.round(tech.confidence * 100)}% · Status:{" "}
+                        {tech.disposition ?? "unreviewed"}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {carvedArtifacts.length > 0 && (
+            <div className="report-section" id="report-artifacts">
+              <span className="section-kicker">
+                02C / CARVED HTTP &amp; YARA ARTIFACT INVENTORY ({carvedArtifacts.length})
+              </span>
+              <h3>Opaque Artifact Metadata (Safe Analyst Review)</h3>
+              <div className="report-finding-list">
+                {carvedArtifacts.map((art) => (
+                  <div className="report-finding" key={art.artifact_id}>
+                    <span className="triage-chip mono">{art.artifact_id}</span>
+                    <div>
+                      <strong>
+                        {art.content_type} · {formatBytes(art.size_bytes)}
+                      </strong>
+                      <small className="mono">SHA-256: {redactor.redactHash(art.sha256)}</small>
+                      <span className="mono">
+                        Matched YARA Rules:{" "}
+                        {art.matched_rules.length > 0 ? art.matched_rules.join(", ") : "None (Carved Object)"}
+                        {art.evidence_id ? ` · Evidence: ${art.evidence_id}` : ""}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="report-section ai-report-section" id="report-ai">
             <div className="ai-report-title">
               <div>
                 <span className="section-kicker">03 / TIER-1 TRIAGE &amp; AI NARRATIVE</span>
                 <h3>Analyst narrative &amp; context reduction</h3>
               </div>
-              <span className={`ai-mode-tag ${aiActive ? "ai-mode-on" : ""}`}>
-                <Icon name="spark" size={13} />
-                {aiActive ? `AI: ${report.ai?.model ?? "ENABLED"}` : `AI: ${(report.ai?.state ?? "disabled").toUpperCase()}`}
-              </span>
+              {aiActive && (
+                <span className="ai-mode-tag ai-mode-on">
+                  <Icon name="spark" size={13} />
+                  AI: {report.ai?.model ?? "COMPLETED"}
+                </span>
+              )}
             </div>
 
-            {report.triage && (
-              <div className="triage-report-box mono">
-                <span>
-                  Tier-1 Classifier ({report.triage.model}): evaluated {formatCompactCount(report.triage.total_evaluated)} items · filtered{" "}
-                  {formatCompactCount(report.triage.benign_filtered)} Benign ({Math.round(report.triage.reduction_ratio * 100)}% reduction) ·{" "}
-                  escalated {formatCompactCount(report.triage.escalated_count)} · mean PPL={report.triage.mean_ppl.toFixed(2)}
-                </span>
-                {report.ai?.context_reduction && (
+            {report.triage && (() => {
+              const etInfo = describeEtbertExecution(report.triage);
+              return (
+                <div className="triage-report-box mono">
                   <span>
-                    Pre-AI evidence budget: selected {report.ai.context_reduction.sent_evidence_count ?? 0} of{" "}
-                    {report.ai.context_reduction.raw_evidence_count ?? 0} structured records; evidence references are retained
+                    Tier-1 Classifier ({report.triage.model}): evaluated {formatCompactCount(report.triage.total_evaluated)} items · filtered{" "}
+                    {formatCompactCount(report.triage.benign_filtered)} Benign ({Math.round(report.triage.reduction_ratio * 100)}% reduction) ·{" "}
+                    escalated {formatCompactCount(report.triage.escalated_count)} · mean PPL={report.triage.mean_ppl.toFixed(2)}
+                    {etInfo.stageNote}
                   </span>
-                )}
-              </div>
-            )}
+                  {report.ai?.context_reduction && (
+                    <span>
+                      Pre-AI evidence budget: selected {report.ai.context_reduction.sent_evidence_count ?? 0} of{" "}
+                      {report.ai.context_reduction.raw_evidence_count ?? 0} structured records; evidence references are retained
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
 
             {aiActive && report.ai?.report ? (
               <div className="ai-narrative">
                 <ul className="ai-summary-list">
                   {report.ai.report.summary.map((claim, idx) => (
                     <li key={idx}>
-                      {claim.claim} {claim.evidence_ids.map((eid) => (
+                      {redactor.redactFreeText(claim.claim)}{" "}
+                      {claim.evidence_ids.map((eid) => (
                         <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
                       ))}
                     </li>
@@ -3479,7 +5932,7 @@ function ReportsPage({
                   <ul className="ai-assessment-list">
                     {report.ai.report.assessments.map((a) => (
                       <li key={a.finding_id}>
-                        <b>[{a.finding_id}]</b> ({a.confidence}) {a.interpretation}{" "}
+                        <b>[{a.finding_id}]</b> ({a.confidence}) {redactor.redactFreeText(a.interpretation)}{" "}
                         {a.evidence_ids.map((eid) => (
                           <button key={eid} onClick={() => onOpenEvidence(null, eid)}>
                             [{eid}]
@@ -3493,7 +5946,8 @@ function ReportsPage({
                   <ul className="ai-limitation-list">
                     {report.ai.report.limitations.map((claim, idx) => (
                       <li key={idx}>
-                        Limitation: {claim.claim} {claim.evidence_ids.map((eid) => (
+                        Limitation: {redactor.redactFreeText(claim.claim)}{" "}
+                        {claim.evidence_ids.map((eid) => (
                           <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
                         ))}
                       </li>
@@ -3504,7 +5958,8 @@ function ReportsPage({
                   <ul className="ai-action-list">
                     {report.ai.report.recommended_actions.map((act, idx) => (
                       <li key={idx}>
-                        Action: {act.action} {act.evidence_ids.map((eid) => (
+                        Action: {redactor.redactFreeText(act.action)}{" "}
+                        {act.evidence_ids.map((eid) => (
                           <button key={eid} onClick={() => onOpenEvidence(null, eid)}>[{eid}]</button>
                         ))}
                       </li>
@@ -3519,25 +5974,243 @@ function ReportsPage({
               <div className="ai-disabled">
                 <Icon name="shield" size={17} />
                 <span>
-                  {report.ai?.error_code
-                    ? `AI narrative ถูกข้ามด้วย fallback (${report.ai.error_code}) — deterministic findings และ Tier-1 triage ยังอยู่ครบ`
-                    : "AI narrative ปิดอยู่ — สามารถตรวจ deterministic findings และ export Tier-1 JSONL ได้ตามปกติ"}
+                  {connected && aiBackendReady
+                    ? `พร้อมสร้าง AI Narrative สำหรับรายงานนี้ (${aiConfig?.configuration.provider}: ${aiBackendModel})`
+                    : "ยังไม่ได้เปิดใช้งาน Layer-2 AI — ตรวจสอบผลจาก deterministic findings และ Tier-1 triage ได้ตามปกติ"}
                 </span>
-                <button className="text-button" onClick={() => onNavigate("analyze")}>
-                  ดูตัวเลือก <Icon name="arrow" size={14} />
-                </button>
+                <div className="ai-disabled-actions">
+                  {connected && aiBackendReady && report.origin === "live" && (
+                    <>
+                      <label className="prompt-tuning-field" title="เวลารอ AI สูงสุด (วินาที) สำหรับการสร้างสรุปครั้งนี้">
+                        <span>Timeout (s)</span>
+                        <input
+                          type="number"
+                          min={5}
+                          max={600}
+                          step={15}
+                          value={promptTimeoutSec}
+                          disabled={generatingSummary}
+                          onChange={(e) => setPromptTimeoutSec(Number(e.target.value) || 120)}
+                          aria-label="Summary timeout seconds"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={generatingSummary}
+                        onClick={() => void handleGenerateSummary()}
+                      >
+                        <Icon name="spark" size={13} />{" "}
+                        {generatingSummary ? "กำลังสร้าง AI Summary…" : "สร้าง AI Summary ให้รายงานนี้"}
+                      </button>
+                    </>
+                  )}
+                  <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
+                    <Icon name="spark" size={13} /> ตั้งค่า AI &amp; Models
+                  </button>
+                  <button type="button" className="text-button" onClick={() => onNavigate("analyze")}>
+                    ไปหน้าวิเคราะห์ <Icon name="arrow" size={14} />
+                  </button>
+                </div>
+                {summaryError && (
+                  <p role="alert" className="grounded-chat-error" style={{ marginTop: "8px" }}>
+                    {summaryError}
+                  </p>
+                )}
               </div>
             )}
           </div>
 
+          <div className="report-section grounded-chat-section" id="report-chat">
+            <span className="section-kicker">04 / GROUNDED CONTEXTUAL CHAT</span>
+            <h3>ถาม AI จาก evidence ของ analysis นี้</h3>
+            {report.origin !== "live" ? (
+              <p className="muted">Contextual chat ใช้ได้กับ analysis ที่ประมวลผลโดย backend เท่านั้น</p>
+            ) : (
+              <>
+                <p className="grounded-chat-privacy">
+                  แต่ละคำถามต้องยืนยันแยกกัน · ส่งเฉพาะ structured evidence ที่ pseudonymize แล้ว · URL, path, payload และ transcript จะไม่ถูกเก็บโดย backend
+                </p>
+                {connected && aiConfig && aiBackendReady && (
+                  <div className="ai-chat-active-pill">
+                    <Icon name="spark" size={12} />
+                    <span>
+                      AI Ready: {aiConfig.configuration.provider} · {aiBackendModel} ({aiConfig.configuration.data_boundary})
+                    </span>
+                  </div>
+                )}
+                {connected && aiConfig && !aiBackendEnabled && (
+                  <div className="ai-chat-status-strip">
+                    <div className="alert-box alert-warn">
+                      <Icon name="alert" size={15} />
+                      <div>
+                        <strong>Layer-2 AI ถูกปิดอยู่ (ai.enabled = false)</strong>
+                        <p style={{ margin: "3px 0 0" }}>
+                          เปิดใช้งาน Layer-2 AI เพื่อถามคำถามแบบ grounded กับ evidence ของรายงานนี้
+                        </p>
+                      </div>
+                    </div>
+                    <div className="ai-inline-model-bar">
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={quickAiBusy}
+                        onClick={() => void handleQuickEnableAi()}
+                      >
+                        <Icon name="spark" size={13} /> {quickAiBusy ? "กำลังเปิด…" : "เปิดใช้งาน Layer-2 AI"}
+                      </button>
+                      <button type="button" className="secondary-button tiny-btn" onClick={() => onOpenConnectionModal("ai")}>
+                        ตั้งค่า AI &amp; Models
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {connected && aiConfig && aiBackendEnabled && !aiBackendModel && (
+                  <div className="ai-chat-status-strip">
+                    <div>
+                      <strong>Layer-2 AI เปิดใช้งานแล้ว ({aiConfig.configuration.provider})</strong>
+                      {" — เลือกหรือระบุ Model ด้านล่างเพื่อเปิดใช้ Grounded Chat"}
+                    </div>
+                    {aiModels && aiModels.items.length > 0 && (
+                      <div className="ai-quick-models">
+                        {aiModels.items.slice(0, 6).map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            className="ai-model-chip"
+                            disabled={quickAiBusy}
+                            onClick={() => void handleQuickSelectModel(item.id)}
+                          >
+                            <Icon name="spark" size={11} /> {item.id}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="ai-inline-model-bar">
+                      <input
+                        type="text"
+                        value={quickModelInput}
+                        onChange={(e) => setQuickModelInput(e.target.value)}
+                        placeholder="ระบุชื่อ model (เช่น qwen2.5:7b, llama3.2)"
+                        disabled={quickAiBusy}
+                        aria-label="Model name for grounded chat"
+                      />
+                      <button
+                        type="button"
+                        className="primary-button tiny-btn"
+                        disabled={quickAiBusy || !quickModelInput.trim()}
+                        onClick={() => void handleQuickSelectModel(quickModelInput)}
+                      >
+                        {quickAiBusy ? "กำลังบันทึก…" : "ใช้โมเดลนี้"}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button tiny-btn"
+                        disabled={quickAiBusy}
+                        onClick={() => void handleQuickDetectModels()}
+                      >
+                        <Icon name="search" size={12} /> {quickAiBusy ? "กำลังค้นหา…" : "Detect Models"}
+                      </button>
+                      <button type="button" className="text-button" onClick={() => onOpenConnectionModal("ai")}>
+                        ตั้งค่า AI Provider
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {chatTurns.map((turn, turnIndex) => (
+                  <div className="grounded-chat-turn" key={`${report.analysisId}-${turnIndex}`}>
+                    <strong>Q: {redactor.redactFreeText(turn.question)}</strong>
+                    <ul>
+                      {turn.claims.map((claim, claimIndex) => (
+                        <li key={claimIndex}>
+                          {redactor.redactFreeText(claim.claim)}{" "}
+                          {claim.evidence_ids.map((evidenceId) => (
+                            <button key={evidenceId} type="button" className="inline-ev-btn" onClick={() => onOpenEvidence(null, evidenceId)}>
+                              [{evidenceId}]
+                            </button>
+                          ))}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+                <form className="grounded-chat-form" onSubmit={(event) => void submitChat(event)}>
+                  <label htmlFor="grounded-chat-question">Question</label>
+                  <textarea
+                    id="grounded-chat-question"
+                    rows={3}
+                    maxLength={8_000}
+                    value={chatQuestion}
+                    onChange={(event) => setChatQuestion(event.target.value)}
+                    placeholder="Which evidence supports the DNS query-volume finding?"
+                    disabled={chatPending}
+                  />
+                  <label className="grounded-chat-consent">
+                    <input type="checkbox" checked={chatConsent} onChange={(event) => setChatConsent(event.target.checked)} disabled={chatPending} />
+                    I consent to send this question and the privacy-filtered evidence to the configured AI provider for this turn.
+                  </label>
+                  {chatError && <p role="alert" className="grounded-chat-error">{chatError}</p>}
+                  <div className="chat-submit-row">
+                    <button
+                      type="submit"
+                      className="primary-button"
+                      disabled={chatPending || !chatQuestion.trim() || !chatConsent || (connected && Boolean(aiConfig) && !aiBackendReady)}
+                    >
+                      {chatPending ? "Analyzing evidence…" : "Ask grounded AI"}
+                    </button>
+                    <div className="prompt-tuning-bar">
+                      <label className="prompt-tuning-field" title="เวลารอ AI สูงสุด (วินาที) สำหรับคำถามนี้">
+                        <span>Timeout (s)</span>
+                        <input
+                          type="number"
+                          min={5}
+                          max={600}
+                          step={15}
+                          value={promptTimeoutSec}
+                          disabled={chatPending}
+                          onChange={(e) => setPromptTimeoutSec(Number(e.target.value) || 120)}
+                          aria-label="Prompt timeout seconds"
+                        />
+                      </label>
+                      <label className="prompt-tuning-field" title="จำนวน output tokens สูงสุด (รวม thinking + JSON)">
+                        <span>Max tokens</span>
+                        <input
+                          type="number"
+                          min={256}
+                          max={16384}
+                          step={512}
+                          value={promptMaxTokens}
+                          disabled={chatPending}
+                          onChange={(e) => setPromptMaxTokens(Number(e.target.value) || 4096)}
+                          aria-label="Prompt max output tokens"
+                        />
+                      </label>
+                    </div>
+                    {chatDisabledReason && <small className="chat-helper-hint">{chatDisabledReason}</small>}
+                  </div>
+                </form>
+              </>
+            )}
+          </div>
+
+          <OSINTPanel
+            api={apiClient}
+            analysisId={report.analysisId}
+            live={report.origin === "live"}
+            connected={connected}
+            privacyRedactor={redactor}
+            initialResult={report.osint}
+            onOpenEvidence={(evidenceId) => onOpenEvidence(null, evidenceId)}
+          />
+
           <div className="report-section coverage-report" id="report-coverage">
-            <span className="section-kicker">04 / COVERAGE &amp; LIMITATIONS</span>
+            <span className="section-kicker">05 / COVERAGE &amp; LIMITATIONS</span>
             <h3>สิ่งที่ควรทราบก่อนสรุป</h3>
             <ul>
               {report.warnings.map((w, idx) => (
-                <li key={idx}>{w}</li>
+                <li key={idx}>{redactor.redactFreeText(w)}</li>
               ))}
-              <li>SHA-256: <code className="mono">{report.fullSha}</code></li>
+              <li>SHA-256: <code className="mono">{redactor.redactHash(report.fullSha)}</code></li>
             </ul>
           </div>
         </section>
@@ -3558,8 +6231,12 @@ function ReportsPage({
                 <span>03</span>Tier-1 &amp; AI narrative
                 <Icon name="arrow" size={14} />
               </button>
+              <button onClick={() => jumpTo("report-chat")}>
+                <span>04</span>Grounded chat
+                <Icon name="arrow" size={14} />
+              </button>
               <button onClick={() => jumpTo("report-coverage")}>
-                <span>04</span>Coverage &amp; limitations
+                <span>05</span>Coverage &amp; limitations
                 <Icon name="arrow" size={14} />
               </button>
             </div>

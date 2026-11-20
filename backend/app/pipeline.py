@@ -28,6 +28,7 @@ from statistics import median
 from typing import Any, Callable, Iterable, Sequence
 
 from .models import (
+    ArtifactRecord,
     CaptureMetrics,
     Coverage,
     Evidence,
@@ -39,10 +40,29 @@ from .models import (
     Tier1Summary,
     TimelineBucket,
 )
+from .dns_analysis import DNSObservation, analyze_dns_candidates
+from .beacon_analysis import BeaconObservation, analyze_beacon_candidates
+from .ja3_analysis import fingerprints_from_zeek_attributes, match_known_ja3_threat
+from .tls_cert_analysis import TLSCertificateObservation, analyze_tls_certificate_metadata
+from .correlation import (
+    build_ioc_inventory,
+    correlate_bundle_findings,
+    correlate_zeek_and_tshark_evidence,
+)
+from .flow_intel import build_flow_analytics
+from .geoip import build_world_map_flows
+from .mitre import ATTACKMapper
 from .system import probe_capabilities, resolve_adaptive_profile
 from .triage import classify_bundle
 from .zeek import NormalizedZeekRow, bounded_directory_size, parse_zeek_logs
-from .yara import NormalizedYaraMatch, RuleSnapshot, YaraRulesError, snapshot_ruleset
+from .yara import (
+    NormalizedYaraMatch,
+    RuleSnapshot,
+    YaraRulesError,
+    default_rules_dir,
+    detect_carved_content_type,
+    snapshot_ruleset,
+)
 
 
 # Canonical 16-field TShark allowlist kept stable for unit tests and base builds.
@@ -85,7 +105,6 @@ EXTENDED_FIELD_NAMES: tuple[str, ...] = FIELD_NAMES + (
     "tcp.analysis.retransmission",
     "tcp.seq",
     "data.len",
-    "icmp.data_len",
     "icmp.code",
     "dns.qry.type",
     "http.response.code",
@@ -104,10 +123,16 @@ MAX_PACKET_REFS = 50
 MAX_NUMERIC_SERIES = 50
 MAX_SAMPLE_PACKETS = 200
 MAX_LINE_BYTES = 64 * 1024
+MAX_CSV_PHYSICAL_LINE_BYTES = 64 * 1024
+MAX_CSV_RECORD_BYTES = 256 * 1024
+MAX_CSV_FIELD_BYTES = 64 * 1024
+MAX_CSV_COLUMNS = 256
 DEFAULT_MAX_STDOUT_BYTES = 64 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_DNS_RECORDS = MAX_EVIDENCE
 MAX_ARP_RECORDS = 1500
+MAX_BEACON_FLOW_SAMPLES = 2_048
+MAX_TLS_FINGERPRINT_EVIDENCE = 1_000
 DEFAULT_ZEEK_MAX_ROWS = 2_000
 DEFAULT_ZEEK_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 DEFAULT_ZEEK_TIMEOUT_SECONDS = 45
@@ -127,6 +152,10 @@ TCP_PORT_SPREAD_THRESHOLD = 20
 DNS_NXDOMAIN_THRESHOLD = 3
 DNS_HIGH_ENTROPY_THRESHOLD = 3.5
 DNS_HIGH_ENTROPY_REPEAT_THRESHOLD = 3
+DNS_QUERY_VELOCITY_WINDOW_SECONDS = 60
+DNS_QUERY_VELOCITY_MIN_QUERIES = 60
+DNS_QUERY_VELOCITY_MIN_UNIQUE_NAMES = 40
+MAX_DNS_VELOCITY_GROUPS = 256
 PERIODIC_MIN_STARTS = 4
 PERIODIC_RELATIVE_TOLERANCE = 0.25
 TIMELINE_BUCKETS = 36
@@ -155,6 +184,7 @@ class _Limits:
     zeek_max_output_bytes: int = DEFAULT_ZEEK_MAX_OUTPUT_BYTES
     zeek_timeout_seconds: int = DEFAULT_ZEEK_TIMEOUT_SECONDS
     zeek_memory_mb: int = DEFAULT_ZEEK_MEMORY_MB
+    osint_enabled: bool = False
     yara_enabled: bool = False
     yara_rules_dir: Path | None = None
     yara_max_rules_files: int = DEFAULT_YARA_MAX_RULES_FILES
@@ -314,6 +344,10 @@ class _Accumulator:
     flow_cap_hit: bool = False
     flow_evictions: int = 0
     dns_cap_hit: bool = False
+    dns_analysis_cap_hit: bool = False
+    dns_velocity_cap_hit: bool = False
+    beacon_analysis_cap_hit: bool = False
+    beacon_observations_examined: int = 0
     syn_field_observed: bool = False
     stream_limited: bool = False
 
@@ -338,6 +372,7 @@ class _Accumulator:
     arp_scan_refs: dict[str, list[int]] = field(default_factory=dict)
     arp_scan_req_count: dict[str, int] = field(default_factory=dict)
     # Timeline coarse observations (bucketed dynamically on finalize)
+    _packets_ingested: int = 0
     _time_samples: list[tuple[float, int, bool]] = field(default_factory=list)
     sample_packets: list[SamplePacket] = field(default_factory=list)
 
@@ -374,6 +409,7 @@ class _Accumulator:
 
     def ingest_packet(self, packet: _Packet, *, is_flagged_hint: bool = False) -> None:
         """Consume one parsed packet metadata object in O(K) bounded memory."""
+        self._packets_ingested += 1
         if packet.frame_len is not None:
             self.total_bytes += packet.frame_len
 
@@ -495,22 +531,43 @@ class _Accumulator:
             or (packet.arp_src_ip and len(self.arp_ip_macs.get(packet.arp_src_ip, ())) > 1)
         )
 
+        seen_count = max(self.rows_analyzed, self._packets_ingested)
+
         # Bounded time series sample reservoir (max 3600 points -> bins into 36 timeline bars cleanly)
         if len(self._time_samples) < 3600:
-            self._time_samples.append((ts if ts is not None else float(self.rows_analyzed), packet.frame_len or 0, anomaly_tick))
-        elif self.rows_analyzed % max(2, self.rows_analyzed // 1800) == 0:
+            self._time_samples.append((ts if ts is not None else float(seen_count), packet.frame_len or 0, anomaly_tick))
+        elif seen_count % max(2, seen_count // 1800) == 0:
             # Replace oldest non-anomaly or downsample proportionally
-            idx = (self.rows_analyzed * 2654435761) % 3600
+            idx = (seen_count * 2654435761) % 3600
             if not self._time_samples[idx][2] or anomaly_tick:
-                self._time_samples[idx] = (ts if ts is not None else float(self.rows_analyzed), packet.frame_len or 0, anomaly_tick)
+                self._time_samples[idx] = (ts if ts is not None else float(seen_count), packet.frame_len or 0, anomaly_tick)
 
-        # Keep up to MAX_SAMPLE_PACKETS representative & flagged rows for Packet Explorer UI
+        # Keep up to MAX_SAMPLE_PACKETS representative & flagged rows across the ENTIRE capture timeline
         if len(self.sample_packets) < MAX_SAMPLE_PACKETS:
-            # Take early frames + spread out samples when huge, always capturing anomalies
-            take = anomaly_tick or len(self.sample_packets) < 60 or (self.rows_analyzed % max(1, self.rows_analyzed // 120) == 0)
-            if take:
-                self.sample_packets.append(
-                    SamplePacket(
+            self.sample_packets.append(
+                SamplePacket(
+                    no=packet.frame,
+                    time=_format_utc_time(ts, packet.frame),
+                    source=packet.src or packet.eth_src or "Unknown",
+                    destination=packet.dst or packet.eth_dst or "Unknown",
+                    protocol=proto_label,
+                    length=packet.frame_len or 0,
+                    info=packet.info_summary or _default_packet_info(packet, proto_label),
+                    triage_label="Flagged" if anomaly_tick else None,
+                )
+            )
+        else:
+            # Deterministic uniform reservoir slot spanning [0..seen_count-1] via 32-bit Murmur3 mix.
+            # Anchor index 0 on the opening frame; reserve up to half the buffer (odd slots) for anomalies
+            # while maintaining even temporal coverage from start to end of the capture.
+            h = ((seen_count ^ 0x9E3779B9) * 0x85EBCA6B) & 0xFFFFFFFF
+            h = ((h ^ (h >> 13)) * 0xC2B2AE35) & 0xFFFFFFFF
+            h ^= h >> 16
+            slot = h % seen_count
+            if 0 < slot < MAX_SAMPLE_PACKETS:
+                existing = self.sample_packets[slot]
+                if anomaly_tick or existing.triage_label is None:
+                    self.sample_packets[slot] = SamplePacket(
                         no=packet.frame,
                         time=_format_utc_time(ts, packet.frame),
                         source=packet.src or packet.eth_src or "Unknown",
@@ -518,13 +575,13 @@ class _Accumulator:
                         protocol=proto_label,
                         length=packet.frame_len or 0,
                         info=packet.info_summary or _default_packet_info(packet, proto_label),
+                        triage_label="Flagged" if anomaly_tick else None,
                     )
-                )
-        elif anomaly_tick:
-            # Ensure critical flagged frames replace an ordinary background sample if buffer is full
-            for idx in range(len(self.sample_packets) - 1, 20, -1):
-                if self.sample_packets[idx].triage_label is None and self.sample_packets[idx].evidence_id is None:
-                    self.sample_packets[idx] = SamplePacket(
+            elif anomaly_tick:
+                # Bounded anomaly replacement on odd slots only so even slots stay uniformly spread
+                anom_slot = 1 + ((h % (MAX_SAMPLE_PACKETS // 2)) * 2)
+                if anom_slot < MAX_SAMPLE_PACKETS and self.sample_packets[anom_slot].triage_label is None:
+                    self.sample_packets[anom_slot] = SamplePacket(
                         no=packet.frame,
                         time=_format_utc_time(ts, packet.frame),
                         source=packet.src or packet.eth_src or "Unknown",
@@ -534,7 +591,6 @@ class _Accumulator:
                         info=packet.info_summary or _default_packet_info(packet, proto_label),
                         triage_label="Flagged",
                     )
-                    break
 
     def _create_flow(
         self,
@@ -926,21 +982,20 @@ def _parse_packet(parts: Sequence[str]) -> _Packet | None:
     tcp_retrans = bool(_parse_bool(parts[28])) if len(parts) > 28 else False
     tcp_seq = _parse_int(parts[29], minimum=0, maximum=4_294_967_295) if len(parts) > 29 else None
     data_len = _parse_int(parts[30], minimum=0, maximum=1_000_000_000) if len(parts) > 30 else None
-    icmp_data_len = _parse_int(parts[31], minimum=0, maximum=1_000_000_000) if len(parts) > 31 else None
-    icmp_code = _parse_int(parts[32], minimum=0, maximum=255) if len(parts) > 32 else None
-    dns_qry_type = _parse_int(parts[33], minimum=0, maximum=65535) if len(parts) > 33 else None
-    http_resp_code = _parse_int(parts[34], minimum=100, maximum=599) if len(parts) > 34 else None
+    icmp_code = _parse_int(parts[31], minimum=0, maximum=255) if len(parts) > 31 else None
+    dns_qry_type = _parse_int(parts[32], minimum=0, maximum=65535) if len(parts) > 32 else None
+    http_resp_code = _parse_int(parts[33], minimum=100, maximum=599) if len(parts) > 33 else None
 
-    uri_raw = parts[35] if len(parts) > 35 else ""
-    host_raw = parts[36] if len(parts) > 36 else ""
+    uri_raw = parts[34] if len(parts) > 34 else ""
+    host_raw = parts[35] if len(parts) > 35 else ""
     uri_len, uri_ent, xss_m, crlf_m, sqli_m, shell_m, host_is_ip = _sanitize_http_markers(uri_raw, host_raw)
 
-    telnet_cmd_seen = bool(len(parts) > 37 and parts[37].strip())
-    wlan_subtype = _parse_hex_or_int(parts[38], minimum=0, maximum=255) if len(parts) > 38 else None
-    wlan_bssid = _safe_text(parts[39].strip().lower(), max_length=64) if len(parts) > 39 and parts[39].strip() else None
-    wlan_sa = _safe_text(parts[40].strip().lower(), max_length=64) if len(parts) > 40 and parts[40].strip() else None
-    wlan_da = _safe_text(parts[41].strip().lower(), max_length=64) if len(parts) > 41 and parts[41].strip() else None
-    arp_dst_ip = _parse_ip(parts[42]) if len(parts) > 42 else None
+    telnet_cmd_seen = bool(len(parts) > 36 and parts[36].strip())
+    wlan_subtype = _parse_hex_or_int(parts[37], minimum=0, maximum=255) if len(parts) > 37 else None
+    wlan_bssid = _safe_text(parts[38].strip().lower(), max_length=64) if len(parts) > 38 and parts[38].strip() else None
+    wlan_sa = _safe_text(parts[39].strip().lower(), max_length=64) if len(parts) > 39 and parts[39].strip() else None
+    wlan_da = _safe_text(parts[40].strip().lower(), max_length=64) if len(parts) > 40 and parts[40].strip() else None
+    arp_dst_ip = _parse_ip(parts[41]) if len(parts) > 41 else None
 
     if proto is None:
         if icmp_type is not None:
@@ -953,6 +1008,10 @@ def _parse_packet(parts: Sequence[str]) -> _Packet | None:
             proto = "WLAN"
             src = src or wlan_sa or eth_src or wlan_bssid
             dst = dst or wlan_da or wlan_bssid or eth_dst or "Broadcast"
+
+    # TShark has no portable icmp.data_len field. For ICMPv4, use the
+    # supported generic data.len field when the ICMP dissector exposes it.
+    icmp_data_len = data_len if proto == 1 else None
 
     return _Packet(
         frame=frame,
@@ -1078,6 +1137,7 @@ def _yara_limit_values(settings: object, parser_memory_mb: int) -> dict[str, obj
         minimum=1024 * 1024, maximum=256 * 1024 * 1024,
     )
     return {
+        "osint_enabled": bool(getattr(settings, "osint_enabled", False)),
         "yara_enabled": bool(getattr(settings, "yara_enabled", False)),
         "yara_rules_dir": rules_dir,
         "yara_max_rules_files": _setting_int(settings, "yara_max_rules_files", DEFAULT_YARA_MAX_RULES_FILES, minimum=1, maximum=256),
@@ -1849,8 +1909,83 @@ def _detect_findings(
                 ],
             )
 
+    # 3a. Adapted DGA/tunneling heuristics operate on bounded request metadata
+    # only. They emit low-confidence candidates linked to the retained DNS rows.
+    dns_analysis = analyze_dns_candidates(
+        DNSObservation(
+            query=record.query,
+            evidence_id=evidence_id,
+            source=record.src,
+            response_code=record.rcode,
+            qtype=record.qtype,
+        )
+        for record, evidence_id in dns_evidence
+    )
+    if dns_analysis.truncated:
+        accumulator.dns_analysis_cap_hit = True
+    for candidate in dns_analysis.candidates:
+        _finding(
+            findings,
+            detector=candidate.detector,
+            title=candidate.title,
+            severity="low",
+            confidence="low",
+            summary=candidate.summary,
+            evidence_ids=candidate.evidence_ids,
+            limitations=list(candidate.limitations),
+        )
+
+    # 3b. High-volume, high-diversity DNS requests in fixed 60-second windows.
+    # Keep only bounded aggregates; query names are used locally for counts and
+    # are never copied into this finding's title or summary.
+    velocity_groups: dict[tuple[str, int], dict[str, Any]] = {}
+    for record, evidence_id in dns_evidence:
+        if record.timestamp is None or record.src is None or record.rcode is not None:
+            continue  # require a timestamped DNS request, not a response row
+        if not math.isfinite(record.timestamp) or record.timestamp < 0:
+            continue
+        window = int(record.timestamp // DNS_QUERY_VELOCITY_WINDOW_SECONDS)
+        key = (record.src, window)
+        group = velocity_groups.get(key)
+        if group is None:
+            if len(velocity_groups) >= MAX_DNS_VELOCITY_GROUPS:
+                accumulator.dns_velocity_cap_hit = True
+                continue
+            group = {"count": 0, "queries": set(), "evidence_ids": []}
+            velocity_groups[key] = group
+        group["count"] += 1
+        query_key = record.query.rstrip(".").lower()
+        if len(group["queries"]) < DNS_QUERY_VELOCITY_MIN_UNIQUE_NAMES:
+            group["queries"].add(query_key)
+        if len(group["evidence_ids"]) < 100:
+            group["evidence_ids"].append(evidence_id)
+
+    for (_source, _window), group in sorted(velocity_groups.items()):
+        query_count = int(group["count"])
+        unique_count = len(group["queries"])
+        if query_count < DNS_QUERY_VELOCITY_MIN_QUERIES or unique_count < DNS_QUERY_VELOCITY_MIN_UNIQUE_NAMES:
+            continue
+        _finding(
+            findings,
+            detector="dns_query_velocity_diversity",
+            title="High-volume, high-diversity DNS query burst",
+            severity="low",
+            confidence="low",
+            summary=(
+                f"A single source emitted {query_count} DNS requests for at least "
+                f"{unique_count} distinct names in one fixed {DNS_QUERY_VELOCITY_WINDOW_SECONDS}-second window."
+            ),
+            evidence_ids=group["evidence_ids"],
+            limitations=[
+                "This low-confidence volume/diversity heuristic is not proof of DNS tunneling or compromise.",
+                "Benign resolvers, software updates, service discovery, and capture duplication can produce bursts.",
+                "Only timestamped DNS request rows retained within configured packet/evidence bounds are evaluated.",
+            ],
+        )
+
     # 4. Periodic SYN-based connection starts (candidate beacon)
     starts_by_target: dict[tuple[str, str, int | None], list[tuple[float, str]]] = {}
+    periodic_cited_evidence: set[str] = set()
     total_starts = 0
     for flow in accumulator.flows.values():
         if flow.proto != 6 or not flow.syn_times:
@@ -1885,6 +2020,7 @@ def _detect_findings(
                 continue
             if all(abs(interval - typical) / typical <= PERIODIC_RELATIVE_TOLERANCE for interval in intervals):
                 candidate_group = True
+                periodic_cited_evidence.update(evidence_id for _, evidence_id in events)
                 _finding(
                     findings,
                     detector="periodic_tcp_connection_starts",
@@ -1903,6 +2039,49 @@ def _detect_findings(
             accumulator.warn(
                 "Periodic TCP detector ran on SYN starts but found no sufficiently regular bounded interval group."
             )
+
+    # 4a. Adapted PCAP-Hunter interval/jitter scoring over retained flow samples.
+    # This complements the stricter SYN-start detector; already-cited groups are
+    # suppressed to avoid emitting duplicate low-confidence findings.
+    beacon_observations: list[BeaconObservation] = []
+    for flow in accumulator.flows.values():
+        evidence_id = flow_evidence.get(flow.key)
+        if evidence_id is None or len(flow.times) < 4:
+            continue
+        if len(beacon_observations) >= MAX_BEACON_FLOW_SAMPLES:
+            accumulator.beacon_analysis_cap_hit = True
+            break
+        protocol = {6: "tcp", 17: "udp", 1: "icmp", 58: "icmpv6"}.get(flow.proto, "other")
+        beacon_observations.append(
+            BeaconObservation(
+                evidence_id=evidence_id,
+                timestamps=flow.times,
+                protocol=protocol,
+                destination_port=flow.dst_port,
+                timestamps_truncated=flow.packets > len(flow.times),
+            )
+        )
+    beacon_analysis = analyze_beacon_candidates(
+        beacon_observations,
+        input_truncated=accumulator.beacon_analysis_cap_hit,
+    )
+    accumulator.beacon_observations_examined = beacon_analysis.observations_examined
+    accumulator.beacon_analysis_cap_hit = accumulator.beacon_analysis_cap_hit or beacon_analysis.truncated
+    for candidate in beacon_analysis.candidates:
+        if set(candidate.evidence_ids).issubset(periodic_cited_evidence):
+            continue
+        _finding(
+            findings,
+            detector=candidate.detector,
+            title=candidate.title,
+            severity="low",
+            confidence="low",
+            summary=candidate.summary,
+            evidence_ids=list(candidate.evidence_ids),
+            limitations=list(candidate.limitations),
+        )
+    if accumulator.beacon_analysis_cap_hit:
+        accumulator.warn("Beacon timing analysis reached a configured observation or timestamp cap; candidate coverage is partial.")
 
     # 5. TLS repeated ClientHello / renegotiation anomaly
     for flow in accumulator.flows.values():
@@ -1937,6 +2116,25 @@ def _detect_findings(
                     evidence_ids=[eid],
                     limitations=[
                         "Verify whether ICMP burst corresponds to diagnostics/ping sweep or Smurf amplification.",
+                    ],
+                )
+
+    # 7. 802.11 WLAN Deauthentication / Disassociation Flood
+    for flow in accumulator.flows.values():
+        if flow.proto == "WLAN" and flow.wlan_deauth_count >= 10:
+            eid = flow_evidence.get(flow.key)
+            if eid:
+                _finding(
+                    findings,
+                    detector="wlan_deauth_flood",
+                    title="802.11 WLAN deauthentication / disassociation flood",
+                    severity="medium",
+                    confidence="low",
+                    summary=f"WLAN flow {flow.src}->{flow.dst} logged {flow.wlan_deauth_count} deauth/disassoc frames ({flow.packets} total frames).",
+                    evidence_ids=[eid],
+                    limitations=[
+                        "IEEE 802.11 management frame flood heuristics are observational and can overlap roaming or AP resets.",
+                        "Verify BSSID authorization and signal proximity before attributing interference.",
                     ],
                 )
 
@@ -2020,16 +2218,22 @@ def _build_bundle(
     parser_state: str,
     parser_detail: str,
     zeek_stage: Stage,
+    osint_enabled: bool = False,
     zeek_records: Sequence[NormalizedZeekRow] = (),
     yara_stage: Stage | None = None,
     yara_records: Sequence[NormalizedYaraMatch] = (),
+    carved_artifacts: Sequence[dict[str, Any]] = (),
     parser_name: str = "tshark-fields-offline",
     triage_cfg: object | None = None,
     triage_enabled: bool = True,
     triage_endpoint_consent: bool = False,
 ) -> EvidenceBundle:
     if yara_stage is None:
-        yara_stage = _stage("yara", "skipped", "Optional HTTP carving/YARA stage is disabled by settings.")
+        yara_stage = _stage(
+            "yara",
+            "skipped",
+            "Disabled by PCAP_YARA_ENABLED; enable only with reviewed local .yar/.yara rules and TShark/YARA installed.",
+        )
     evidence: list[Evidence] = []
     flow_evidence: dict[tuple[int | str, str, int | None, str, int | None], str] = {}
     dns_evidence: list[tuple[_DnsRecord, str]] = []
@@ -2038,6 +2242,8 @@ def _build_bundle(
     zeek_evidence_cap_hit = False
     yara_evidence_cap_hit = False
     yara_evidence_ids: list[str] = []
+    yara_ev_by_sha: dict[str, str] = {}
+    retained_zeek_rows: list[tuple[NormalizedZeekRow, str]] = []
 
     # 1. Include conflicting/high-activity ARP IP->MAC claims first (never buried below huge flows)
     arp_candidates = [
@@ -2162,9 +2368,10 @@ def _build_bundle(
                 kind="zeek",
                 summary=record.summary,
                 packet_refs=[],
-                attributes=record.attributes,
+                attributes=dict(record.attributes),
             )
         )
+        retained_zeek_rows.append((record, evidence_id))
     if zeek_evidence_cap_hit and zeek_stage.state == "completed":
         zeek_stage = zeek_stage.model_copy(
             update={
@@ -2201,6 +2408,7 @@ def _build_bundle(
             )
         )
         yara_evidence_ids.append(evidence_id)
+        yara_ev_by_sha.setdefault(record.object_sha256, evidence_id)
     if yara_evidence_cap_hit and yara_stage.state == "completed":
         yara_stage = yara_stage.model_copy(
             update={
@@ -2209,18 +2417,175 @@ def _build_bundle(
             }
         )
 
+    tls_fingerprint_count = 0
+    tls_evidence_cap_hit = False
+    ja3_threat_matches: list[tuple[str, str, str]] = []
+    tls_observations = [
+        TLSCertificateObservation(
+            evidence_id=evidence_id,
+            source_log=record.log_name,
+            attributes=record.attributes,
+        )
+        for record, evidence_id in retained_zeek_rows
+    ]
+    for record, source_evidence_id in retained_zeek_rows:
+        for fingerprint in fingerprints_from_zeek_attributes(record.attributes):
+            if tls_fingerprint_count >= MAX_TLS_FINGERPRINT_EVIDENCE or len(evidence) >= MAX_EVIDENCE:
+                tls_evidence_cap_hit = True
+                evidence_cap_hit = True
+                break
+            fingerprint_evidence_id = f"EV-{len(evidence) + 1:06d}"
+            metadata = {
+                "protocol": "TLS",
+                "fingerprint_kind": fingerprint.kind,
+                **fingerprint.to_metadata(),
+                "source_log": record.log_name,
+                "source_row": record.source_row,
+                "source_evidence_id": source_evidence_id,
+            }
+            if fingerprint.kind == "ja3":
+                threat_profile = match_known_ja3_threat(fingerprint.digest)
+                if threat_profile:
+                    metadata["ja3_malicious_match"] = True
+                    ja3_threat_matches.append((fingerprint_evidence_id, fingerprint.digest, threat_profile))
+            evidence.append(
+                Evidence(
+                    evidence_id=fingerprint_evidence_id,
+                    kind="tls",
+                    summary=(
+                        f"Validated Zeek {fingerprint.kind.upper()} TLS fingerprint metadata "
+                        f"from {record.log_name} row {record.source_row}."
+                    ),
+                    packet_refs=[],
+                    attributes=metadata,
+                )
+            )
+            tls_fingerprint_count += 1
+        if tls_evidence_cap_hit:
+            break
+
+    # Cross-link Zeek rows (conn.log, dns.log, ssl.log, x509.log) with TShark flow/dns/tls rows
+    if retained_zeek_rows:
+        correlate_zeek_and_tshark_evidence(evidence)
+
+    tls_analysis = analyze_tls_certificate_metadata(tls_observations)
+    tls_cap_hit = tls_analysis.truncated or tls_evidence_cap_hit
+    tls_detail = (
+        f"Offline TLS metadata analysis evaluated {tls_analysis.records_examined} retained Zeek rows; "
+        f"retained {tls_fingerprint_count} validated JA3/JA3S fingerprints and "
+        f"{len(tls_analysis.candidates)} low-confidence certificate metadata candidates. "
+        "No certificate bytes, issuer reputation, or network lookups are used."
+    )
+    if not retained_zeek_rows and zeek_stage.state in {"skipped", "unavailable", "failed"}:
+        tls_stage = _stage("TLS ANALYTICS", zeek_stage.state, f"Requires Zeek TLS/X.509 logs; {zeek_stage.detail}")
+    else:
+        tls_stage = _stage("TLS ANALYTICS", "partial" if tls_cap_hit or zeek_stage.state == "partial" else "completed", tls_detail)
+
     if evidence_cap_hit:
         accumulator.warn("Evidence cap reached; additional normalized flow/DNS/Zeek/YARA evidence was not retained.")
     if zeek_stage.state == "partial":
         accumulator.warn("Zeek stage coverage is partial; inspect the Zeek stage detail and configured bounds.")
     if yara_stage.state == "partial":
         accumulator.warn("YARA stage coverage is partial; inspect the stage detail and configured bounds.")
+    if tls_stage.state == "partial":
+        accumulator.warn("TLS metadata analysis coverage is partial; inspect the Zeek/TLS stage detail and configured caps.")
     if accumulator.flow_evictions > 0:
         accumulator.warn(
             f"Streaming flow table evicted {accumulator.flow_evictions} low-signal ephemeral flows to maintain bounded RAM."
         )
 
     findings = _detect_findings(accumulator, flow_evidence, dns_evidence, arp_evidence)
+
+    # Evaluate Zeek dns.log answers/TTLs for fast-flux and per-origin NXDOMAIN ratio
+    zeek_dns_obs: list[DNSObservation] = []
+    for record, zeek_ev_id in retained_zeek_rows:
+        if record.log_name != "dns.log":
+            continue
+        q = str(record.attributes.get("query") or "")
+        if not q:
+            continue
+        ans_raw = str(record.attributes.get("dns_answers") or "")
+        answers = tuple(a.strip() for a in ans_raw.split(",") if a.strip()) if ans_raw else ()
+        min_ttl_raw = record.attributes.get("dns_ttl_min")
+        min_ttl = int(min_ttl_raw) if isinstance(min_ttl_raw, int) and not isinstance(min_ttl_raw, bool) else None
+        rcode_raw = record.attributes.get("rcode")
+        rcode = int(rcode_raw) if isinstance(rcode_raw, int) and not isinstance(rcode_raw, bool) else None
+        src_str = str(record.attributes.get("src") or "") or None
+        zeek_dns_obs.append(
+            DNSObservation(
+                query=q,
+                evidence_id=zeek_ev_id,
+                source=src_str,
+                response_code=rcode,
+                answers=answers,
+                min_ttl=min_ttl,
+            )
+        )
+    if zeek_dns_obs:
+        zeek_dns_res = analyze_dns_candidates(zeek_dns_obs)
+        existing_det_ev = {(f.detector, tuple(f.evidence_ids)) for f in findings}
+        for candidate in zeek_dns_res.candidates:
+            if (candidate.detector, candidate.evidence_ids) not in existing_det_ev:
+                _finding(
+                    findings,
+                    detector=candidate.detector,
+                    title=candidate.title,
+                    severity="medium" if candidate.detector == "dns_fast_flux_heuristic" else "low",
+                    confidence="low",
+                    summary=candidate.summary,
+                    evidence_ids=list(candidate.evidence_ids),
+                    limitations=list(candidate.limitations),
+                )
+
+    for candidate in tls_analysis.candidates:
+        _finding(
+            findings,
+            detector=candidate.detector,
+            title=candidate.title,
+            severity="low",
+            confidence=candidate.confidence,
+            summary=candidate.summary,
+            evidence_ids=list(candidate.evidence_ids),
+            limitations=list(candidate.limitations),
+        )
+    for fp_ev_id, _digest, profile_label in ja3_threat_matches:
+        _finding(
+            findings,
+            detector="tls_ja3_known_signature",
+            title="JA3 client fingerprint matches known threat profile",
+            severity="medium",
+            confidence="low",
+            summary=f"Retained Zeek TLS ClientHello JA3 digest matched local signature profile ({profile_label}).",
+            evidence_ids=[fp_ev_id],
+            limitations=[
+                "JA3 digests fingerprint TLS client stacks and can be shared by benign HTTP libraries or OS runtimes.",
+                "Corroborate with destination IP/SNI, certificate metadata, and periodic beacon timing before escalation.",
+            ],
+        )
+    dns_analytics_partial = accumulator.dns_velocity_cap_hit or accumulator.dns_analysis_cap_hit
+    dns_analysis_stage = _stage(
+        "DNS ANALYTICS",
+        "partial" if dns_analytics_partial else "completed",
+        (
+            "Offline DNS heuristic analysis reached a configured record/domain/source-window cap; "
+            "some groups were not evaluated."
+            if dns_analytics_partial
+            else f"Offline DNS analysis evaluated {len(dns_evidence)} retained records for NXDOMAIN, DGA-like label, tunneling-pattern, and fixed {DNS_QUERY_VELOCITY_WINDOW_SECONDS}-second query-rate candidates; no network lookups were performed."
+        ),
+    )
+    if accumulator.dns_velocity_cap_hit:
+        accumulator.warn("DNS query-rate analysis reached its source/window group cap; some groups were not evaluated.")
+    if accumulator.dns_analysis_cap_hit:
+        accumulator.warn("DNS DGA/tunneling analysis reached its bounded record/group/candidate cap; some groups were not evaluated.")
+    beacon_stage = _stage(
+        "BEACON ANALYTICS",
+        "partial" if accumulator.beacon_analysis_cap_hit else "completed",
+        (
+            "Offline beacon timing analysis reached an observation/timestamp cap; some retained flow samples were not evaluated."
+            if accumulator.beacon_analysis_cap_hit
+            else f"Offline interval/jitter analysis evaluated {accumulator.beacon_observations_examined} retained flow samples; candidates are low-confidence and do not establish C2 activity."
+        ),
+    )
     for evidence_id in yara_evidence_ids:
         _finding(
             findings,
@@ -2252,11 +2617,23 @@ def _build_bundle(
         if warning not in deduped_warnings and len(deduped_warnings) < 100:
             deduped_warnings.append(warning)
 
+    osint_stage = (
+        _stage(
+            "osint",
+            "awaiting_consent",
+            "Provider panel is available; no external lookup is sent during parsing. Select indicators/providers and confirm each operation in Reports.",
+        )
+        if osint_enabled
+        else _stage("osint", "skipped", "OSINT provider capability is disabled by PCAP_OSINT_ENABLED=0.")
+    )
     stages = [
         _stage("tshark", parser_state, parser_detail),
+        dns_analysis_stage,
         zeek_stage,
+        beacon_stage,
+        tls_stage,
         yara_stage,
-        _stage("osint", "skipped", "OSINT integration is unsupported and no network lookup was performed."),
+        osint_stage,
     ]
     packets_seen = (
         accumulator.rows_seen
@@ -2276,8 +2653,12 @@ def _build_bundle(
             or accumulator.stream_limited
             or accumulator.flow_cap_hit
             or accumulator.dns_cap_hit
+            or accumulator.dns_analysis_cap_hit
+            or accumulator.dns_velocity_cap_hit
+            or accumulator.beacon_analysis_cap_hit
             or evidence_cap_hit
             or zeek_stage.state == "partial"
+            or tls_stage.state == "partial"
             or yara_stage.state == "partial"
         ),
         parser=parser_name,
@@ -2289,13 +2670,14 @@ def _build_bundle(
     if accumulator.first_epoch is not None and accumulator.last_epoch is not None:
         duration_s = max(0.0, accumulator.last_epoch - accumulator.first_epoch)
 
-    # Link sample packets to matching Evidence IDs by packet_ref
+    # Link sample packets to matching Evidence IDs by packet_ref (sorted chronologically by frame no.)
     ref_to_ev: dict[int, str] = {}
     for ev in evidence:
         for ref in ev.packet_refs:
             ref_to_ev.setdefault(ref, ev.evidence_id)
+    sorted_samples = sorted(accumulator.sample_packets[:MAX_SAMPLE_PACKETS], key=lambda sp: sp.no)
     linked_samples: list[SamplePacket] = []
-    for sp in accumulator.sample_packets[:MAX_SAMPLE_PACKETS]:
+    for sp in sorted_samples:
         ev_id = ref_to_ev.get(sp.no)
         linked_samples.append(
             sp.model_copy(update={"evidence_id": ev_id}) if ev_id else sp
@@ -2355,6 +2737,18 @@ def _build_bundle(
             mean_confidence=round(triage_report.mean_confidence, 4),
             mean_ppl=round(triage_report.mean_ppl, 4),
             etbert_scored_count=getattr(triage_report, "etbert_scored_count", 0),
+            etbert_backend=getattr(triage_report, "etbert_backend", None),
+            etbert_device=getattr(triage_report, "etbert_device", None),
+            etbert_model=getattr(triage_report, "etbert_model", None),
+            etbert_top_classes=[
+                Tier1ClassStat(
+                    label=item.label,
+                    count=item.count,
+                    avg_confidence=item.avg_confidence,
+                    escalated=item.escalated,
+                )
+                for item in getattr(triage_report, "etbert_top_classes", [])[:20]
+            ],
             top_classes=[
                 Tier1ClassStat(
                     label=item.label,
@@ -2367,6 +2761,80 @@ def _build_bundle(
             escalated_evidence_ids=triage_report.escalated_evidence_ids[:500],
         )
 
+    # Build opaque YARA / carved HTTP artifact metadata records (never sent to external AI)
+    artifacts_by_sha: dict[str, ArtifactRecord] = {}
+    for raw_art in carved_artifacts[:200]:
+        sha = str(raw_art.get("sha256") or "")
+        if not re.fullmatch(r"[a-f0-9]{64}", sha):
+            continue
+        artifacts_by_sha[sha] = ArtifactRecord(
+            artifact_id=f"ART-{sha[:16]}",
+            sha256=sha,
+            size_bytes=max(1, int(raw_art.get("size_bytes") or 1)),
+            content_type=str(raw_art.get("content_type") or "application/octet-stream")[:120],
+            protocol="HTTP",
+            object_index=max(1, int(raw_art.get("object_index") or 1)),
+            matched_rules=[str(r)[:128] for r in (raw_art.get("matched_rules") or [])][:32],
+            evidence_id=yara_ev_by_sha.get(sha),
+            header_hex=str(raw_art.get("header_hex") or "")[:64],
+        )
+    for record in yara_records:
+        sha = record.object_sha256
+        existing_art = artifacts_by_sha.get(sha)
+        if existing_art is None:
+            artifacts_by_sha[sha] = ArtifactRecord(
+                artifact_id=f"ART-{sha[:16]}",
+                sha256=sha,
+                size_bytes=max(1, record.object_size_bytes),
+                content_type="application/octet-stream",
+                protocol="HTTP",
+                object_index=max(1, record.object_index),
+                matched_rules=[record.rule_id],
+                evidence_id=yara_ev_by_sha.get(sha),
+                header_hex="",
+            )
+        elif record.rule_id not in existing_art.matched_rules and len(existing_art.matched_rules) < 32:
+            artifacts_by_sha[sha] = existing_art.model_copy(
+                update={
+                    "matched_rules": [*existing_art.matched_rules, record.rule_id],
+                    "evidence_id": existing_art.evidence_id or yara_ev_by_sha.get(sha),
+                }
+            )
+    artifacts_list = list(artifacts_by_sha.values())[:200]
+
+    pkt_lengths = [int(ln) for _, ln, _ in accumulator._time_samples if ln and ln > 0]
+    iat_samples: list[float] = []
+    for flow in accumulator.flows.values():
+        for iv in flow.intervals:
+            if math.isfinite(iv) and iv >= 0:
+                iat_samples.append(float(iv))
+                if len(iat_samples) >= 5000:
+                    break
+        if len(iat_samples) >= 5000:
+            break
+    if not iat_samples and accumulator.first_epoch is not None and len(accumulator._time_samples) >= 2:
+        sorted_ts = sorted(ts for ts, _, _ in accumulator._time_samples if math.isfinite(ts))
+        for prev_ts, cur_ts in zip(sorted_ts, sorted_ts[1:]):
+            dt = cur_ts - prev_ts
+            if math.isfinite(dt) and dt >= 0:
+                iat_samples.append(dt)
+                if len(iat_samples) >= 5000:
+                    break
+
+    flow_analytics = build_flow_analytics(
+        evidence,
+        packet_lengths=pkt_lengths or None,
+        inter_arrival_seconds=iat_samples or None,
+        findings=findings,
+        duration_seconds=duration_s,
+        total_packets=packets_analyzed,
+        total_bytes=accumulator.total_bytes,
+    )
+    geoip_summary = build_world_map_flows(evidence)
+    correlations_list = [item.to_dict() for item in correlate_bundle_findings(evidence, findings)]
+    mitre_dict = ATTACKMapper().map_analysis(findings=findings).to_dict()
+    ioc_inventory = build_ioc_inventory(evidence, findings)
+
     try:
         return EvidenceBundle(
             capture_sha256=capture_sha256,
@@ -2375,6 +2843,12 @@ def _build_bundle(
             findings=findings,
             triage=triage_summary,
             telemetry=telemetry,
+            mitre_attack=mitre_dict,
+            correlations=correlations_list,
+            artifacts=artifacts_list,
+            flow_analytics=flow_analytics,
+            geoip=geoip_summary,
+            iocs=ioc_inventory,
         )
     except Exception:
         raise PipelineError("INTERNAL_CONTRACT_ERROR", "Parser output failed the evidence contract") from None
@@ -2451,12 +2925,21 @@ def _run_yara(
     limits: _Limits,
     deadline: float,
     is_cancelled: Callable[[], bool],
+    carved_artifacts_out: list[dict[str, Any]] | None = None,
 ) -> tuple[Stage, list[NormalizedYaraMatch]]:
     """Carve bounded HTTP objects and scan them locally; never retain object bytes."""
     if not limits.yara_enabled:
-        return _stage("yara", "skipped", "Optional HTTP carving/YARA stage is disabled by settings."), []
+        return _stage(
+            "yara",
+            "skipped",
+            "Disabled by PCAP_YARA_ENABLED; enable only with reviewed local .yar/.yara rules and TShark/YARA installed.",
+        ), []
     if limits.yara_rules_dir is None:
-        return _stage("yara", "unavailable", "YARA is enabled but no operator rules directory is configured."), []
+        return _stage(
+            "yara",
+            "unavailable",
+            "YARA is enabled but PCAP_YARA_RULES_DIR does not point to an operator rules directory.",
+        ), []
     tshark = shutil.which("tshark")
     yara = shutil.which("yara")
     if not tshark or not yara:
@@ -2478,12 +2961,29 @@ def _run_yara(
             objects_dir = run_dir / "objects"
             rules_dir = run_dir / "rules"
             objects_dir.mkdir(mode=0o700)
-            ruleset = snapshot_ruleset(
-                limits.yara_rules_dir,
-                rules_dir,
-                max_files=limits.yara_max_rules_files,
-                max_bytes=limits.yara_max_rules_bytes,
-            )
+            try:
+                ruleset = snapshot_ruleset(
+                    limits.yara_rules_dir,
+                    rules_dir,
+                    max_files=limits.yara_max_rules_files,
+                    max_bytes=limits.yara_max_rules_bytes,
+                )
+            except YaraRulesError as exc:
+                default_repo_yara = (Path(__file__).resolve().parents[2] / "yara-rules").resolve()
+                bundled_yara = default_rules_dir()
+                if (
+                    str(exc) == "ruleset_empty"
+                    and limits.yara_rules_dir == default_repo_yara
+                    and bundled_yara is not None
+                ):
+                    ruleset = snapshot_ruleset(
+                        bundled_yara,
+                        rules_dir,
+                        max_files=limits.yara_max_rules_files,
+                        max_bytes=limits.yara_max_rules_bytes,
+                    )
+                else:
+                    raise
 
             carve_process = _spawn(
                 [tshark, "-n", "-r", str(path), "--export-objects", f"http,{objects_dir}"],
@@ -2541,6 +3041,7 @@ def _run_yara(
                 return _stage("yara", "failed", "TShark HTTP object export failed; TShark and Zeek evidence were retained."), []
 
             object_meta: dict[int, tuple[str, int]] = {}
+            object_headers: dict[int, tuple[str, str]] = {}
             for object_index, original_name in enumerate(names, start=1):
                 if is_cancelled():
                     raise PipelineError("CANCELLED", "Offline parser cancelled")
@@ -2562,6 +3063,7 @@ def _run_yara(
                     fd = os.open(safe_path, flags)
                     digest = hashlib.sha256()
                     size = 0
+                    first_head = b""
                     with os.fdopen(fd, "rb") as object_file:
                         opened = os.fstat(object_file.fileno())
                         if not stat.S_ISREG(opened.st_mode) or opened.st_size != info.st_size:
@@ -2577,6 +3079,8 @@ def _run_yara(
                             block = object_file.read(64 * 1024)
                             if not block:
                                 break
+                            if not first_head:
+                                first_head = block[:256]
                             size += len(block)
                             if size > limits.yara_max_object_bytes or carved_bytes + size > limits.yara_max_total_bytes:
                                 partial = True
@@ -2590,6 +3094,10 @@ def _run_yara(
                         continue
                     carved_bytes += size
                     object_meta[object_index] = (digest.hexdigest(), size)
+                    object_headers[object_index] = (
+                        detect_carved_content_type(first_head),
+                        first_head[:32].hex(),
+                    )
                 except PipelineError:
                     raise
                 except OSError:
@@ -2698,6 +3206,25 @@ def _run_yara(
                     if yara_state == "failed" and not matches:
                         return _stage("yara", "failed", "The local YARA scan failed; TShark and Zeek evidence were retained."), []
 
+            if carved_artifacts_out is not None and object_meta:
+                matched_by_idx: dict[int, list[str]] = {}
+                for m in matches:
+                    rules_for_obj = matched_by_idx.setdefault(m.object_index, [])
+                    if m.rule_id not in rules_for_obj:
+                        rules_for_obj.append(m.rule_id)
+                for idx, (obj_sha, obj_size) in sorted(object_meta.items()):
+                    ctype, hhex = object_headers.get(idx, ("application/octet-stream", ""))
+                    carved_artifacts_out.append(
+                        {
+                            "object_index": idx,
+                            "sha256": obj_sha,
+                            "size_bytes": obj_size,
+                            "content_type": ctype,
+                            "header_hex": hhex,
+                            "matched_rules": matched_by_idx.get(idx, []),
+                        }
+                    )
+
             detail = (
                 f"Offline YARA scanned {objects_scanned} HTTP object(s), retained {len(matches)} rule match(es), "
                 f"using the configured operator ruleset; limits: {limits.yara_max_objects} objects, "
@@ -2709,7 +3236,20 @@ def _run_yara(
             return _stage("yara", "completed", detail), matches
     except PipelineError:
         raise
-    except YaraRulesError:
+    except YaraRulesError as exc:
+        reason = str(exc)
+        if reason == "ruleset_empty":
+            return _stage(
+                "yara",
+                "skipped",
+                "YARA is enabled, but no .yar/.yara signatures are present in the configured local rules directory.",
+            ), []
+        if reason == "rules_directory_unavailable":
+            return _stage(
+                "yara",
+                "unavailable",
+                "YARA is enabled, but the configured local rules directory is unavailable.",
+            ), []
         return _stage("yara", "failed", "The operator YARA ruleset is invalid, unsafe, or exceeds its configured bounds."), []
     except (OSError, ValueError, subprocess.SubprocessError):
         return _stage("yara", "failed", "HTTP carving or local YARA scanning failed; TShark evidence was retained."), []
@@ -2725,15 +3265,46 @@ _HTTP_METHOD_RE = re.compile(r"\b(GET|POST|PUT|DELETE|HEAD|OPTIONS)\s+([^\s]{1,1
 def _looks_like_wireshark_csv(path: Path) -> bool:
     try:
         with path.open("rb") as f:
-            head = f.read(512).lstrip(b"\xef\xbb\xbf")
+            head = f.read(1024).lstrip(b"\xef\xbb\xbf")
     except OSError:
         return False
     # Check it is not binary PCAP/PCAPNG
-    if head[:4] in {b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a"}:
+    if b"\x00" in head or head[:4] in {b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a"}:
         return False
     text = head.decode("utf-8", errors="ignore").lower()
     first_line = text.splitlines()[0] if text else ""
-    return ("time" in first_line and "source" in first_line and "destination" in first_line)
+    has_time = "time" in first_line
+    has_src = ("source" in first_line) or ("src" in first_line)
+    has_dst = ("destination" in first_line) or ("dst" in first_line)
+    return has_time and has_src and has_dst
+
+
+class _BoundedCSVLines:
+    """Binary line source enforcing hard byte budgets while csv.reader consumes a record."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self._record_bytes = 0
+        self._first_line = True
+
+    def __iter__(self) -> _BoundedCSVLines:
+        return self
+
+    def __next__(self) -> str:
+        raw = self._handle.readline(MAX_CSV_PHYSICAL_LINE_BYTES + 1)
+        if not raw:
+            raise StopIteration
+        if len(raw) > MAX_CSV_PHYSICAL_LINE_BYTES:
+            raise PipelineError("PARSER_FAILED", "CSV physical-line byte limit exceeded")
+        self._record_bytes += len(raw)
+        if self._record_bytes > MAX_CSV_RECORD_BYTES:
+            raise PipelineError("PARSER_FAILED", "CSV record byte limit exceeded")
+        encoding = "utf-8-sig" if self._first_line else "utf-8"
+        self._first_line = False
+        return raw.decode(encoding, errors="replace")
+
+    def finish_record(self) -> None:
+        self._record_bytes = 0
 
 
 def _analyze_csv_capture(
@@ -2755,16 +3326,28 @@ def _analyze_csv_capture(
     )
     deadline_hit = False
     delimiter = "\t"
-    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-        first_line = handle.readline(MAX_LINE_BYTES)
+    with path.open("rb") as handle:
+        first_line = handle.readline(MAX_CSV_PHYSICAL_LINE_BYTES + 1)
         if not first_line:
             raise PipelineError("PARSER_FAILED", "Capture CSV is empty")
-        delimiter = "\t" if first_line.count("\t") >= first_line.count(",") else ","
+        if len(first_line) > MAX_CSV_PHYSICAL_LINE_BYTES:
+            raise PipelineError("PARSER_FAILED", "CSV header byte limit exceeded")
+        first_line_text = first_line.decode("utf-8-sig", errors="replace")
+        delimiter = "\t" if first_line_text.count("\t") >= first_line_text.count(",") else ","
         handle.seek(0)
-        reader = csv.reader(handle, delimiter=delimiter)
-        header = next(reader, None)
+        bounded_lines = _BoundedCSVLines(handle)
+        reader = csv.reader(bounded_lines, delimiter=delimiter, strict=True)
+        try:
+            header = next(reader, None)
+        except csv.Error as exc:
+            raise PipelineError("PARSER_FAILED", "Malformed CSV header") from exc
+        bounded_lines.finish_record()
         if not header:
             raise PipelineError("PARSER_FAILED", "Capture CSV missing header row")
+        if len(header) > MAX_CSV_COLUMNS:
+            raise PipelineError("PARSER_FAILED", "CSV column limit exceeded")
+        if any(len(value.encode("utf-8", errors="replace")) > MAX_CSV_FIELD_BYTES for value in header):
+            raise PipelineError("PARSER_FAILED", "CSV header field byte limit exceeded")
         col_map = {col.strip().lower().rstrip("."): idx for idx, col in enumerate(header)}
 
         def col(row: list[str], *names: str, default: str = "") -> str:
@@ -2774,7 +3357,19 @@ def _analyze_csv_capture(
                     return row[idx].strip()
             return default
 
-        for row in reader:
+        while True:
+            try:
+                row = next(reader)
+            except StopIteration:
+                break
+            except csv.Error as exc:
+                detail = "CSV field byte limit exceeded" if "field larger than field limit" in str(exc).lower() else "Malformed CSV record"
+                raise PipelineError("PARSER_FAILED", detail) from exc
+            bounded_lines.finish_record()
+            if len(row) > MAX_CSV_COLUMNS:
+                raise PipelineError("PARSER_FAILED", "CSV column limit exceeded")
+            if any(len(value.encode("utf-8", errors="replace")) > MAX_CSV_FIELD_BYTES for value in row):
+                raise PipelineError("PARSER_FAILED", "CSV field byte limit exceeded")
             if is_cancelled():
                 raise PipelineError("CANCELLED", "Offline parser cancelled")
             if accumulator.rows_seen % 500 == 0 and time.monotonic() >= deadline:
@@ -2946,6 +3541,7 @@ def _analyze_csv_capture(
         parser_state=parser_state,
         parser_detail=parser_detail,
         zeek_stage=zeek_stage,
+        osint_enabled=limits.osint_enabled,
         yara_stage=yara_stage,
         parser_name="wireshark-csv-offline",
         triage_cfg=triage_cfg,
@@ -3044,12 +3640,18 @@ def analyze_capture(
             is_cancelled=is_cancelled,
         )
     else:
-        zeek_stage = _stage("zeek", "skipped", "Optional Zeek stage is disabled by settings.")
+        zeek_stage = _stage(
+            "zeek",
+            "skipped",
+            "Disabled by PCAP_ZEEK_ENABLED; set it to 1 to run offline Zeek (requires zeek on PATH).",
+        )
+    carved_artifacts: list[dict[str, Any]] = []
     yara_stage, yara_records = _run_yara(
         path,
         limits=limits,
         deadline=deadline,
         is_cancelled=is_cancelled,
+        carved_artifacts_out=carved_artifacts,
     )
     return _build_bundle(
         accumulator,
@@ -3057,9 +3659,11 @@ def analyze_capture(
         parser_state=parser_state,
         parser_detail=parser_detail,
         zeek_stage=zeek_stage,
+        osint_enabled=limits.osint_enabled,
         zeek_records=zeek_records,
         yara_stage=yara_stage,
         yara_records=yara_records,
+        carved_artifacts=carved_artifacts,
         triage_cfg=triage_cfg,
         triage_enabled=triage_enabled,
         triage_endpoint_consent=triage_endpoint_consent,

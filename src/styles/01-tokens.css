@@ -1,0 +1,60 @@
+:root {
+  color-scheme: dark;
+
+  /* Core dark-cyber palette */
+  --bg: #101720;
+  --bg-2: #141e29;
+  --sidebar: #0d141c;
+  --panel: #18232f;
+  --panel-2: #1d2a37;
+  --panel-3: #222f3d;
+  --ink: #e4edf4;
+  --ink-2: #becbd6;
+  --text: var(--ink);
+  --muted: #8193a3;
+  --muted-2: #627687;
+  --line: #293847;
+  --line-2: #344758;
+  --line-strong: #435a6e;
+
+  /* Accents & semantic status tones */
+  --cyan: #32bdd1;
+  --cyan-2: #74d8e4;
+  --cyan-soft: rgba(50, 189, 209, .12);
+  --blue: #5b9ee8;
+  --blue-soft: rgba(91, 158, 232, .13);
+  --green: #6fcf97;
+  --green-soft: rgba(111, 207, 151, .12);
+  --amber: #e5b85c;
+  --amber-soft: rgba(229, 184, 92, .12);
+  --red: #ec7979;
+  --red-soft: rgba(236, 121, 121, .12);
+  --purple: #b7a0eb;
+  --purple-soft: rgba(183, 160, 235, .13);
+
+  /* Alert / toast semantic tokens inspired by PHPSCANNER */
+  --ok: #6fcf97;
+  --ok-bg: rgba(111, 207, 151, .11);
+  --ok-border: rgba(111, 207, 151, .34);
+  --info: #5b9ee8;
+  --info-bg: rgba(91, 158, 232, .11);
+  --info-border: rgba(91, 158, 232, .34);
+  --warn-tone: #e5b85c;
+  --warn-bg: rgba(229, 184, 92, .11);
+  --warn-border: rgba(229, 184, 92, .36);
+  --crit-tone: #ec7979;
+  --crit-bg: rgba(236, 121, 121, .13);
+  --crit-border: rgba(236, 121, 121, .38);
+
+  --grad-accent: linear-gradient(135deg, #32bdd1, #5b9ee8);
+  --grad-ai: linear-gradient(135deg, #5b9ee8, #b7a0eb);
+
+  /* Typography & motion physics */
+  --font: Inter, "Noto Sans Thai", "Anuphan", Tahoma, system-ui, sans-serif;
+  --sans: var(--font);
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --spring: cubic-bezier(.34, 1.56, .64, 1);
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --shadow: 0 12px 30px rgba(0, 0, 0, .18);
+  --shadow-float: 0 22px 48px rgba(0, 0, 0, .42);
+}

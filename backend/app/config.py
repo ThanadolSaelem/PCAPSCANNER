@@ -78,13 +78,18 @@ def _validate_endpoint(value: str, *, data_boundary: str, require_https_remote: 
     except ValueError:
         ip = None
     if ip is not None:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
         # Metadata, link-local, multicast, unspecified and reserved destinations
-        # are never valid provider endpoints.  Loopback/private are allowed only
-        # for an explicitly local data boundary.
+        # are never valid provider endpoints.
         if ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
             raise ValueError("forbidden_endpoint")
+        if data_boundary == "local" and not ip.is_loopback:
+            raise ValueError("local_boundary_requires_loopback")
         if data_boundary == "remote" and (ip.is_loopback or ip.is_private):
             raise ValueError("remote_private_endpoint")
+    elif data_boundary == "local" and lowered_host not in {"localhost", "ip6-localhost"}:
+        raise ValueError("local_boundary_requires_loopback")
     elif data_boundary == "remote" and lowered_host in {"localhost", "ip6-localhost"}:
         raise ValueError("remote_private_endpoint")
     if require_https_remote and data_boundary == "remote" and parts.scheme.lower() != "https":
@@ -125,8 +130,11 @@ def _validate_origin(value: str) -> str:
         ip = ipaddress.ip_address(parts.hostname)
     except ValueError:
         ip = None
-    if ip is not None and (ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved):
-        raise ValueError("forbidden_origin")
+    if ip is not None:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+            raise ValueError("forbidden_origin")
     return value
 
 
@@ -136,7 +144,7 @@ class AIConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", use_enum_values=True, validate_assignment=True)
 
     schema_version: Literal["1.0"] = "1.0"
-    enabled: bool = False
+    enabled: bool = True
     provider: ProviderName = ProviderName.OPENAI_COMPATIBLE
     # None means the safe local Ollama-compatible default for the compatible
     # provider, or the runtime MANUS_API_URL for the Manus adapter.
@@ -146,15 +154,49 @@ class AIConfig(BaseModel):
     # This is an environment variable *name*, never a key value.
     api_key_env: str | None = Field(default=None, max_length=128)
     data_boundary: DataBoundary = "remote"
-    timeout_seconds: int = Field(default=30, ge=1, le=120)
+    timeout_seconds: int = Field(default=30, ge=1, le=600)
     retries: int = Field(default=0, ge=0, le=2)
-    input_max_bytes: int = Field(default=100_000, ge=1, le=100_000)
-    max_output_tokens: int = Field(default=2048, ge=1, le=8192)
+    input_max_bytes: int = Field(default=150_000, ge=1, le=2_000_000)
+    max_output_tokens: int = Field(default=2048, ge=1, le=16_384)
     context_window_tokens: int = Field(default=16_384, ge=1, le=2_000_000)
     token_parameter: TokenParameter = "max_tokens"
     response_mode: ResponseMode = "json_schema"
     temperature: float | None = Field(default=None, ge=0, le=2)
     anthropic_version: str = Field(default="2023-06-01", min_length=1, max_length=64)
+    # Non-secret catalog card id (see backend/app/llm/catalog.py).  It drives UI
+    # presets and selects a dedicated in-memory credential slot; it never
+    # relaxes the origin/boundary policy below.
+    preset: str | None = Field(default=None, max_length=48)
+
+    @field_validator("preset")
+    @classmethod
+    def known_preset(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from .llm.catalog import PRESET_ID_RE, is_known_preset
+
+        if not PRESET_ID_RE.fullmatch(value) or not is_known_preset(value):
+            raise ValueError("unknown_ai_preset")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_local_ollama_defaults(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        provider = data.get("provider", ProviderName.OPENAI_COMPATIBLE)
+        provider_text = provider.value if isinstance(provider, ProviderName) else str(provider)
+        if (
+            provider_text == ProviderName.OPENAI_COMPATIBLE.value
+            and "base_url" not in data
+            and "data_boundary" not in data
+            and "allowed_origins" not in data
+        ):
+            updated = dict(data)
+            updated["data_boundary"] = "local"
+            updated["allowed_origins"] = ["http://127.0.0.1:11434"]
+            return updated
+        return data
 
     @field_validator("allowed_origins")
     @classmethod
@@ -180,11 +222,17 @@ class AIConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_policy(self) -> "AIConfig":
+        if self.preset is not None:
+            from .llm.catalog import get_preset
+
+            preset_meta = get_preset(self.preset)
+            provider_value = self.provider.value if isinstance(self.provider, ProviderName) else str(self.provider)
+            if preset_meta is None or preset_meta["protocol"] != provider_value:
+                raise ValueError("preset_protocol_mismatch")
         if self.base_url is not None:
             _validate_endpoint(self.base_url, data_boundary=self.data_boundary)
         if not self.enabled:
             return self
-
         if self.provider == ProviderName.MANUS:
             # The actual URL and key are obtained at runtime from MANUS_*.
             # A configured URL is still validated and must be allowlisted.
@@ -204,6 +252,28 @@ class AIConfig(BaseModel):
         return self
 
 
+DEFAULT_ETBERT_MODEL_CANDIDATES: tuple[str, ...] = (
+    str(Path.home() / "Downloads" / "pre-trained_model.bin"),
+)
+
+
+def resolve_default_etbert_checkpoint() -> str | None:
+    env_val = (
+        os.environ.get("PCAP_ETBERT_MODEL_BIN")
+        or os.environ.get("PCAP_TRIAGE_ETBERT_CHECKPOINT_PATH")
+        or ""
+    ).strip()
+    if env_val:
+        return env_val
+    for cand in DEFAULT_ETBERT_MODEL_CANDIDATES:
+        try:
+            if Path(cand).expanduser().is_file():
+                return str(Path(cand).expanduser().resolve())
+        except OSError:
+            continue
+    return None
+
+
 class TriageConfig(BaseModel):
     """Non-secret configuration for the Tier-1 fast calibrated classifier."""
 
@@ -214,6 +284,7 @@ class TriageConfig(BaseModel):
     endpoint_url: str | None = None
     etbert_enabled: bool = False
     etbert_endpoint_url: str | None = None
+    etbert_checkpoint_path: str | None = Field(default_factory=resolve_default_etbert_checkpoint)
     data_boundary: DataBoundary = "local"
     allowed_origins: list[str] = Field(default_factory=list, max_length=20)
     model_name: str = Field(default="openjev-cal-tier1", min_length=1, max_length=120)
@@ -269,13 +340,18 @@ class AppSettings(BaseModel):
     flow_limit: int = Field(default=5_000, ge=1)
     parser_timeout_seconds: int = Field(default=120, ge=1)
     parser_memory_mb: int = Field(default=512, ge=1)
-    zeek_enabled: bool = False
+    # Offline analyzers are enabled by default when their binaries are installed.
+    # Their hard runtime/resource bounds remain enforced by the pipeline.
+    zeek_enabled: bool = True
     zeek_max_rows: int = Field(default=2_000, ge=1, le=10_000)
     zeek_max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
     zeek_timeout_seconds: int = Field(default=45, ge=1, le=120)
     zeek_memory_mb: int = Field(default=256, ge=128, le=512)
-    yara_enabled: bool = False
-    yara_rules_dir: Path | None = None
+    # OSINT provider capability is available by default, but each outbound IOC
+    # lookup still requires explicit per-operation user consent.
+    osint_enabled: bool = True
+    yara_enabled: bool = True
+    yara_rules_dir: Path | None = Path("./yara-rules")
     yara_max_rules_files: int = Field(default=64, ge=1, le=256)
     yara_max_rules_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     yara_max_objects: int = Field(default=100, ge=1, le=500)
@@ -397,6 +473,7 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_ZEEK_MAX_OUTPUT_BYTES": ("zeek_max_output_bytes", "int"),
         "PCAP_ZEEK_TIMEOUT_SECONDS": ("zeek_timeout_seconds", "int"),
         "PCAP_ZEEK_MEMORY_MB": ("zeek_memory_mb", "int"),
+        "PCAP_OSINT_ENABLED": ("osint_enabled", "bool"),
         "PCAP_YARA_ENABLED": ("yara_enabled", "bool"),
         "PCAP_YARA_RULES_DIR": ("yara_rules_dir", "str"),
         "PCAP_YARA_MAX_RULES_FILES": ("yara_max_rules_files", "int"),
@@ -433,6 +510,8 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_TRIAGE_ENDPOINT_URL": ("endpoint_url", "str"),
         "PCAP_TRIAGE_ETBERT_ENABLED": ("etbert_enabled", "bool"),
         "PCAP_TRIAGE_ETBERT_ENDPOINT_URL": ("etbert_endpoint_url", "str"),
+        "PCAP_TRIAGE_ETBERT_CHECKPOINT_PATH": ("etbert_checkpoint_path", "str"),
+        "PCAP_ETBERT_MODEL_BIN": ("etbert_checkpoint_path", "str"),
         "PCAP_TRIAGE_ETBERT_MODEL": ("etbert_model_name", "str"),
         "PCAP_TRIAGE_ETBERT_TIMEOUT_SECONDS": ("etbert_timeout_seconds", "int"),
         "PCAP_TRIAGE_DATA_BOUNDARY": ("data_boundary", "str"),
@@ -459,6 +538,8 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
                 raise ValueError(f"invalid_triage_{field_name}") from exc
         elif kind == "bool":
             triage[field_name] = _parse_bool(raw, f"triage_{field_name}")
+        elif kind == "list":
+            triage[field_name] = _parse_list(raw, f"triage_{field_name}")
         else:
             triage[field_name] = raw
     if triage:
@@ -481,6 +562,7 @@ def _env_overlay(env: dict[str, str]) -> dict[str, Any]:
         "PCAP_AI_RESPONSE_MODE": ("response_mode", "str"),
         "PCAP_AI_TEMPERATURE": ("temperature", "float"),
         "PCAP_AI_ANTHROPIC_VERSION": ("anthropic_version", "str"),
+        "PCAP_AI_PRESET": ("preset", "str"),
     }
     # Double-underscore names are accepted as a conventional nested alias too.
     for env_name, (field_name, kind) in ai_map.items():
@@ -552,6 +634,16 @@ def load_settings() -> AppSettings:
             ws_overlay["local_ingest_roots"] = ws_raw["local_ingest_roots"]
         if ws_raw.get("resource_mode"):
             ws_overlay["resource_mode"] = ws_raw["resource_mode"]
+        ws_triage: dict[str, Any] = {}
+        if "etbert_checkpoint_path" in ws_raw:
+            raw_ckpt = ws_raw.get("etbert_checkpoint_path")
+            ws_triage["etbert_checkpoint_path"] = raw_ckpt if isinstance(raw_ckpt, str) and raw_ckpt.strip() else None
+        if isinstance(ws_raw.get("etbert_enabled"), bool):
+            ws_triage["etbert_enabled"] = ws_raw["etbert_enabled"]
+        if ws_triage:
+            ws_overlay["triage"] = ws_triage
+        if isinstance(ws_raw.get("ai"), dict) and ws_raw["ai"]:
+            ws_overlay["ai"] = ws_raw["ai"]
         _assert_nonsecret(ws_overlay)
         if ws_raw.get("prefer_workspace"):
             # Desktop UI-picked paths take precedence over ambient shell defaults.
@@ -568,4 +660,4 @@ def load_settings() -> AppSettings:
     return AppSettings.model_validate(merged)
 
 
-__all__ = ["AIConfig", "AppSettings", "ProviderName", "TriageConfig", "load_settings"]
+__all__ = ["AIConfig", "AppSettings", "ProviderName", "TriageConfig", "load_settings", "resolve_default_etbert_checkpoint"]

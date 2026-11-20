@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import asyncio
 import json
 import mimetypes
 import os
@@ -14,27 +15,45 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from .config import AppSettings, load_settings
+from .config import AIConfig, AppSettings, load_settings
 from .batch_upload import BatchUploadError, stage_batch_upload
 from .models import (
+    AIConfigUpdateRequest,
+    AICredentialUpdateRequest,
+    AIModelProbeRequest,
     AIResult,
     BatchResponse,
     AnalysisRequest,
+    CaseAnalysisLinkRequest,
+    CaseCreateRequest,
+    CaseDetail,
+    CaseIOCCreateRequest,
+    CaseListResponse,
+    CaseNoteCreateRequest,
+    CasePatchRequest,
     ChunkUploadInitRequest,
+    AISummaryRequest,
     EvidenceBundle,
+    GroundedChatRequest,
+    JobsPruneRequest,
+    OSINTKeyRotateRequest,
+    OSINTLookupRequest,
     LocalCaptureRequest,
     NativePickRequest,
     ProblemDetails,
+    ScopedKeyCreateRequest,
     WorkspaceUpdateRequest,
 )
 from .picker import (
+    ALLOWED_MODEL_EXTENSIONS,
     PickerError,
     detect_picker_backend,
     is_loopback_client,
@@ -47,6 +66,28 @@ from .picker import (
 from .store import ACTIVE, Store, StoreError
 from .system import build_capabilities_payload, probe_capabilities, recommended_chunk_size_bytes
 from .triage import bundle_to_triage_jsonl
+from .etbert_bridge import inspect_etbert_checkpoint, is_etbert_effectively_enabled
+from .yara import default_rules_dir, inspect_yara_rules
+from .geoip import build_world_map_flows
+from .exporters.csv_json import export_findings_and_evidence_csv
+from .exporters.cef import export_findings_cef
+from .exporters.navigator import export_attack_navigator_layer
+from .exporters.pdf_report import export_snapshot_pdf
+from .llm import (
+    clear_runtime_api_key,
+    credential_slot_for,
+    credential_slot_names,
+    generate_chat_completion,
+    generate_summary,
+    infer_preset,
+    list_presets,
+    probe_models,
+    runtime_api_key_status,
+    set_runtime_api_key,
+)
+from .llm.chat import ChatLimits, answer_question
+from .stix_export import export_stix_bundle
+from .osint_service import OSINTService, extract_ioc_candidates, MAX_IOCS_PER_OPERATION
 
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
@@ -183,6 +224,30 @@ def problem(status: int, code: str, request_id: str | None = None, headers=None)
     )
 
 
+def _required_scope_for_request(method: str, path: str) -> tuple[str, ...]:
+    if path.startswith("/api/v1/auth/keys"):
+        return ("admin:keys",)
+    if path.endswith((".csv", ".cef", ".navigator.json", ".pdf", ".stix.json", ".jsonl")):
+        return ("export:reports",)
+    if path.endswith("/snapshot"):
+        if method == "GET":
+            return ("read:manifest", "export:reports", "read:analyses")
+        return ("export:reports",)
+    if path.endswith("/report"):
+        return ("read:report", "read:analyses")
+    if path.endswith(("/evidence", "/artifacts", "/geoip")) or "/artifacts/" in path:
+        return ("read:evidence", "read:analyses")
+    if "/osint" in path or path.startswith("/api/v1/iocs"):
+        return ("read:osint", "read:analyses") if method == "GET" else ("write:osint",)
+    if path.startswith("/api/v1/cases"):
+        return ("read:cases",) if method == "GET" else ("write:cases",)
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        return ("write:analyses",)
+    if path.startswith("/api/v1/analyses"):
+        return ("read:status", "read:analyses")
+    return ("read:analyses", "read:status")
+
+
 class BoundaryMiddleware:
     """Authenticate before reading bodies; bound JSON even without Content-Length."""
 
@@ -201,8 +266,25 @@ class BoundaryMiddleware:
                 return await problem(503, "api_credentials_not_configured", rid)(scope, receive, send)
             try:
                 scheme, supplied = headers.get(b"authorization", b"").decode("ascii").split(" ", 1)
-                authorized = scheme.lower() == "bearer" and hmac.compare_digest(supplied, token)
             except (ValueError, UnicodeError):
+                scheme, supplied = "", ""
+            if scheme.lower() != "bearer" or not supplied:
+                return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
+            if hmac.compare_digest(supplied, token):
+                authorized = True
+            elif supplied.startswith("phk_"):
+                app_obj = scope.get("app")
+                store_obj = getattr(getattr(app_obj, "state", None), "store", None)
+                if store_obj is None:
+                    return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
+                req_scope = _required_scope_for_request(scope.get("method", "GET"), scope["path"])
+                try:
+                    store_obj.verify_scoped_api_key(supplied, required_scope=req_scope, endpoint=scope["path"])
+                    authorized = True
+                except StoreError as exc:
+                    hdrs = {"WWW-Authenticate": "Bearer"} if exc.status == 401 else ({"Retry-After": "60"} if exc.status == 429 else None)
+                    return await problem(exc.status, exc.code, rid, hdrs)(scope, receive, send)
+            else:
                 authorized = False
             if not authorized:
                 return await problem(401, "unauthorized", rid, {"WWW-Authenticate": "Bearer"})(scope, receive, send)
@@ -239,6 +321,15 @@ class BoundaryMiddleware:
                     (b"x-request-id", rid.encode()),
                     (b"cache-control", b"no-store"),
                     (b"x-content-type-options", b"nosniff"),
+                    (b"x-frame-options", b"DENY"),
+                    (b"referrer-policy", b"no-referrer"),
+                    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+                    (
+                        b"content-security-policy",
+                        b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                        b"img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; "
+                        b"object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+                    ),
                 ]
             await send(message)
 
@@ -263,10 +354,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.openapi_version = "3.1.0"
     app.state.settings, app.state.store = initial_cfg, initial_store
     app.state.local_file_grants = {}
+    app.state.osint_service = OSINTService()
     app.state.local_file_grants_lock = threading.Lock()
     app.state.batch_admission = threading.BoundedSemaphore(initial_cfg.batch_admission_concurrency)
     app.state.batch_admission_active = 0
     app.state.batch_admission_state_lock = threading.Lock()
+    app.state.chat_semaphore = asyncio.Semaphore(2)
     app.add_middleware(BoundaryMiddleware, settings=initial_cfg)
 
     def _cfg() -> AppSettings:
@@ -307,10 +400,19 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         cfg_now = _cfg()
         ws_path = resolve_workspace_config_path()
         picker_backend = detect_picker_backend() if is_native_picker_enabled() else None
+        ckpt_path = getattr(cfg_now.triage, "etbert_checkpoint_path", None)
+        ckpt_info = inspect_etbert_checkpoint(ckpt_path)
         return {
             "data_dir": str(Path(cfg_now.data_dir).expanduser().resolve()),
             "local_ingest_roots": [str(r) for r in _allowed_roots(cfg_now)],
             "resource_mode": str(getattr(cfg_now, "resource_mode", "auto")),
+            "etbert_checkpoint_path": ckpt_path,
+            "etbert_checkpoint_configured": bool(ckpt_path),
+            "etbert_enabled": is_etbert_effectively_enabled(
+                cfg_now.triage, ckpt_ready=bool(ckpt_info.get("ready"))
+            ),
+            "etbert_checkpoint_info": ckpt_info,
+            "etbert_checkpoint_status": ckpt_info,
             "native_picker_available": bool(picker_backend is not None),
             "picker_backend": picker_backend,
             "persisted": bool(ws_path is not None),
@@ -339,6 +441,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         new_data_dir: str | None = None,
         new_roots: list[str] | None = None,
         new_resource_mode: str | None = None,
+        new_etbert_checkpoint_path: str | None = None,
+        new_etbert_enabled: bool | None = None,
+        clear_etbert_checkpoint: bool = False,
     ) -> dict[str, object]:
         cfg_now = _cfg()
         store_now = _store()
@@ -377,17 +482,53 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if new_resource_mode is not None:
             update_fields["resource_mode"] = new_resource_mode
 
+        triage_updates: dict[str, object] = {}
+        clearing_etbert = False
+        if clear_etbert_checkpoint:
+            clearing_etbert = True
+            triage_updates["etbert_checkpoint_path"] = None
+            if new_etbert_enabled is None:
+                triage_updates["etbert_enabled"] = False
+        elif new_etbert_checkpoint_path is not None:
+            cleaned_ckpt = new_etbert_checkpoint_path.strip()
+            if cleaned_ckpt:
+                if "\x00" in cleaned_ckpt:
+                    raise HTTPException(400, "invalid_etbert_checkpoint_path")
+                resolved_ckpt = Path(cleaned_ckpt).expanduser().resolve()
+                if not resolved_ckpt.is_file() or resolved_ckpt.suffix.lower() not in ALLOWED_MODEL_EXTENSIONS:
+                    raise HTTPException(400, "invalid_etbert_checkpoint_path")
+                triage_updates["etbert_checkpoint_path"] = str(resolved_ckpt)
+                if new_etbert_enabled is None:
+                    triage_updates["etbert_enabled"] = True
+            else:
+                clearing_etbert = True
+                triage_updates["etbert_checkpoint_path"] = None
+                if new_etbert_enabled is None:
+                    triage_updates["etbert_enabled"] = False
+        if new_etbert_enabled is not None:
+            triage_updates["etbert_enabled"] = bool(new_etbert_enabled)
+        if triage_updates:
+            update_fields["triage"] = cfg_now.triage.model_copy(update=triage_updates)
+
         if update_fields:
             updated_cfg = cfg_now.model_copy(update=update_fields)
             app.state.settings = updated_cfg
             app.state.store = next_store
             ws_path = resolve_workspace_config_path()
             if ws_path is not None:
+                explicit_etbert = (
+                    bool(updated_cfg.triage.etbert_enabled)
+                    if "etbert_enabled" in updated_cfg.triage.model_fields_set
+                    else None
+                )
+                persisted_ckpt = "" if clearing_etbert else updated_cfg.triage.etbert_checkpoint_path
                 update_workspace_config(
                     path=ws_path,
                     data_dir=str(updated_cfg.data_dir),
                     local_ingest_roots=list(updated_cfg.local_ingest_roots),
                     resource_mode=str(updated_cfg.resource_mode),
+                    etbert_checkpoint_path=persisted_ckpt,
+                    etbert_enabled=explicit_etbert,
                     prefer_workspace=True,
                 )
 
@@ -419,6 +560,23 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def capabilities():
         return build_capabilities_payload(_cfg())
 
+    @app.get("/api/v1/system/etbert", tags=["System"])
+    def etbert_status():
+        cfg_now = _cfg()
+        status = inspect_etbert_checkpoint(cfg_now.triage.etbert_checkpoint_path)
+        return {
+            **status,
+            "etbert_enabled": is_etbert_effectively_enabled(
+                cfg_now.triage, ckpt_ready=bool(status.get("ready"))
+            ),
+            "mode": str(cfg_now.triage.mode),
+        }
+
+    @app.get("/api/v1/yara/rules", tags=["System"])
+    def yara_rules_inventory():
+        cfg_now = _cfg()
+        return inspect_yara_rules(cfg_now.yara_rules_dir or default_rules_dir())
+
     @app.get("/api/v1/system/workspace", tags=["System"])
     def get_workspace():
         return _workspace_state()
@@ -448,6 +606,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             new_data_dir=body.data_dir,
             new_roots=next_roots,
             new_resource_mode=body.resource_mode,
+            new_etbert_checkpoint_path=body.etbert_checkpoint_path,
+            new_etbert_enabled=body.etbert_enabled,
+            clear_etbert_checkpoint=body.clear_etbert_checkpoint,
         )
 
     @app.post("/api/v1/system/pick-path", tags=["System"])
@@ -496,6 +657,24 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "cancelled": False,
                 "purpose": "capture_root",
                 "selected_path": str(picked),
+                "workspace": ws_state,
+            }
+
+        if body.purpose == "model_file":
+            if not picked.is_file() or picked.suffix.lower() not in ALLOWED_MODEL_EXTENSIONS:
+                raise HTTPException(415, "unsupported_model_extension")
+            resolved_model = str(picked.resolve(strict=True))
+            ws_state = _apply_workspace_mutation(
+                new_etbert_checkpoint_path=resolved_model,
+                new_etbert_enabled=True,
+            )
+            ckpt_info = inspect_etbert_checkpoint(resolved_model)
+            return {
+                "cancelled": False,
+                "purpose": "model_file",
+                "selected_path": resolved_model,
+                "etbert_checkpoint": ckpt_info,
+                "etbert_status": ckpt_info,
                 "workspace": ws_state,
             }
 
@@ -874,6 +1053,69 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "validation": "zero_copy_local_reference",
         }
 
+    @app.get("/api/v1/cases", tags=["Cases"], response_model=CaseListResponse)
+    def list_cases(
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+        search: Annotated[str, Query(max_length=120)] = "",
+    ):
+        return _store().cases(limit=limit, offset=offset, search=search)
+
+    @app.post("/api/v1/cases", status_code=201, tags=["Cases"], response_model=CaseDetail)
+    def create_case(body: CaseCreateRequest):
+        return _store().create_case(body.model_dump())
+
+    @app.get("/api/v1/cases/{case_id}", tags=["Cases"], response_model=CaseDetail)
+    def get_case(case_id: str):
+        return _store().case(case_id)
+
+    @app.patch("/api/v1/cases/{case_id}", tags=["Cases"], response_model=CaseDetail)
+    def patch_case(case_id: str, body: CasePatchRequest):
+        return _store().update_case(case_id, body.model_dump(exclude_unset=True))
+
+    @app.delete("/api/v1/cases/{case_id}", status_code=204, tags=["Cases"])
+    def delete_case(case_id: str):
+        _store().delete_case(case_id)
+        return Response(status_code=204)
+
+    @app.post("/api/v1/cases/{case_id}/analyses", tags=["Cases"], response_model=CaseDetail)
+    def link_case_analysis(case_id: str, body: CaseAnalysisLinkRequest):
+        return _store().link_case_analysis(case_id, body.analysis_id)
+
+    @app.delete("/api/v1/cases/{case_id}/analyses/{analysis_id}", status_code=204, tags=["Cases"])
+    def unlink_case_analysis(case_id: str, analysis_id: str):
+        _store().unlink_case_analysis(case_id, analysis_id)
+        return Response(status_code=204)
+
+    @app.post("/api/v1/cases/{case_id}/notes", tags=["Cases"], response_model=CaseDetail)
+    def create_case_note(case_id: str, body: CaseNoteCreateRequest):
+        return _store().create_case_note(case_id, body.note)
+
+    @app.delete("/api/v1/cases/{case_id}/notes/{note_id}", status_code=204, tags=["Cases"])
+    def delete_case_note(case_id: str, note_id: str):
+        _store().delete_case_note(case_id, note_id)
+        return Response(status_code=204)
+
+    @app.get("/api/v1/cases/{case_id}/iocs", tags=["Cases"])
+    def list_case_iocs(case_id: str):
+        return {"items": _store().list_case_iocs(case_id)}
+
+    @app.post("/api/v1/cases/{case_id}/iocs", status_code=201, tags=["Cases"])
+    def create_case_ioc(case_id: str, body: CaseIOCCreateRequest):
+        return _store().add_case_ioc(case_id, body.model_dump())
+
+    @app.delete("/api/v1/cases/{case_id}/iocs/{ioc_id}", status_code=204, tags=["Cases"])
+    def delete_case_ioc(case_id: str, ioc_id: str):
+        _store().delete_case_ioc(case_id, ioc_id)
+        return Response(status_code=204)
+
+    @app.get("/api/v1/iocs/search", tags=["OSINT"])
+    def search_iocs(
+        query: Annotated[str, Query(max_length=256)] = "",
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ):
+        return _store().search_local_iocs(query=query, limit=limit)
+
     @app.post("/api/v1/analyses", status_code=202, tags=["Analyses"])
     def analyze(body: AnalysisRequest, idempotency_key: Annotated[str | None, Header(max_length=128)] = None):
         cfg_now = _cfg()
@@ -883,13 +1125,41 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise HTTPException(409, "ai_model_not_configured")
         return _store().create_job(body, profile_hash(cfg_now), idempotency_key)
 
+    def _require_loopback_workspace_mutation(request: Request, error_code: str) -> None:
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, error_code)
+
     @app.get("/api/v1/analyses", tags=["Analyses"])
-    def list_jobs(limit: Annotated[int, Query(ge=1, le=100)] = 50):
-        return {"items": _store().jobs(limit)}
+    def list_jobs(
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        store_now = _store()
+        return {
+            "items": store_now.jobs(limit=limit, offset=offset),
+            "total": store_now.jobs_count(),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.post("/api/v1/analyses/prune", tags=["Analyses"])
+    def prune_jobs_endpoint(
+        keep_latest: Annotated[int, Query(ge=0, le=500)] = 20,
+        max_age_hours: Annotated[int | None, Query(ge=1, le=8760)] = None,
+        body: JobsPruneRequest | None = Body(default=None),
+    ):
+        eff_keep = body.keep_latest if body is not None else keep_latest
+        eff_age = body.max_age_hours if body is not None else max_age_hours
+        return _store().prune_jobs(keep_latest=eff_keep, max_age_hours=eff_age)
 
     @app.get("/api/v1/analyses/{analysis_id}", tags=["Analyses"])
     def job(analysis_id: str):
         return _store().job(analysis_id)
+
+    @app.delete("/api/v1/analyses/{analysis_id}", tags=["Analyses"])
+    def delete_job_endpoint(analysis_id: str):
+        return _store().delete_job(analysis_id)
 
     @app.post("/api/v1/analyses/{analysis_id}/cancel", tags=["Analyses"])
     def cancel(analysis_id: str):
@@ -915,6 +1185,54 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="triage-{analysis_id[:8]}.jsonl"'},
         )
 
+    @app.post("/api/v1/analyses/{analysis_id}/snapshot", status_code=201, tags=["Reports"])
+    def create_analysis_snapshot(analysis_id: str):
+        return _store().create_snapshot(analysis_id)
+
+    @app.get("/api/v1/analyses/{analysis_id}/snapshot", tags=["Reports"])
+    def get_analysis_snapshot(analysis_id: str, snapshot_id: Annotated[str | None, Query(max_length=64)] = None):
+        snap = _store().get_or_create_snapshot(analysis_id, snapshot_id=snapshot_id)
+        return {k: v for k, v in snap.items() if not k.startswith("_")}
+
+    @app.get("/api/v1/analyses/{analysis_id}/artifacts", tags=["Evidence"])
+    def list_analysis_artifacts(analysis_id: str):
+        items = _store().list_artifacts(analysis_id)
+        return {"analysis_id": analysis_id, "items": items, "total": len(items)}
+
+    @app.get("/api/v1/analyses/{analysis_id}/artifacts/{artifact_id}", tags=["Evidence"])
+    def get_analysis_artifact(
+        analysis_id: str,
+        artifact_id: str,
+        download: Annotated[bool, Query()] = False,
+    ):
+        item = _store().get_artifact(analysis_id, artifact_id)
+        if download:
+            safe_meta = json.dumps(
+                {
+                    "artifact": item,
+                    "safety_notice": "Raw carved binary bytes are not served directly; verify SHA-256 and YARA rule metadata offline.",
+                },
+                indent=2,
+            )
+            return Response(
+                content=safe_meta.encode("utf-8"),
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{artifact_id}-metadata.json"',
+                },
+            )
+        return item
+
+    @app.get("/api/v1/analyses/{analysis_id}/geoip", tags=["Evidence"])
+    def get_analysis_geoip(analysis_id: str):
+        row = _store().job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        if bundle.geoip:
+            return bundle.geoip
+        return build_world_map_flows(bundle.evidence)
+
     @app.get("/api/v1/analyses/{analysis_id}/report", tags=["Reports"])
     def report(analysis_id: str):
         store_now = _store()
@@ -934,19 +1252,631 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "capture_format": meta.get("capture_format"),
             "evidence": bundle.model_dump(mode="json"),
             "ai": json.loads(row["ai_result"]) if row["ai_result"] else {"state": "pending"},
+            "osint": json.loads(row["osint_result"]) if row.get("osint_result") else {"state": "not_requested", "results": []},
             "disclaimer": "Detector findings are candidates. AI is advisory; missing findings do not certify safety.",
         }
 
-    @app.get("/api/v1/ai/config", tags=["AI"])
-    def ai_config():
-        # AIConfig stores only secret ENV references, never values.
+    @app.get("/api/v1/osint/capabilities", tags=["OSINT"])
+    def osint_capabilities():
+        return app.state.osint_service.capabilities(enabled=bool(_cfg().osint_enabled))
+
+    @app.get("/api/v1/osint/cache", tags=["OSINT"])
+    def list_osint_cache_entries(limit: Annotated[int, Query(ge=1, le=200)] = 100):
+        items = _store().list_osint_cache(limit=limit)
+        return {"items": items, "total": len(items)}
+
+    @app.post("/api/v1/osint/cache/clear", tags=["OSINT"])
+    def clear_osint_cache_entries(
+        request: Request,
+        provider: Annotated[str | None, Query(max_length=32)] = None,
+    ):
+        _require_loopback_workspace_mutation(request, "osint_cache_mutation_loopback_only")
+        deleted = _store().clear_osint_cache(provider=provider)
+        return {"deleted": deleted, "deleted_count": deleted, "provider": provider}
+
+    @app.delete("/api/v1/osint/cache", tags=["OSINT"])
+    def delete_all_osint_cache_entries(
+        request: Request,
+        provider: Annotated[str | None, Query(max_length=32)] = None,
+    ):
+        _require_loopback_workspace_mutation(request, "osint_cache_mutation_loopback_only")
+        deleted = _store().clear_osint_cache(provider=provider)
+        return {"deleted": deleted, "deleted_count": deleted, "provider": provider}
+
+    @app.delete("/api/v1/osint/cache/{cache_id}", status_code=204, tags=["OSINT"])
+    def delete_osint_cache_entry(cache_id: str, request: Request):
+        _require_loopback_workspace_mutation(request, "osint_cache_mutation_loopback_only")
+        _store().delete_osint_cache_entry(cache_id)
+        return Response(status_code=204)
+
+    @app.post("/api/v1/osint/keys/rotate", tags=["OSINT"])
+    def rotate_osint_key(body: OSINTKeyRotateRequest, request: Request):
+        _require_loopback_workspace_mutation(request, "osint_key_rotation_loopback_only")
+        try:
+            result = app.state.osint_service.rotate_key(body.provider, body.api_key)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        cleared = _store().clear_osint_cache(provider=body.provider) if body.invalidate_cache else 0
+        return {
+            **result,
+            "cache_invalidated": bool(body.invalidate_cache),
+            "deleted_cache_entries": cleared,
+        }
+
+    @app.get("/api/v1/analyses/{analysis_id}/osint/candidates", tags=["OSINT"])
+    def osint_candidates(analysis_id: str):
+        store_now = _store()
+        row = store_now.job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        pending_operation = store_now.unresolved_osint_operation(analysis_id)
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        if not bundle.evidence:
+            return {
+                "analysis_id": analysis_id,
+                "candidates": [],
+                "candidate_count": 0,
+                "truncated": False,
+                "max_iocs_per_operation": MAX_IOCS_PER_OPERATION,
+                "lookup_is_external": True,
+                "consent_required_for_lookup": True,
+                "pending_operation": pending_operation,
+            }
+        candidates, truncated = extract_ioc_candidates(
+            bundle, [item.evidence_id for item in bundle.evidence]
+        )
+        return {
+            "analysis_id": analysis_id,
+            "candidates": [candidate.public_dict() for candidate in candidates],
+            "candidate_count": len(candidates),
+            "truncated": truncated,
+            "max_iocs_per_operation": MAX_IOCS_PER_OPERATION,
+            "lookup_is_external": True,
+            "consent_required_for_lookup": True,
+            "pending_operation": pending_operation,
+        }
+
+    @app.post("/api/v1/analyses/{analysis_id}/osint", tags=["OSINT"])
+    async def osint_lookup(analysis_id: str, body: OSINTLookupRequest):
+        store_now = _store()
+        row = store_now.job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        if not body.consent:
+            store_now.record_osint_audit(
+                analysis_id,
+                requested_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                providers=list(body.providers),
+                indicator_count=0,
+                outcome="consent_denied",
+                consent=False,
+            )
+            raise HTTPException(428, "osint_consent_required")
+        fingerprint_payload = json.dumps(
+            {"candidate_ids": sorted(body.candidate_ids), "providers": sorted(body.providers)},
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        request_fingerprint = hmac.new(
+            _cfg().api_token.get_secret_value().encode("utf-8"),
+            b"PCAPSCANNER-OSINT-OP-v1\0" + analysis_id.encode("ascii") + b"\0" + fingerprint_payload,
+            hashlib.sha256,
+        ).hexdigest()
+        attempted = store_now.osint_audit_operation(analysis_id, body.operation_id)
+        if attempted is not None:
+            if not hmac.compare_digest(attempted.get("request_fingerprint") or "", request_fingerprint):
+                raise HTTPException(409, "osint_operation_id_conflict")
+            previous = json.loads(row["osint_result"]) if row.get("osint_result") else None
+            if isinstance(previous, dict) and previous.get("operation_id") == body.operation_id:
+                return previous
+            raise HTTPException(409, "osint_operation_already_attempted")
+        previous = json.loads(row["osint_result"]) if row.get("osint_result") else None
+        if isinstance(previous, dict) and previous.get("operation_id") == body.operation_id:
+            raise HTTPException(409, "osint_operation_state_inconsistent")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        all_candidates, _ = extract_ioc_candidates(
+            bundle, [item.evidence_id for item in bundle.evidence]
+        )
+        by_id = {candidate.candidate_id: candidate for candidate in all_candidates}
+        if any(candidate_id not in by_id for candidate_id in body.candidate_ids):
+            raise HTTPException(422, "unknown_osint_candidate")
+        selected = [by_id[candidate_id] for candidate_id in body.candidate_ids]
+        try:
+            with store_now.osint_operation_lock(analysis_id):
+                # Re-read after acquiring the process-shared lock to prevent duplicate API-credit use.
+                current = store_now.job(analysis_id, internal=True)
+                attempted = store_now.osint_audit_operation(analysis_id, body.operation_id)
+                if attempted is not None:
+                    if not hmac.compare_digest(attempted.get("request_fingerprint") or "", request_fingerprint):
+                        raise HTTPException(409, "osint_operation_id_conflict")
+                    prior = json.loads(current["osint_result"]) if current.get("osint_result") else None
+                    if isinstance(prior, dict) and prior.get("operation_id") == body.operation_id:
+                        return prior
+                    raise HTTPException(409, "osint_operation_already_attempted")
+                unresolved = store_now.unresolved_osint_operation(analysis_id)
+                if unresolved is not None:
+                    if not body.accept_uncertain_retry_risk:
+                        raise HTTPException(409, "osint_previous_operation_unresolved")
+                    store_now.resolve_uncertain_osint_operation(analysis_id, unresolved["operation_id"])
+                requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                # Persist consent and operation metadata before any external request.
+                # If the process dies after a provider call but before saving its result,
+                # a retry with this ID must not silently spend credits twice.
+                store_now.record_osint_audit(
+                    analysis_id,
+                    requested_at=requested_at,
+                    providers=list(body.providers),
+                    indicator_count=len(selected),
+                    outcome="started",
+                    consent=True,
+                    operation_id=body.operation_id,
+                    request_fingerprint=request_fingerprint,
+                )
+                result = await app.state.osint_service.enrich(
+                    selected,
+                    body.providers,
+                    consent=True,
+                    enabled=bool(_cfg().osint_enabled),
+                )
+                result["operation_id"] = body.operation_id
+                for item in result.get("results", []):
+                    if isinstance(item, dict) and item.get("state") in {"completed", "partial", "not_found"}:
+                        cand_obj = by_id.get(str(item.get("candidate_id")))
+                        if cand_obj is not None:
+                            store_now.put_osint_cache(
+                                str(item.get("provider")),
+                                cand_obj.indicator_type,
+                                cand_obj.indicator,
+                                str(item.get("state")),
+                                dict(item.get("summary") or {}),
+                            )
+                store_now.save_osint_result(
+                    analysis_id,
+                    json.dumps(result, separators=(",", ":"), ensure_ascii=True),
+                )
+                uncertain_states = {
+                    "provider_timeout", "operation_timeout", "provider_error",
+                    "invalid_provider_response", "response_too_large", "redirect_blocked",
+                }
+                has_uncertain_provider_attempt = any(
+                    item.get("state") in uncertain_states
+                    for item in result.get("results", [])
+                    if isinstance(item, dict)
+                )
+                store_now.finish_osint_audit(
+                    analysis_id,
+                    body.operation_id,
+                    "uncertain" if has_uncertain_provider_attempt else str(result.get("state", "unknown")),
+                )
+                return result
+        except ValueError as exc:
+            code = str(exc)
+            if code not in {
+                "ioc_count_limit_exceeded", "provider_selection_invalid", "unsupported_provider",
+                "lookup_count_limit_exceeded", "invalid_ioc_candidate", "duplicate_ioc_candidate",
+            }:
+                code = "invalid_osint_request"
+            raise HTTPException(422, code) from exc
+
+    @app.post("/api/v1/analyses/{analysis_id}/summary", tags=["AI"])
+    async def generate_analysis_summary(
+        analysis_id: str,
+        body: AISummaryRequest | None = Body(default=None),
+    ):
+        if not re.fullmatch(r"[a-f0-9]{32}", analysis_id):
+            raise HTTPException(404, "analysis_not_found")
+        row = _store().job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
         cfg_now = _cfg()
+        if not cfg_now.ai.enabled:
+            raise HTTPException(409, "ai_disabled_by_operator")
+        if not cfg_now.ai.model and str(cfg_now.ai.provider) != "manus":
+            raise HTTPException(409, "ai_model_not_configured")
+        ai_overrides: dict[str, Any] = {}
+        if body is not None:
+            if body.timeout_seconds is not None:
+                ai_overrides["timeout_seconds"] = body.timeout_seconds
+            if body.max_output_tokens is not None:
+                ai_overrides["max_output_tokens"] = body.max_output_tokens
+        cfg_effective = (
+            cfg_now.model_copy(update={"ai": cfg_now.ai.model_copy(update=ai_overrides)})
+            if ai_overrides
+            else cfg_now
+        )
+        result = await generate_summary(bundle, cfg_effective)
+        _store().save_ai_result(analysis_id, result.model_dump_json())
+        return result.model_dump(mode="json")
+
+    @app.post("/api/v1/analyses/{analysis_id}/chat", tags=["AI"])
+    async def grounded_chat(analysis_id: str, body: GroundedChatRequest):
+        row = _store().job(analysis_id, internal=True)
+        if not row["evidence"]:
+            raise HTTPException(409, "evidence_not_ready")
+        bundle = EvidenceBundle.model_validate_json(row["evidence"])
+        if not body.consent:
+            result = await answer_question(bundle, body.question, consent=False)
+        else:
+            cfg_now = _cfg()
+            if not cfg_now.ai.enabled:
+                raise HTTPException(409, "ai_disabled_by_operator")
+            if not cfg_now.ai.model:
+                raise HTTPException(409, "ai_model_not_configured")
+            if cfg_now.ai.context_window_tokens <= 513:
+                raise HTTPException(409, "ai_context_window_too_small")
+
+            ai_overrides: dict[str, Any] = {}
+            if body.timeout_seconds is not None:
+                ai_overrides["timeout_seconds"] = body.timeout_seconds
+            if body.max_output_tokens is not None:
+                ai_overrides["max_output_tokens"] = body.max_output_tokens
+            cfg_effective = (
+                cfg_now.model_copy(update={"ai": cfg_now.ai.model_copy(update=ai_overrides)})
+                if ai_overrides
+                else cfg_now
+            )
+
+            async def provider_call(prompt: str) -> str:
+                return await generate_chat_completion(prompt, cfg_effective)
+
+            max_output_tokens = min(
+                4_096,
+                cfg_effective.ai.max_output_tokens,
+                cfg_effective.ai.context_window_tokens - 513,
+            )
+            token_input_space = max(512, cfg_effective.ai.context_window_tokens - max_output_tokens - 512)
+            token_bytes_budget = token_input_space * 3
+            effective_context_bytes = min(cfg_effective.ai.input_max_bytes, token_bytes_budget)
+            effective_prompt_bytes = min(cfg_effective.ai.input_max_bytes, effective_context_bytes + 8_000)
+
+            target_bundle = bundle
+            if len(bundle.evidence) > 25 or len(bundle.findings) > 25:
+                try:
+                    from .triage import pack_evidence_for_ai
+                    target_bundle, _ = pack_evidence_for_ai(
+                        bundle,
+                        max_bytes=effective_context_bytes,
+                        triage_cfg=cfg_effective.triage,
+                    )
+                except Exception:
+                    target_bundle = bundle
+
+            limits = ChatLimits(
+                max_question_bytes=min(2_000, cfg_effective.ai.input_max_bytes),
+                max_context_bytes=effective_context_bytes,
+                max_prompt_bytes=effective_prompt_bytes,
+                max_output_bytes=min(32_000, max_output_tokens * 4),
+                context_window_tokens=cfg_effective.ai.context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                timeout_seconds=float(cfg_effective.ai.timeout_seconds),
+                max_claims=20,
+            )
+            async with app.state.chat_semaphore:
+                result = await answer_question(
+                    target_bundle,
+                    body.question,
+                    consent=True,
+                    provider=provider_call,
+                    limits=limits,
+                )
+                if result.state == "budget_exceeded" and (len(bundle.evidence) > 1 or len(bundle.findings) > 1):
+                    try:
+                        from .triage import pack_evidence_for_ai
+                        tighter_budget = max(3_000, int(effective_context_bytes * 0.6))
+                        tighter_bundle, _ = pack_evidence_for_ai(
+                            bundle,
+                            max_bytes=tighter_budget,
+                            triage_cfg=cfg_now.triage,
+                        )
+                        result = await answer_question(
+                            tighter_bundle,
+                            body.question,
+                            consent=True,
+                            provider=provider_call,
+                            limits=limits,
+                        )
+                    except Exception:
+                        pass
+        return {
+            "state": result.state,
+            "claims": [claim.model_dump(mode="json") for claim in result.claims],
+            "prompt_sha256": result.prompt_sha256,
+            "error_code": result.error_code,
+            "usage": result.usage,
+            "transcript_persisted": False,
+        }
+
+    def _resolve_snapshot_and_bundle(
+        analysis_id: str, snapshot_id: str | None = None
+    ) -> tuple[dict, EvidenceBundle]:
+        if not re.fullmatch(r"[a-f0-9]{32}", analysis_id):
+            raise HTTPException(404, "analysis_not_found")
+        snap = _store().get_or_create_snapshot(analysis_id, snapshot_id=snapshot_id)
+        bundle = EvidenceBundle.model_validate_json(snap["_bundle_json"])
+        manifest = {k: v for k, v in snap.items() if not k.startswith("_")}
+        return manifest, bundle
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.stix.json", tags=["Reports"])
+    def export_stix(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        payload = export_stix_bundle(bundle, redact=redact)
+        payload["x_pcapscanner_snapshot_id"] = manifest["snapshot_id"]
+        return JSONResponse(
+            content=payload,
+            media_type="application/stix+json",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-stix-{analysis_id[:8]}.json"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.csv", tags=["Reports"])
+    def export_csv(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        csv_text = export_findings_and_evidence_csv(bundle, snapshot_id=manifest["snapshot_id"], redact=redact)
+        return Response(
+            content=csv_text.encode("utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-findings-{analysis_id[:8]}.csv"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.cef", tags=["Reports"])
+    def export_cef(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        cef_text = export_findings_cef(bundle, snapshot_id=manifest["snapshot_id"], redact=redact)
+        return PlainTextResponse(
+            content=cef_text,
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-siem-{analysis_id[:8]}.cef"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.navigator.json", tags=["Reports"])
+    def export_navigator(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        layer = export_attack_navigator_layer(
+            bundle,
+            snapshot_id=manifest["snapshot_id"],
+            analysis_id=analysis_id,
+            redact=redact,
+        )
+        return JSONResponse(
+            content=layer,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-attack-navigator-{analysis_id[:8]}.json"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.get("/api/v1/analyses/{analysis_id}/export.pdf", tags=["Reports"])
+    def export_pdf(
+        analysis_id: str,
+        snapshot_id: Annotated[str | None, Query(max_length=64)] = None,
+        redact: Annotated[bool, Query()] = False,
+    ):
+        manifest, bundle = _resolve_snapshot_and_bundle(analysis_id, snapshot_id=snapshot_id)
+        store_now = _store()
+        job_meta = store_now.job(analysis_id)
+        internal_row = store_now.job(analysis_id, internal=True)
+        ai_result = json.loads(internal_row["ai_result"]) if internal_row.get("ai_result") else None
+        pdf_bytes = export_snapshot_pdf(
+            bundle,
+            snapshot=manifest,
+            job=job_meta,
+            ai_result=ai_result,
+            redact=redact,
+        )
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="pcap-forensic-report-{analysis_id[:8]}.pdf"',
+                "X-Snapshot-Id": str(manifest["snapshot_id"]),
+            },
+        )
+
+    @app.post("/api/v1/auth/keys", status_code=201, tags=["Auth"])
+    def create_scoped_key(body: ScopedKeyCreateRequest):
+        return _store().create_scoped_api_key(
+            label=body.name,
+            scopes=list(body.scopes),
+            expires_in_days=body.expires_in_days,
+            rate_limit_per_minute=body.rate_limit_rpm,
+            quota_limit=body.quota_limit,
+        )
+
+    @app.get("/api/v1/auth/keys", tags=["Auth"])
+    def list_scoped_keys():
+        items = _store().list_scoped_api_keys()
+        return {"items": items, "total": len(items)}
+
+    @app.delete("/api/v1/auth/keys/{key_id}", tags=["Auth"])
+    def revoke_scoped_key(key_id: str):
+        return _store().revoke_scoped_api_key(key_id)
+
+    @app.get("/api/v1/auth/keys/audit", tags=["Auth"])
+    def list_scoped_key_audit(limit: Annotated[int, Query(ge=1, le=500)] = 100):
+        items = _store().list_api_key_audit(limit=limit)
+        return {"items": items, "total": len(items)}
+
+    def _ai_config_payload(cfg_now: AppSettings) -> dict[str, object]:
+        api_key_env = cfg_now.ai.api_key_env
+        rt_status = runtime_api_key_status()
+        cur_provider = cfg_now.ai.provider.value if hasattr(cfg_now.ai.provider, "value") else str(cfg_now.ai.provider)
+        cur_slot = credential_slot_for(cfg_now.ai)
+        cur_rt = rt_status.get(cur_slot, {"configured": False, "key_fingerprint": None})
+        manus_env_set = bool(os.environ.get("MANUS_API_KEY"))
+        manus_ready = bool(rt_status.get("manus", {}).get("configured") or os.environ.get("MANUS_API_KEY"))
         return {
             "configuration": cfg_now.ai.model_dump(mode="json"),
             "triage": cfg_now.triage.model_dump(mode="json"),
             "policy_hash": profile_hash(cfg_now),
-            "editable": "server_config_file_and_environment_only",
+            "editable": "loopback_nonsecret_runtime_and_env",
+            "api_key_env_set": bool(api_key_env and os.environ.get(api_key_env)),
+            "manus_env_set": manus_env_set,
+            "manus_ready": manus_ready,
+            # Catalog card that best describes the active route (explicit preset,
+            # else inferred from provider + base_url origin for legacy configs).
+            "active_preset": cfg_now.ai.preset or infer_preset(cur_provider, cfg_now.ai.base_url),
+            "credential_slot": cur_slot,
+            "runtime_key_set": bool(cur_rt["configured"]),
+            "runtime_key_fingerprint": cur_rt["key_fingerprint"],
+            "runtime_keys": {k: bool(v["configured"]) for k, v in rt_status.items()},
+            "runtime_key_fingerprints": {k: v["key_fingerprint"] for k, v in rt_status.items()},
         }
+
+    def _drop_mismatched_preset(data: dict[str, object], fields_set: set[str]) -> None:
+        """Keep a catalog preset (and therefore its RAM key slot) only while it still describes the route.
+
+        A preset is dropped when the wire protocol changes, or when a vendor preset with a fixed
+        endpoint is re-pointed at another origin, so a vendor's key is never replayed elsewhere.
+        """
+        if "preset" in fields_set or not data.get("preset"):
+            return
+        from .llm import get_preset
+
+        meta = get_preset(str(data.get("preset")))
+        provider_value = data.get("provider")
+        provider_text = getattr(provider_value, "value", provider_value)
+        if meta is None or meta["protocol"] != str(provider_text):
+            data["preset"] = None
+            return
+        base_url = data.get("base_url")
+        if (
+            not meta.get("base_url_editable")
+            and meta.get("base_url")
+            and isinstance(base_url, str)
+            and base_url.strip()
+        ):
+            from .config import _origin
+
+            try:
+                if _origin(base_url.strip().rstrip("/")) != _origin(str(meta["base_url"])):
+                    data["preset"] = None
+            except ValueError:
+                data["preset"] = None
+
+    @app.get("/api/v1/ai/config", tags=["AI"])
+    def ai_config():
+        # AIConfig stores only secret ENV references, never values.
+        return _ai_config_payload(_cfg())
+
+    @app.get("/api/v1/ai/providers", tags=["AI"])
+    def ai_providers():
+        """Non-secret provider catalog used by the Model Settings UI (LiteLLM-style registry)."""
+        rt_status = runtime_api_key_status()
+        items = []
+        for preset in list_presets():
+            slot = rt_status.get(preset["id"], {"configured": False, "key_fingerprint": None})
+            env_name = preset.get("api_key_env")
+            items.append(
+                {
+                    **preset,
+                    "runtime_key_set": bool(slot["configured"]),
+                    "runtime_key_fingerprint": slot["key_fingerprint"],
+                    "env_key_set": bool(env_name and os.environ.get(env_name))
+                    or (preset["id"] == "manus" and bool(os.environ.get("MANUS_API_KEY"))),
+                }
+            )
+        return {"schema_version": "1.0", "items": items}
+
+    @app.put("/api/v1/ai/credentials", tags=["AI"])
+    def set_ai_credentials(body: AICredentialUpdateRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_credentials_loopback_only")
+        try:
+            meta = set_runtime_api_key(body.provider, body.api_key)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return {**meta, **_ai_config_payload(_cfg())}
+
+    @app.delete("/api/v1/ai/credentials", tags=["AI"])
+    def delete_ai_credentials(
+        request: Request,
+        provider: Annotated[str, Query(min_length=1, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]{0,47}$")],
+    ):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_credentials_loopback_only")
+        if provider not in credential_slot_names():
+            raise HTTPException(422, "unsupported_ai_provider")
+        cleared = clear_runtime_api_key(provider)
+        return {"provider": provider, "cleared": cleared, **_ai_config_payload(_cfg())}
+
+    @app.put("/api/v1/ai/config", tags=["AI"])
+    def update_ai_config(body: AIConfigUpdateRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_config_mutation_loopback_only")
+
+        cfg_now = _cfg()
+        next_ai_data = cfg_now.ai.model_dump(mode="python")
+        for field_name in body.model_fields_set:
+            val = getattr(body, field_name)
+            if field_name in {"base_url", "model", "api_key_env", "preset"} and isinstance(val, str):
+                val = val.strip() or None
+            next_ai_data[field_name] = val
+        # Switching wire protocol without naming a new preset drops a stale card.
+        _drop_mismatched_preset(next_ai_data, body.model_fields_set)
+        if (
+            next_ai_data.get("enabled")
+            and str(next_ai_data.get("provider")) == "openai_compatible"
+            and next_ai_data.get("base_url") is None
+            and "base_url" not in body.model_fields_set
+            and "data_boundary" not in body.model_fields_set
+            and "allowed_origins" not in body.model_fields_set
+            and not next_ai_data.get("allowed_origins")
+        ):
+            next_ai_data["data_boundary"] = "local"
+            next_ai_data["allowed_origins"] = ["http://127.0.0.1:11434"]
+        if str(next_ai_data.get("provider")) == "manus":
+            if next_ai_data.get("base_url") is None and not next_ai_data.get("allowed_origins"):
+                next_ai_data["base_url"] = "https://api.manus.ai"
+                next_ai_data["data_boundary"] = "remote"
+                next_ai_data["allowed_origins"] = ["https://api.manus.ai"]
+            if not next_ai_data.get("model"):
+                next_ai_data["model"] = "standard"
+            if "timeout_seconds" not in body.model_fields_set and int(next_ai_data.get("timeout_seconds") or 30) < 90:
+                next_ai_data["timeout_seconds"] = 120
+        try:
+            updated_ai = AIConfig.model_validate(next_ai_data)
+        except ValidationError:
+            raise HTTPException(422, "invalid_ai_configuration") from None
+
+        updated_cfg = cfg_now.model_copy(update={"ai": updated_ai})
+        app.state.settings = updated_cfg
+        ws_path = resolve_workspace_config_path()
+        if ws_path is not None:
+            update_workspace_config(
+                path=ws_path,
+                ai=updated_ai.model_dump(mode="json"),
+                prefer_workspace=True,
+            )
+        return _ai_config_payload(updated_cfg)
 
     @app.get("/api/v1/ai/config/schema", tags=["AI"])
     def ai_schema():
@@ -960,11 +1890,48 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
         cfg_now = _cfg()
         try:
-            items = await list_models(cfg_now)
+            discovery_cfg = cfg_now.model_copy(
+                update={"ai": cfg_now.ai.model_copy(update={"timeout_seconds": min(cfg_now.ai.timeout_seconds, 5)})}
+            )
+            items = await list_models(discovery_cfg)
             return {
                 "state": "disabled" if not cfg_now.ai.enabled else ("completed" if items else "unavailable_or_empty"),
                 "items": items,
                 "warning": None if items else "No catalog returned; this does not prove the provider has no models",
+            }
+        except Exception:
+            raise HTTPException(502, "ai_model_discovery_unavailable")
+
+    @app.post("/api/v1/ai/models/probe", tags=["AI"])
+    async def ai_models_probe(body: AIModelProbeRequest, request: Request):
+        client_host = request.client.host if request.client else None
+        if not is_loopback_client(client_host) and not truthy_env(os.environ.get("PCAP_ALLOW_REMOTE_WORKSPACE")):
+            raise HTTPException(403, "ai_probe_loopback_only")
+
+        cfg_now = _cfg()
+        probe_data = cfg_now.ai.model_dump(mode="python")
+        for field_name in body.model_fields_set:
+            val = getattr(body, field_name)
+            if field_name in {"base_url", "api_key_env", "preset"} and isinstance(val, str):
+                val = val.strip() or None
+            probe_data[field_name] = val
+        _drop_mismatched_preset(probe_data, body.model_fields_set)
+        if str(probe_data.get("provider")) == "manus":
+            if probe_data.get("base_url") is None and not probe_data.get("allowed_origins"):
+                probe_data["base_url"] = "https://api.manus.ai"
+                probe_data["data_boundary"] = "remote"
+                probe_data["allowed_origins"] = ["https://api.manus.ai"]
+        probe_data["enabled"] = False
+        try:
+            probe_cfg = AIConfig.model_validate(probe_data)
+        except ValidationError:
+            raise HTTPException(422, "invalid_ai_configuration") from None
+        try:
+            items, warning = await probe_models(probe_cfg)
+            return {
+                "state": "completed" if items else "unavailable_or_empty",
+                "items": items,
+                "warning": warning,
             }
         except Exception:
             raise HTTPException(502, "ai_model_discovery_unavailable")

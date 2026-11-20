@@ -1,10 +1,16 @@
 import type {
+  AIConfigResponse,
+  AIProviderName,
   AIResult,
   BackendEvidence,
   BackendReport,
+  OSINTLookupResponse,
   EvidenceBundle,
+  SystemCapabilities,
   Tier1Summary,
+  WorkspaceConfigState,
 } from "../api/client.ts";
+import { PrivacyRedactor } from "./privacy.ts";
 export type Severity = "critical" | "high" | "medium" | "low";
 
 export type ReportOrigin = "live" | "local-csv" | "empty";
@@ -28,7 +34,7 @@ export interface WorkspaceFinding {
 export interface WorkspaceStage {
   name: string;
   engine: string;
-  status: "done" | "skipped" | "running" | "queued" | "failed" | "partial";
+  status: "done" | "skipped" | "unavailable" | "awaiting_consent" | "running" | "queued" | "failed" | "partial";
   detail: string;
 }
 
@@ -83,6 +89,7 @@ export interface WorkspaceReport {
   timelineLabels: string[];
   triage?: Tier1Summary | null;
   ai?: AIResult | null;
+  osint?: OSINTLookupResponse | { state: "not_requested"; results: [] };
   warnings: string[];
   disclaimer: string;
   rawBundle?: EvidenceBundle;
@@ -141,6 +148,9 @@ function mapStageState(state: string): WorkspaceStage["status"] {
   if (state === "completed") return "done";
   if (state === "failed") return "failed";
   if (state === "partial") return "partial";
+  if (state === "unavailable") return "unavailable";
+  if (state === "awaiting_consent") return "awaiting_consent";
+  if (state === "skipped") return "skipped";
   return "skipped";
 }
 
@@ -304,13 +314,12 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
   }));
 
   if (bundle.triage?.enabled) {
-    const etbertCount = bundle.triage.etbert_scored_count ?? 0;
-    const etbertNote = etbertCount > 0 ? ` · ET-BERT ${etbertCount} L7` : "";
+    const etInfo = describeEtbertExecution(bundle.triage);
     stages.push({
       name: "TIER-1 CLASSIFIER",
       engine: "triage",
       status: "done",
-      detail: `${bundle.triage.model} · ${bundle.triage.benign_filtered} benign filtered (${Math.round(bundle.triage.reduction_ratio * 100)}% reduction) · ppl ${bundle.triage.mean_ppl.toFixed(2)}${etbertNote}`,
+      detail: `${bundle.triage.model} · ${bundle.triage.benign_filtered} benign filtered (${Math.round(bundle.triage.reduction_ratio * 100)}% reduction) · ppl ${bundle.triage.mean_ppl.toFixed(2)}${etInfo.stageNote}`,
     });
   }
 
@@ -327,10 +336,12 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
             : "partial",
     detail:
       report.ai?.state === "completed"
-        ? `Model ${report.ai.model ?? "configured"} generated evidence-grounded summary`
-        : report.ai?.error_code
-          ? `Fallback (${report.ai.error_code}) — deterministic findings retained`
-          : "Opt-in advisory narrator disabled",
+        ? `Layer-2 LLM (${report.ai.model ?? "configured"}) generated evidence-grounded summary`
+        : report.ai?.state === "pending"
+          ? `Layer-2 LLM (${report.ai.model ?? "configured"}) generating narrative...`
+          : report.ai?.error_code
+            ? `Layer-2 Fallback (${report.ai.error_code}) — Layer-1 & deterministic findings retained`
+            : "Layer-2 LLM disabled for this run (optional; configure provider & grant consent to enable)",
   });
 
   const sha = bundle.capture_sha256;
@@ -365,70 +376,152 @@ export function adaptBackendReport(report: BackendReport): WorkspaceReport {
     timelineLabels,
     triage: bundle.triage ?? null,
     ai: report.ai,
+    osint: report.osint,
     warnings: bundle.coverage.warnings,
     disclaimer: report.disclaimer,
     rawBundle: bundle,
   };
 }
 
-export function exportReportJson(report: WorkspaceReport): string {
+export interface EtbertExecutionStatus {
+  tone: "neural" | "fallback" | "idle";
+  badge: string;
+  stageNote: string;
+  reportLine: string;
+  topClassText: string;
+}
+
+export function describeEtbertExecution(triage: Tier1Summary): EtbertExecutionStatus {
+  const count = triage.etbert_scored_count ?? 0;
+  const backend = (triage.etbert_backend ?? "").trim().toLowerCase();
+  const device = (triage.etbert_device ?? "").trim();
+  const topClasses = triage.etbert_top_classes ?? [];
+  const topClassText = topClasses
+    .slice(0, 3)
+    .map((c) => `${c.label} (${c.count})`)
+    .join(", ");
+
+  if (count <= 0) {
+    return {
+      tone: "idle",
+      badge: "ET-BERT Standby (0 L7)",
+      stageNote: " · ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)",
+      reportLine: "ET-BERT: 0 L7 datagrams (L2/control/WLAN evaluated via Layer-1 heuristics)",
+      topClassText: "",
+    };
+  }
+
+  if (backend === "neural_hf") {
+    const devSuffix = device ? ` (${device})` : "";
+    const topPart = topClassText ? ` · Top: ${topClassText}` : "";
+    return {
+      tone: "neural",
+      badge: `ET-BERT Neural${devSuffix}`,
+      stageNote: ` · ET-BERT Neural${devSuffix}: ${count} L7 scored${topPart}`,
+      reportLine: `ET-BERT Neural${devSuffix}: ${count} L7 scored${topPart}`,
+      topClassText,
+    };
+  }
+
+  if (backend === "local_bin_fallback") {
+    return {
+      tone: "fallback",
+      badge: "Local .bin Heuristic Fallback",
+      stageNote: ` · Local .bin Heuristic Fallback: ${count} L7 scored (ไม่ใช่ Neural Transformer Weights)`,
+      reportLine: `Local .bin Heuristic Fallback: ${count} L7 scored (ไม่ใช่ Neural Transformer Weights)`,
+      topClassText,
+    };
+  }
+
+  if (backend === "feature_fallback") {
+    return {
+      tone: "fallback",
+      badge: "ET-BERT Feature Fallback",
+      stageNote: ` · ET-BERT Feature Fallback: ${count} L7 scored (sidecar ยังไม่ได้โหลด Neural Weights)`,
+      reportLine: `ET-BERT Feature Fallback: ${count} L7 scored (sidecar ยังไม่ได้โหลด Neural Weights)`,
+      topClassText,
+    };
+  }
+
+  const topPart = topClassText ? ` · Top: ${topClassText}` : "";
+  return {
+    tone: "idle",
+    badge: `ET-BERT (${count} L7)`,
+    stageNote: ` · ET-BERT ${count} L7 scored${topPart}`,
+    reportLine: `ET-BERT L7 scored=${count}${topPart}`,
+    topClassText,
+  };
+}
+
+export interface ExportRedactionOptions {
+  redact?: boolean;
+  redactor?: PrivacyRedactor;
+}
+
+function resolveExportReport(report: WorkspaceReport, options?: ExportRedactionOptions): WorkspaceReport {
+  const activeRedactor = options?.redactor ?? (options?.redact ? new PrivacyRedactor(true) : null);
+  if (!activeRedactor || !activeRedactor.isEnabled()) return report;
+  return activeRedactor.redactReport(report);
+}
+
+export function exportReportJson(report: WorkspaceReport, options?: ExportRedactionOptions): string {
+  const src = resolveExportReport(report, options);
   return JSON.stringify(
     {
-      analysis_id: report.analysisId,
-      origin: report.origin,
-      status: report.status,
-      case_id: report.caseId,
-      filename: report.fileName,
-      sha256: report.fullSha,
-      packets_seen: report.packetCapReached ? null : report.packetsSeen,
-      packets_seen_lower_bound: report.packetCapReached ? report.packetsSeen : null,
-      packet_cap_reached: report.packetCapReached,
-      packets_analyzed: report.packetsAnalyzed,
-      triage: report.triage ?? null,
-      findings: report.findings,
-      evidence: report.rawBundle?.evidence ?? report.flows,
-      ai: report.ai ?? null,
-      warnings: report.warnings,
-      disclaimer: report.disclaimer,
+      analysis_id: src.analysisId,
+      origin: src.origin,
+      status: src.status,
+      case_id: src.caseId,
+      filename: src.fileName,
+      sha256: src.fullSha,
+      packets_seen: src.packetCapReached ? null : src.packetsSeen,
+      packets_seen_lower_bound: src.packetCapReached ? src.packetsSeen : null,
+      packet_cap_reached: src.packetCapReached,
+      packets_analyzed: src.packetsAnalyzed,
+      triage: src.triage ?? null,
+      findings: src.findings,
+      evidence: src.rawBundle?.evidence ?? src.flows,
+      ai: src.ai ?? null,
+      osint: src.osint ?? null,
+      warnings: src.warnings,
+      disclaimer: src.disclaimer,
     },
     null,
     2,
   );
 }
 
-export function exportReportMarkdown(report: WorkspaceReport): string {
+export function exportReportMarkdown(report: WorkspaceReport, options?: ExportRedactionOptions): string {
+  const src = resolveExportReport(report, options);
   const lines: string[] = [
-    `# PCAPSCANNER Analysis Report — ${report.caseId}`,
+    `# PCAPSCANNER Analysis Report — ${src.caseId}`,
     ``,
-    `- **Origin**: ${report.origin}`,
-    `- **Status**: ${report.status}`,
-    `- **File**: \`${report.fileName}\` (${report.sizeLabel})`,
-    `- **SHA-256**: \`${report.fullSha}\``,
-    `- **Coverage**: ${packetCoverageSummary(report)}`,
-    `- **Protocol Mix**: ${report.protocolSummary}`,
+    `- **Origin**: ${src.origin}`,
+    `- **Status**: ${src.status}`,
+    `- **File**: \`${src.fileName}\` (${src.sizeLabel})`,
+    `- **SHA-256**: \`${src.fullSha}\``,
+    `- **Coverage**: ${packetCoverageSummary(src)}`,
+    `- **Protocol Mix**: ${src.protocolSummary}`,
     ``,
   ];
 
-  if (report.triage) {
-    const etbertLine =
-      (report.triage.etbert_scored_count ?? 0) > 0
-        ? `- ET-BERT L7 Scored Flows: **${report.triage.etbert_scored_count}**`
-        : null;
+  if (src.triage) {
+    const etInfo = describeEtbertExecution(src.triage);
     lines.push(
-      `## Tier-1 Calibrated Triage (${report.triage.model})`,
-      `- Evaluated: **${report.triage.total_evaluated}** records`,
-      `- High-Confidence Benign Filtered: **${report.triage.benign_filtered}** (${(report.triage.reduction_ratio * 100).toFixed(1)}% noise reduction)`,
-      `- Escalated / Uncertain: **${report.triage.escalated_count}** (${report.triage.uncertain_count} uncertain, mean PPL=${report.triage.mean_ppl.toFixed(2)})`,
-      ...(etbertLine ? [etbertLine] : []),
+      `## Tier-1 Calibrated Triage (${src.triage.model})`,
+      `- Evaluated: **${src.triage.total_evaluated}** records`,
+      `- High-Confidence Benign Filtered: **${src.triage.benign_filtered}** (${(src.triage.reduction_ratio * 100).toFixed(1)}% noise reduction)`,
+      `- Escalated / Uncertain: **${src.triage.escalated_count}** (${src.triage.uncertain_count} uncertain, mean PPL=${src.triage.mean_ppl.toFixed(2)})`,
+      `- ${etInfo.reportLine}`,
       ``,
     );
   }
 
-  lines.push(`## Deterministic Findings (${report.findings.length})`, ``);
-  if (report.findings.length === 0) {
+  lines.push(`## Deterministic Findings (${src.findings.length})`, ``);
+  if (src.findings.length === 0) {
     lines.push(`No deterministic heuristics exceeded thresholds inside the analyzed window.`, ``);
   } else {
-    for (const f of report.findings) {
+    for (const f of src.findings) {
       lines.push(
         `### [${f.severity.toUpperCase()}] ${f.id} — ${f.title}`,
         `- **Confidence**: ${f.confidence}${f.triageClass ? ` · Tier-1: \`${f.triageClass}\` (${((f.triageConfidence ?? 0) * 100).toFixed(1)}%)` : ""}`,
@@ -441,24 +534,24 @@ export function exportReportMarkdown(report: WorkspaceReport): string {
     }
   }
 
-  if (report.ai?.report) {
+  if (src.ai?.report) {
     lines.push(
-      `## AI-Assisted Narrative (Advisory — ${report.ai.model ?? "provider"})`,
+      `## AI-Assisted Narrative (Advisory — ${src.ai.model ?? "provider"})`,
       ``,
     );
-    for (const claim of report.ai.report.summary) {
+    for (const claim of src.ai.report.summary) {
       lines.push(`- ${claim.claim}`, `  - Evidence: ${claim.evidence_ids.map((id) => `\`${id}\``).join(", ")}`);
     }
-    for (const assessment of report.ai.report.assessments) {
+    for (const assessment of src.ai.report.assessments) {
       lines.push(
         `- [${assessment.finding_id}] (${assessment.confidence}) ${assessment.interpretation}`,
         `  - Evidence: ${assessment.evidence_ids.map((id) => `\`${id}\``).join(", ")}`,
       );
     }
-    for (const claim of report.ai.report.limitations) {
+    for (const claim of src.ai.report.limitations) {
       lines.push(`- Limitation: ${claim.claim}`, `  - Evidence: ${claim.evidence_ids.map((id) => `\`${id}\``).join(", ")}`);
     }
-    for (const recommendation of report.ai.report.recommended_actions) {
+    for (const recommendation of src.ai.report.recommended_actions) {
       lines.push(
         `- Recommendation: ${recommendation.action}`,
         `  - Evidence: ${recommendation.evidence_ids.map((id) => `\`${id}\``).join(", ")}`,
@@ -467,16 +560,17 @@ export function exportReportMarkdown(report: WorkspaceReport): string {
     lines.push("");
   }
 
-  lines.push(`## Coverage Gaps & Disclaimer`, ``, `> ${report.disclaimer}`, ``);
-  for (const w of report.warnings) {
+  lines.push(`## Coverage Gaps & Disclaimer`, ``, `> ${src.disclaimer}`, ``);
+  for (const w of src.warnings) {
     lines.push(`- ${w}`);
   }
   return lines.join("\n");
 }
 
-export function exportTriageJsonlFallback(report: WorkspaceReport): string {
-  if (report.rawBundle) {
-    const evList = report.rawBundle.evidence;
+export function exportTriageJsonlFallback(report: WorkspaceReport, options?: ExportRedactionOptions): string {
+  const src = resolveExportReport(report, options);
+  if (src.rawBundle) {
+    const evList = src.rawBundle.evidence;
     return (
       evList
         .map((ev) =>
@@ -492,7 +586,7 @@ export function exportTriageJsonlFallback(report: WorkspaceReport): string {
     );
   }
   return (
-    report.flows
+    src.flows
       .map((flow) =>
         JSON.stringify({
           evidence_id: flow.evidence,
@@ -545,3 +639,464 @@ export function extractLaunchHashCredentials(hash: string): LaunchHashCredential
     hasLaunchParams,
   };
 }
+
+export type Layer1Kind =
+  | "sidecar_ready"
+  | "bin_classifier_ready"
+  | "bin_encoder_only"
+  | "bin_missing"
+  | "heuristic_only";
+
+export type PillTone = "ok" | "info" | "warn" | "neutral";
+
+export interface Layer1StatusSummary {
+  kind: Layer1Kind;
+  pillTone: PillTone;
+  neuralReady: boolean;
+  sidecarConfigured: boolean;
+  sidecarEtbertConfigured: boolean;
+  sidecarOpenjevConfigured: boolean;
+  boundBinPath: string;
+  binBound: boolean;
+  binReady: boolean;
+  binMissing: boolean;
+  binHasClassifierHead: boolean;
+  badgeLabel: string;
+  hardwareBadgeLabel: string;
+  hardwareBadgeOk: boolean;
+  hardwareBadgeWarn: boolean;
+  analyzeCardDetail: string;
+  sidecarBadgeLabel: string;
+  sidecarHint: string;
+  binBadgeLabel: string;
+  binHint: string;
+  deviceHint: string | null;
+  triageMode: string;
+}
+
+export function resolveLayer1Status({
+  capabilities,
+  workspaceConfig,
+  aiConfig,
+}: {
+  capabilities?: SystemCapabilities | null;
+  workspaceConfig?: WorkspaceConfigState | null;
+  aiConfig?: AIConfigResponse | null;
+}): Layer1StatusSummary {
+  const capTriage = capabilities?.triage ?? null;
+  const aiTriage = aiConfig?.triage ?? null;
+  const sidecarEtbertConfigured = Boolean(
+    aiTriage?.etbert_endpoint_configured || capTriage?.etbert_endpoint_configured,
+  );
+  const sidecarOpenjevConfigured = Boolean(
+    aiTriage?.endpoint_configured || capTriage?.endpoint_configured,
+  );
+  const sidecarConfigured = sidecarEtbertConfigured || sidecarOpenjevConfigured;
+
+  const ckptInfo = workspaceConfig?.etbert_checkpoint_info ?? capTriage?.etbert_checkpoint_info ?? null;
+  const boundBinPath = (
+    workspaceConfig != null
+      ? (workspaceConfig.etbert_checkpoint_path ?? "")
+      : (capTriage?.etbert_checkpoint_path ?? "")
+  ).trim();
+  const binBound = Boolean(boundBinPath);
+  const binMissing = Boolean(binBound && ckptInfo && ckptInfo.exists === false);
+  const binReady = Boolean(binBound && ckptInfo?.valid && ckptInfo?.ready);
+  const binHasClassifierHead = Boolean(ckptInfo?.has_classification_head);
+  const deviceHint = capabilities?.runtime?.device_hint ?? null;
+  const triageMode = String(aiTriage?.mode ?? capTriage?.mode ?? "heuristic_calibrated");
+
+  let kind: Layer1Kind = "heuristic_only";
+  if (sidecarConfigured) {
+    kind = "sidecar_ready";
+  } else if (binReady && binHasClassifierHead) {
+    kind = "bin_classifier_ready";
+  } else if (binReady) {
+    kind = "bin_encoder_only";
+  } else if (binMissing) {
+    kind = "bin_missing";
+  }
+
+  let pillTone: PillTone = "neutral";
+  if (kind === "sidecar_ready" || kind === "bin_classifier_ready") pillTone = "ok";
+  else if (kind === "bin_encoder_only") pillTone = "info";
+  else if (kind === "bin_missing") pillTone = "warn";
+
+  const neuralReady = kind === "sidecar_ready" || kind === "bin_classifier_ready" || kind === "bin_encoder_only";
+  const hardwareBadgeOk = kind === "sidecar_ready" || kind === "bin_classifier_ready";
+  const hardwareBadgeWarn = kind === "bin_missing";
+
+  const sidecarModelTag = sidecarEtbertConfigured && sidecarOpenjevConfigured
+    ? "ET-BERT + OpenJev"
+    : sidecarEtbertConfigured
+      ? "ET-BERT"
+      : "OpenJev";
+
+  const badgeLabel =
+    kind === "sidecar_ready"
+      ? `Sidecar Ready (${sidecarModelTag})`
+      : kind === "bin_classifier_ready"
+        ? `.bin Classifier Ready (${ckptInfo?.architecture ?? "ET-BERT"})`
+        : kind === "bin_encoder_only"
+          ? ".bin Encoder Fallback"
+          : kind === "bin_missing"
+            ? "ไม่พบไฟล์ .bin"
+            : "Heuristic Tier-1";
+
+  const hardwareBadgeLabel =
+    kind === "sidecar_ready"
+      ? `Tier-1 Sidecar Ready (${sidecarModelTag}${deviceHint ? ` · ${deviceHint}` : ""})`
+      : kind === "bin_classifier_ready"
+        ? `ET-BERT .bin Ready (${ckptInfo?.architecture ?? "classifier"})`
+        : kind === "bin_encoder_only"
+          ? "ET-BERT .bin Encoder (Telemetry Fallback)"
+          : kind === "bin_missing"
+            ? "ET-BERT .bin Missing (Heuristic Fallback)"
+            : "Heuristic Tier-1 Active";
+
+  const analyzeCardDetail =
+    kind === "sidecar_ready"
+      ? "Tier-1 Python sidecar พร้อมใช้งาน — ติ๊กยินยอมเรียก Tier-1 endpoint ด้านล่างเมื่อส่งวิเคราะห์ (ส่งเฉพาะ anonymized flow features)"
+      : kind === "bin_classifier_ready"
+        ? "ทำงานอัตโนมัติแบบ offline โดยไม่ต้องใช้ API key (หากเป็น capture ระดับ L2/WLAN/ARP จะขึ้น L7 datagrams = 0 ซึ่งเป็นพฤติกรรมปกติ)"
+        : kind === "bin_encoder_only"
+          ? "ผูกไฟล์ Pre-trained Encoder (.bin ไม่มี classification head) — รัน L7 telemetry fallback อัตโนมัติ (แนะนำวาง models/etbert-l7 ใน tier1-inference เพื่อรัน Transformer จริง)"
+          : kind === "bin_missing"
+            ? "ไม่พบไฟล์ .bin ตาม path ที่ผูกไว้ — ระบบสลับใช้ Heuristic Tier-1 ชั่วคราว (แก้ไขหรือกด Unbind ได้ใน Workspace & Settings)"
+            : "ทำงานอัตโนมัติแบบ offline ด้วย Heuristic Tier-1 (หากต้องการโมเดล Transformer ให้วางโฟลเดอร์ models/etbert-l7 ใน tier1-inference/ แล้วรีสตาร์ท)";
+
+  const sidecarBadgeLabel = sidecarConfigured
+    ? `Sidecar Active (${triageMode}${deviceHint ? ` · ${deviceHint}` : ""})`
+    : "Sidecar Offline (Optional)";
+
+  const sidecarHint = sidecarConfigured
+    ? "รันโมเดล Transformer (เช่น models/etbert-l7) ผ่าน tier1-inference อัตโนมัติ ไม่ต้องกรอกช่องไฟล์ .bin ด้านล่าง"
+    : `หากมีโฟลเดอร์ HuggingFace (models/etbert-l7) ให้วางไว้ที่ tier1-inference/models/etbert-l7 แล้วเปิดโปรแกรมใหม่ผ่าน Start PCAPSCANNER.command (${deviceHint ?? "cpu"})`;
+
+  const binBadgeLabel = !binBound
+    ? "Not bound (Optional)"
+    : binMissing
+      ? "File not found"
+      : binReady && binHasClassifierHead
+        ? `Bound Classifier (${ckptInfo?.architecture ?? "BERT"} · ${ckptInfo?.tensor_count ?? 0} tensors)`
+        : binReady
+          ? `Bound Encoder Only (${ckptInfo?.tensor_count ?? 0} tensors)`
+          : "Invalid .bin";
+
+  const binHint = !binBound
+    ? "ตัวเลือกเสริมสำหรับผูกไฟล์ .bin เดี่ยวแบบ offline เมื่อไม่ได้รัน tier1-inference sidecar (ปล่อยว่างได้)"
+    : binMissing
+      ? "ไม่พบไฟล์ตาม path นี้บนเครื่อง — เลือกไฟล์ใหม่หรือกด Unbind"
+      : binReady && binHasClassifierHead
+        ? "พร้อมใช้เป็น local classifier แบบ offline"
+        : binReady
+          ? "ไฟล์นี้เป็น Pre-trained Encoder (ไม่มี classification head) จึงใช้เป็น L7 telemetry fallback — ถ้าต้องการโมเดลที่ fine-tune แล้ว ให้ใช้โฟลเดอร์ models/etbert-l7 กับ tier1-inference"
+          : "ตรวจสอบไฟล์ .bin/.pt อีกครั้ง หรือกด Unbind";
+
+  return {
+    kind,
+    pillTone,
+    neuralReady,
+    sidecarConfigured,
+    sidecarEtbertConfigured,
+    sidecarOpenjevConfigured,
+    boundBinPath,
+    binBound,
+    binReady,
+    binMissing,
+    binHasClassifierHead,
+    badgeLabel,
+    hardwareBadgeLabel,
+    hardwareBadgeOk,
+    hardwareBadgeWarn,
+    analyzeCardDetail,
+    sidecarBadgeLabel,
+    sidecarHint,
+    binBadgeLabel,
+    binHint,
+    deviceHint,
+    triageMode,
+  };
+}
+
+export interface Layer2DraftInput {
+  enabled: boolean;
+  provider: AIProviderName;
+  data_boundary: "local" | "remote";
+  base_url: string;
+  allowed_origins: string;
+  model: string;
+  api_key_env: string;
+}
+
+export interface Layer2StatusSummary {
+  pillTone: PillTone;
+  badgeLabel: string;
+  helperText: string;
+  hasUnsavedChanges: boolean;
+  savedActive: boolean;
+  missingModel: boolean;
+}
+
+function normalizeUrlForCompare(value?: string | null): string {
+  return (value ?? "").trim().replace(/\/+$/, "");
+}
+
+function normalizeOriginsForCompare(raw: string): string {
+  return raw
+    .split(",")
+    .map((part) => normalizeUrlForCompare(part))
+    .filter(Boolean)
+    .join(", ");
+}
+
+export function resolveLayer2DraftStatus({
+  aiConfig,
+  draft,
+}: {
+  aiConfig?: AIConfigResponse | null;
+  draft: Layer2DraftInput;
+}): Layer2StatusSummary {
+  const cfg = aiConfig?.configuration;
+  if (!cfg) {
+    if (!draft.enabled) {
+      return {
+        pillTone: "neutral",
+        badgeLabel: "Disabled (ไม่ใช้ LLM)",
+        helperText: "ปิด Layer-2 LLM — การตรวจจับ Layer-1 ทำงานอัตโนมัติ",
+        hasUnsavedChanges: false,
+        savedActive: false,
+        missingModel: false,
+      };
+    }
+    if (!draft.model.trim() && draft.provider !== "manus") {
+      return {
+        pillTone: "warn",
+        badgeLabel: "ยังไม่เลือก Model Name",
+        helperText: "กด Probe / Discover Models หรือพิมพ์ชื่อโมเดลจริง แล้วกด Save AI Config ด้านล่าง",
+        hasUnsavedChanges: false,
+        savedActive: false,
+        missingModel: true,
+      };
+    }
+    return {
+      pillTone: "warn",
+      badgeLabel: "ยังไม่บันทึก — กด Save AI Config",
+      helperText: "กด Save AI Config ด้านล่างเพื่อให้ Backend เริ่มใช้งาน Layer-2 LLM",
+      hasUnsavedChanges: true,
+      savedActive: false,
+      missingModel: false,
+    };
+  }
+
+  const savedProvider = cfg.provider || "openai_compatible";
+  const savedModel = (cfg.model ?? "").trim() || (savedProvider === "manus" ? "standard" : "");
+  const savedActive = Boolean(cfg.enabled && (savedModel || savedProvider === "manus"));
+  const draftModel = draft.model.trim() || (draft.provider === "manus" ? "standard" : "");
+  const hasUnsavedChanges =
+    draft.enabled !== Boolean(cfg.enabled) ||
+    draft.provider !== savedProvider ||
+    draft.data_boundary !== (cfg.data_boundary || "local") ||
+    normalizeUrlForCompare(draft.base_url) !== normalizeUrlForCompare(cfg.base_url) ||
+    draftModel !== savedModel ||
+    draft.api_key_env.trim() !== (cfg.api_key_env ?? "").trim() ||
+    normalizeOriginsForCompare(draft.allowed_origins) !==
+      normalizeOriginsForCompare((cfg.allowed_origins ?? []).join(", "));
+
+  if (!draft.enabled) {
+    if (hasUnsavedChanges && savedActive) {
+      return {
+        pillTone: "warn",
+        badgeLabel: "ปิดสวิตช์ (ยังไม่บันทึก)",
+        helperText: "กด Save AI Config ด้านล่างเพื่อบันทึกการปิด Layer-2 LLM",
+        hasUnsavedChanges: true,
+        savedActive,
+        missingModel: false,
+      };
+    }
+    if (hasUnsavedChanges) {
+      return {
+        pillTone: "info",
+        badgeLabel: "มีการแก้ไข (ยังไม่บันทึก)",
+        helperText: "กด Save AI Config ด้านล่างเพื่อยืนยันสถานะปิดใช้งาน",
+        hasUnsavedChanges: true,
+        savedActive,
+        missingModel: false,
+      };
+    }
+    return {
+      pillTone: "neutral",
+      badgeLabel: "Disabled (ไม่ใช้ LLM)",
+      helperText: "ระบบตรวจจับด้วย Layer-1 อัตโนมัติโดยไม่ต้องเปิด LLM สรุปรายงาน",
+      hasUnsavedChanges: false,
+      savedActive,
+      missingModel: false,
+    };
+  }
+
+  if (!draftModel) {
+    return {
+      pillTone: "warn",
+      badgeLabel: "Standby · ยังไม่เลือก Model",
+      helperText:
+        "สวิตช์เปิดรอไว้แต่ยังไม่มีชื่อโมเดล (ข้อความจางในช่อง Model Name เป็นเพียงตัวอย่าง) — กด Probe / Discover Models หรือพิมพ์ชื่อโมเดลแล้วกด Save AI Config",
+      hasUnsavedChanges,
+      savedActive,
+      missingModel: true,
+    };
+  }
+
+  if (hasUnsavedChanges) {
+    return {
+      pillTone: "warn",
+      badgeLabel: "ยังไม่บันทึก — กด Save AI Config",
+      helperText: "กรอกค่าครบแล้ว กด Save AI Config ด้านล่างเพื่อให้ Backend เริ่มใช้งานจริง",
+      hasUnsavedChanges: true,
+      savedActive,
+      missingModel: false,
+    };
+  }
+
+  if (savedActive) {
+    return {
+      pillTone: "ok",
+      badgeLabel: `Active: ${savedProvider}/${savedModel || "standard"}`,
+      helperText: "บันทึกค่าบน Backend แล้ว — พร้อมสร้างสรุปรายงาน Layer-2",
+      hasUnsavedChanges: false,
+      savedActive: true,
+      missingModel: false,
+    };
+  }
+
+  return {
+    pillTone: "neutral",
+    badgeLabel: "Standby (Optional)",
+    helperText: "กด Save AI Config ด้านล่างเพื่อยืนยันการตั้งค่า",
+    hasUnsavedChanges,
+    savedActive: false,
+    missingModel: false,
+  };
+}
+
+export interface RunConsentInput {
+  connected: boolean;
+  isCsvSelected?: boolean;
+  triageEnabled: boolean;
+  triageEndpointConfigured: boolean;
+  triageEndpointConsent: boolean;
+  layer1Kind: Layer1Kind;
+  aiEnabled: boolean;
+  aiConsent: boolean;
+  canStartBackendAi: boolean;
+  aiBackendEnabled?: boolean;
+}
+
+export type RunSubmitBlockReason = "none" | "ai_setup" | "ai_consent";
+export type StageBadgeTone = "required" | "optional" | "warn";
+
+export interface RunConsentSummary {
+  needsTriageEndpointConsent: boolean;
+  needsAiSetup: boolean;
+  needsAiConsent: boolean;
+  hasAnyConsentPrompt: boolean;
+  submitBlockedReason: RunSubmitBlockReason;
+  stage04Label: string;
+  stage04Tone: StageBadgeTone;
+  stage04Note: string;
+  stage05Label: string;
+  stage05Tone: StageBadgeTone;
+  stage05Note: string;
+}
+
+export function resolveRunConsentState({
+  connected,
+  isCsvSelected = false,
+  triageEnabled,
+  triageEndpointConfigured,
+  triageEndpointConsent,
+  layer1Kind,
+  aiEnabled,
+  aiConsent,
+  canStartBackendAi,
+  aiBackendEnabled,
+}: RunConsentInput): RunConsentSummary {
+  const needsTriageEndpointConsent = Boolean(
+    !isCsvSelected && triageEnabled && triageEndpointConfigured && !triageEndpointConsent,
+  );
+  const needsAiSetup = Boolean(!isCsvSelected && connected && aiEnabled && !canStartBackendAi);
+  const needsAiConsent = Boolean(!isCsvSelected && aiEnabled && !needsAiSetup && !aiConsent);
+  const hasAnyConsentPrompt = needsTriageEndpointConsent || needsAiConsent || needsAiSetup;
+
+  let submitBlockedReason: RunSubmitBlockReason = "none";
+  if (needsAiSetup) {
+    submitBlockedReason = "ai_setup";
+  } else if (needsAiConsent) {
+    submitBlockedReason = "ai_consent";
+  }
+
+  let stage04Label = "HEURISTIC";
+  let stage04Tone: StageBadgeTone = "required";
+  let stage04Note = "ใช้ Heuristic Tier-1 ในเครื่อง (Offline)";
+  if (!triageEnabled) {
+    stage04Label = "OFF";
+    stage04Tone = "optional";
+    stage04Note = "ปิด Tier-1 classifier";
+  } else if (triageEndpointConfigured && triageEndpointConsent) {
+    stage04Label = "SIDECAR ON";
+    stage04Tone = "required";
+    stage04Note = "เรียก Tier-1 Neural Sidecar พร้อม consent";
+  } else if (triageEndpointConfigured && !triageEndpointConsent) {
+    stage04Label = "CONSENT?";
+    stage04Tone = "warn";
+    stage04Note =
+      layer1Kind === "bin_classifier_ready" || layer1Kind === "bin_encoder_only"
+        ? "ยังไม่ยินยอม Sidecar HTTP — ใช้ .bin ในเครื่องแทน"
+        : "ยังไม่ยินยอม Sidecar HTTP — ใช้ local heuristic แทน";
+  } else if (layer1Kind === "bin_classifier_ready" || layer1Kind === "bin_encoder_only") {
+    stage04Label = "LOCAL .BIN";
+    stage04Tone = "required";
+    stage04Note = "ใช้โมเดล ET-BERT .bin ในเครื่อง (Offline)";
+  }
+
+  let stage05Label = "OFF";
+  let stage05Tone: StageBadgeTone = "optional";
+  let stage05Note = "ปิด Layer-2 LLM — ใช้ผล Tier-1 & detectors";
+  if (isCsvSelected) {
+    stage05Label = "LOCAL CSV";
+    stage05Tone = "optional";
+    stage05Note = "สแกน CSV ในเบราว์เซอร์ 100% Offline";
+  } else if (aiEnabled) {
+    if (needsAiSetup) {
+      stage05Label = "SETUP?";
+      stage05Tone = "warn";
+      stage05Note =
+        aiBackendEnabled === false
+          ? "Backend ปิด AI อยู่ — เปิดใช้งานหรือปิด LLM ชั่วคราว"
+          : "ยังไม่ได้เลือก Model บน Backend — เลือกโมเดลก่อนส่งงาน";
+    } else if (needsAiConsent) {
+      stage05Label = "CONSENT?";
+      stage05Tone = "warn";
+      stage05Note = "รอติ๊กยืนยัน consent ก่อนส่งสรุปรายงาน";
+    } else {
+      stage05Label = "OPT-IN ON";
+      stage05Tone = "required";
+      stage05Note = "ยืนยันส่ง redacted summary แล้ว";
+    }
+  }
+
+  return {
+    needsTriageEndpointConsent,
+    needsAiSetup,
+    needsAiConsent,
+    hasAnyConsentPrompt,
+    submitBlockedReason,
+    stage04Label,
+    stage04Tone,
+    stage04Note,
+    stage05Label,
+    stage05Tone,
+    stage05Note,
+  };
+}
+
+

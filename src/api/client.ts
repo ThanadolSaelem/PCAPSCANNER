@@ -43,6 +43,23 @@ export interface TriageConfigInfo {
   etbert_endpoint_url?: string | null;
   etbert_enabled?: boolean;
   etbert_endpoint_configured?: boolean;
+  etbert_checkpoint_configured?: boolean;
+  etbert_checkpoint_path?: string | null;
+  etbert_checkpoint_info?: {
+    path?: string;
+    exists?: boolean;
+    valid?: boolean;
+    ready?: boolean;
+    size_bytes?: number;
+    sha256_prefix?: string;
+    tensor_count?: number;
+    vocab_size?: number;
+    hidden_size?: number;
+    num_layers?: number;
+    architecture?: string;
+    checkpoint_type?: string;
+    has_classification_head?: boolean;
+  } | null;
   etbert_model_name?: string;
   high_confidence_threshold: number;
   low_confidence_threshold: number;
@@ -74,6 +91,7 @@ export interface SystemCapabilities {
     batch_max_total_bytes: number;
     batch_admission_concurrency: number;
     zeek_enabled: boolean;
+    osint_enabled?: boolean;
     zeek_max_rows: number;
     zeek_max_output_bytes: number;
     zeek_timeout_seconds: number;
@@ -98,6 +116,10 @@ export interface WorkspaceConfigState {
   data_dir: string;
   local_ingest_roots: string[];
   resource_mode: ResourceMode;
+  etbert_checkpoint_path?: string | null;
+  etbert_checkpoint_configured?: boolean;
+  etbert_enabled?: boolean;
+  etbert_checkpoint_info?: TriageConfigInfo["etbert_checkpoint_info"];
   native_picker_available: boolean;
   picker_backend: string | null;
   persisted: boolean;
@@ -110,9 +132,12 @@ export interface WorkspaceUpdatePayload {
   add_local_ingest_root?: string;
   remove_local_ingest_root?: string;
   resource_mode?: ResourceMode;
+  etbert_checkpoint_path?: string;
+  etbert_enabled?: boolean;
+  clear_etbert_checkpoint?: boolean;
 }
 
-export type NativePickPurpose = "data_dir" | "capture_root" | "capture_file";
+export type NativePickPurpose = "data_dir" | "capture_root" | "capture_file" | "model_file";
 
 export interface NativePickResponse {
   cancelled: boolean;
@@ -123,7 +148,46 @@ export interface NativePickResponse {
   size_bytes?: number | null;
   sha256?: string | null;
   grant_expires_in_seconds?: number | null;
+  etbert_checkpoint?: TriageConfigInfo["etbert_checkpoint_info"];
   workspace: WorkspaceConfigState;
+}
+
+export type AIProviderName = "openai_compatible" | "anthropic" | "manus";
+
+export type AIPresetCategory = "local" | "cloud" | "agent" | "custom";
+
+/** Non-secret provider card from the backend catalog (`GET /api/v1/ai/providers`). */
+export interface AIProviderPreset {
+  id: string;
+  label: string;
+  initials: string;
+  accent: string;
+  category: AIPresetCategory;
+  protocol: AIProviderName;
+  tagline: string;
+  base_url: string | null;
+  allowed_origins: string[];
+  data_boundary: "local" | "remote";
+  api_key_env: string | null;
+  key_required: boolean;
+  key_placeholder: string;
+  model_label: string;
+  default_model: string | null;
+  model_suggestions: string[];
+  supports_discovery: boolean;
+  token_parameter: "max_tokens" | "max_completion_tokens";
+  response_mode: "json_schema" | "json_object" | "text";
+  timeout_seconds: number;
+  base_url_editable: boolean;
+  docs_url: string | null;
+  runtime_key_set?: boolean;
+  runtime_key_fingerprint?: string | null;
+  env_key_set?: boolean;
+}
+
+export interface AIProvidersResponse {
+  schema_version: string;
+  items: AIProviderPreset[];
 }
 
 export interface AIConfigResponse {
@@ -137,13 +201,59 @@ export interface AIConfigResponse {
     api_key_env: string | null;
     data_boundary: "local" | "remote";
     timeout_seconds: number;
+    retries?: number;
     input_max_bytes: number;
     max_output_tokens: number;
     context_window_tokens: number;
+    token_parameter?: "max_tokens" | "max_completion_tokens";
+    response_mode?: "json_schema" | "json_object" | "text";
+    temperature?: number | null;
+    anthropic_version?: string;
+    preset?: string | null;
   };
+  active_preset?: string | null;
+  credential_slot?: string;
   triage?: TriageConfigInfo;
   policy_hash: string;
   editable: string;
+  api_key_env_set?: boolean;
+  manus_env_set?: boolean;
+  manus_ready?: boolean;
+  runtime_key_set?: boolean;
+  runtime_key_fingerprint?: string | null;
+  runtime_keys?: Record<string, boolean>;
+  runtime_key_fingerprints?: Record<string, string | null>;
+}
+
+export interface AIConfigUpdatePayload {
+  enabled?: boolean;
+  provider?: AIProviderName;
+  base_url?: string | null;
+  allowed_origins?: string[];
+  model?: string | null;
+  api_key_env?: string | null;
+  data_boundary?: "local" | "remote";
+  timeout_seconds?: number;
+  retries?: number;
+  input_max_bytes?: number;
+  max_output_tokens?: number;
+  context_window_tokens?: number;
+  token_parameter?: "max_tokens" | "max_completion_tokens";
+  response_mode?: "json_schema" | "json_object" | "text";
+  temperature?: number | null;
+  anthropic_version?: string;
+  preset?: string | null;
+}
+
+export interface AIModelProbePayload {
+  provider?: AIProviderName;
+  preset?: string | null;
+  base_url?: string | null;
+  allowed_origins?: string[];
+  api_key_env?: string | null;
+  data_boundary?: "local" | "remote";
+  timeout_seconds?: number;
+  anthropic_version?: string;
 }
 
 export interface AIModelsResponse {
@@ -171,7 +281,7 @@ export interface BatchItemSummary {
   analysis_id: string;
   sha256: string;
   size_bytes: number;
-  format: "pcap" | "pcapng";
+  format: "pcap" | "pcapng" | "csv" | "tsv";
   state: BatchItemState;
   error_code: string | null;
   evidence_available: boolean;
@@ -187,6 +297,31 @@ export interface BatchSummary {
   partial_items: number;
   cancelled_items: number;
   items: BatchItemSummary[];
+}
+
+export interface JobsPageResponse {
+  items: JobSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface JobDeleteResponse {
+  deleted: boolean;
+  analysis_id: string;
+  capture_deleted: boolean;
+}
+
+export interface JobsPrunePayload {
+  keep_latest?: number;
+  max_age_hours?: number | null;
+}
+
+export interface JobsPruneResponse {
+  deleted_count: number;
+  deleted_ids: string[];
+  captures_deleted: number;
+  remaining_count: number;
 }
 
 export interface ChunkUploadInitResponse {
@@ -213,7 +348,7 @@ export interface LocalBrowseResponse {
 
 export interface BackendStage {
   name: string;
-  state: "completed" | "partial" | "failed" | "skipped" | "unavailable";
+  state: "completed" | "partial" | "failed" | "skipped" | "unavailable" | "awaiting_consent";
   detail: string;
 }
 
@@ -266,6 +401,10 @@ export interface Tier1Summary {
   mean_confidence: number;
   mean_ppl: number;
   etbert_scored_count?: number;
+  etbert_backend?: string | null;
+  etbert_device?: string | null;
+  etbert_model?: string | null;
+  etbert_top_classes?: Tier1ClassStat[];
   top_classes: Tier1ClassStat[];
   escalated_evidence_ids: string[];
 }
@@ -300,6 +439,91 @@ export interface CaptureMetrics {
   sample_packets: SamplePacket[];
 }
 
+export interface ArtifactRecord {
+  artifact_id: string;
+  sha256: string;
+  size_bytes: number;
+  content_type: string;
+  protocol?: string;
+  object_index?: number;
+  matched_rules: string[];
+  evidence_id?: string | null;
+  header_hex?: string;
+  review_available?: boolean;
+}
+
+export interface FlowAnalyticsBundle {
+  packet_size_histogram: { bucket: string; count: number }[];
+  iat_histogram: { bucket: string; count: number }[];
+  top_src_ips: { ip: string; packets: number }[];
+  top_dst_ips: { ip: string; packets: number }[];
+  top_public_dst_ips?: { ip: string; packets: number }[];
+  top_dst_ports: { port: number | string; packets: number }[];
+  top_protos: { protocol: string; packets: number }[];
+  top_domains: { domain: string; count: number }[];
+  sankey_links: { source: string; target: string; service: string; bytes: number; packets: number }[];
+  network_graph: {
+    nodes: { id: string; bytes: number; is_public: boolean }[];
+    edges: { source: string; target: string; bytes: number; packets: number; label: string }[];
+  };
+  traffic_heatmap: { ip: string; buckets: number[] }[];
+}
+
+export interface GeoIPSummary {
+  home?: { lat: number; lon: number; city: string; country: string; continent: string };
+  arcs: {
+    src_id: string;
+    src_label: string;
+    src_lat: number;
+    src_lon: number;
+    dst_id: string;
+    dst_label: string;
+    dst_lat: number;
+    dst_lon: number;
+    packets: number;
+    bytes: number;
+    flows: number;
+    risk: "normal" | "medium" | "high";
+  }[];
+  points: {
+    ip: string;
+    lat: number;
+    lon: number;
+    city: string;
+    country: string;
+    continent: string;
+    packets: number;
+    bytes: number;
+    flows: number;
+    risk: "normal" | "medium" | "high";
+    ptr?: string | null;
+  }[];
+  countries: { country: string; continent: string; packets: number; bytes: number; unique_ips: number }[];
+  continents?: { continent: string; packets: number; bytes: number }[];
+  mapped_public_ips?: number;
+  unmapped_public_ips?: number;
+}
+
+export interface MitreTechniqueCandidate {
+  technique_id: string;
+  technique_name: string;
+  tactic: string;
+  confidence: number;
+  evidence: string[];
+  evidence_ids?: string[];
+  analytic_id?: string;
+  disposition?: string;
+}
+
+export interface MitreAttackMapping {
+  attack_version?: string;
+  schema_version?: string;
+  techniques: MitreTechniqueCandidate[];
+  tactics_summary: Record<string, number>;
+  kill_chain_phase: string;
+  overall_severity: string;
+}
+
 export interface EvidenceBundle {
   schema_version: string;
   capture_sha256: string;
@@ -309,6 +533,12 @@ export interface EvidenceBundle {
   findings: BackendFinding[];
   triage?: Tier1Summary | null;
   telemetry?: CaptureMetrics | null;
+  mitre_attack?: MitreAttackMapping | null;
+  correlations?: Record<string, unknown>[];
+  artifacts?: ArtifactRecord[];
+  flow_analytics?: FlowAnalyticsBundle | null;
+  geoip?: GeoIPSummary | null;
+  iocs?: Record<string, unknown>[];
 }
 
 export interface AIResult {
@@ -357,6 +587,58 @@ export interface JobSummary {
   triage_summary?: Tier1Summary | null;
 }
 
+export type InvestigationSeverity = "info" | "low" | "medium" | "high" | "critical";
+export type InvestigationStatus = "open" | "in_progress" | "resolved" | "closed";
+
+export interface CaseAnalysisLink {
+  analysis_id: string;
+  capture_filename: string | null;
+  state: JobSummary["state"];
+  linked_at: string;
+}
+
+export interface CaseNote {
+  id: string;
+  note: string;
+  created_at: string;
+}
+
+export interface InvestigationCase {
+  id: string;
+  title: string;
+  description: string;
+  status: InvestigationStatus;
+  severity: InvestigationSeverity;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+  analysis_count: number;
+  note_count: number;
+  analyses?: CaseAnalysisLink[];
+  notes?: CaseNote[];
+}
+
+export interface CaseListResponse {
+  items: InvestigationCase[];
+  total: number;
+}
+
+export interface CaseCreatePayload {
+  title: string;
+  description?: string;
+  status?: InvestigationStatus;
+  severity?: InvestigationSeverity;
+  tags?: string[];
+}
+
+export interface CaseUpdatePayload {
+  title?: string;
+  description?: string;
+  severity?: InvestigationSeverity;
+  status?: InvestigationStatus;
+  tags?: string[];
+}
+
 export interface BackendReport {
   analysis_id: string;
   status: JobSummary["state"];
@@ -368,7 +650,102 @@ export interface BackendReport {
   capture_format?: string | null;
   evidence: EvidenceBundle;
   ai: AIResult;
+  osint?: OSINTLookupResponse | { state: "not_requested"; results: [] };
   disclaimer: string;
+}
+
+export type OSINTProviderId = "virustotal" | "abuseipdb" | "greynoise" | "shodan" | "otx" | "rdns" | "rdap";
+
+export interface OSINTProviderCapability {
+  id: OSINTProviderId;
+  name: string;
+  ready: boolean;
+  state: string;
+  supports: string[];
+  reference: string;
+}
+
+export interface OSINTCapabilities {
+  enabled: boolean;
+  available: boolean;
+  providers: OSINTProviderCapability[];
+  max_iocs_per_operation: number;
+  max_providers_per_operation: number;
+  max_total_lookups: number;
+  max_response_bytes_per_lookup: number;
+  max_operation_seconds: number;
+  read_only: true;
+  accepted_inputs: string[];
+  excluded_inputs: string[];
+}
+
+export interface IOCCandidate {
+  candidate_id: string;
+  indicator_type: "ipv4" | "ipv6" | "domain" | "md5" | "sha1" | "sha256";
+  indicator: string;
+  evidence_ids: string[];
+}
+
+export interface OSINTCandidatesResponse {
+  analysis_id: string;
+  candidates: IOCCandidate[];
+  candidate_count: number;
+  truncated: boolean;
+  max_iocs_per_operation: number;
+  lookup_is_external: true;
+  consent_required_for_lookup: true;
+  pending_operation?: {
+    operation_id: string | null;
+    requested_at: string;
+    providers: string[];
+    indicator_count: number;
+    state: "uncertain";
+  } | null;
+}
+
+export interface OSINTLookupItem {
+  candidate_id: string;
+  indicator_type: IOCCandidate["indicator_type"];
+  provider: OSINTProviderId;
+  state: string;
+  summary: Record<string, string | number | boolean | string[] | number[]>;
+  source_reference: string;
+  retry_after_seconds?: number;
+}
+
+export interface OSINTLookupResponse {
+  state: "completed" | "partial" | "unavailable" | "disabled" | "consent_required";
+  error_code: string | null;
+  requested_at?: string;
+  operation_id?: string;
+  consent?: true;
+  provider_ids?: OSINTProviderId[];
+  indicator_count?: number;
+  lookup_count?: number;
+  attempted_count?: number;
+  elapsed_ms?: number;
+  results: OSINTLookupItem[];
+}
+
+export interface OSINTLookupPayload {
+  operation_id: string;
+  candidate_ids: string[];
+  providers: OSINTProviderId[];
+  consent: true;
+  accept_uncertain_retry_risk: boolean;
+}
+
+export interface GroundedChatClaim {
+  claim: string;
+  evidence_ids: string[];
+}
+
+export interface GroundedChatResponse {
+  state: "completed" | "consent_required" | "no_evidence" | "budget_exceeded" | "invalid_output" | "unavailable";
+  claims: GroundedChatClaim[];
+  prompt_sha256: string | null;
+  error_code: string | null;
+  transcript_persisted: false;
 }
 
 export interface UploadProgress {
@@ -485,8 +862,44 @@ export class PcapApiClient {
     return this.requestJson<AIConfigResponse>("/api/v1/ai/config");
   }
 
+  getAiProviders(): Promise<AIProvidersResponse> {
+    return this.requestJson<AIProvidersResponse>("/api/v1/ai/providers");
+  }
+
   getAiModels(): Promise<AIModelsResponse> {
     return this.requestJson<AIModelsResponse>("/api/v1/ai/models");
+  }
+
+  updateAiConfig(payload: AIConfigUpdatePayload): Promise<AIConfigResponse> {
+    return this.requestJson<AIConfigResponse>("/api/v1/ai/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  /** `provider` is a credential slot: a wire provider or a catalog preset id. */
+  setAiCredentials(provider: string, apiKey: string): Promise<AIConfigResponse> {
+    return this.requestJson<AIConfigResponse>("/api/v1/ai/credentials", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, api_key: apiKey }),
+    });
+  }
+
+  clearAiCredentials(provider: string): Promise<AIConfigResponse> {
+    return this.requestJson<AIConfigResponse>(
+      `/api/v1/ai/credentials?provider=${encodeURIComponent(provider)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  probeAiModels(payload: AIModelProbePayload = {}): Promise<AIModelsResponse> {
+    return this.requestJson<AIModelsResponse>("/api/v1/ai/models/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
   }
 
   browseLocalCaptures(): Promise<LocalBrowseResponse> {
@@ -729,8 +1142,14 @@ export class PcapApiClient {
     });
   }
 
-  async listJobs(limit = 50): Promise<JobSummary[]> {
-    const res = await this.requestJson<{ items: JobSummary[] }>(`/api/v1/analyses?limit=${limit}`);
+  listJobsPage(limit = 50, offset = 0): Promise<JobsPageResponse> {
+    const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    const boundedOffset = Math.max(0, Math.trunc(offset));
+    return this.requestJson<JobsPageResponse>(`/api/v1/analyses?limit=${boundedLimit}&offset=${boundedOffset}`);
+  }
+
+  async listJobs(limit = 50, offset = 0): Promise<JobSummary[]> {
+    const res = await this.listJobsPage(limit, offset);
     return res.items;
   }
 
@@ -742,8 +1161,147 @@ export class PcapApiClient {
     return this.requestJson<JobSummary>(`/api/v1/analyses/${analysisId}/cancel`, { method: "POST" });
   }
 
+  deleteJob(analysisId: string): Promise<JobDeleteResponse> {
+    return this.requestJson<JobDeleteResponse>(`/api/v1/analyses/${encodeURIComponent(analysisId)}`, {
+      method: "DELETE",
+    });
+  }
+
+  pruneJobs(payload: JobsPrunePayload = {}): Promise<JobsPruneResponse> {
+    return this.requestJson<JobsPruneResponse>("/api/v1/analyses/prune", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
   getReport(analysisId: string): Promise<BackendReport> {
     return this.requestJson<BackendReport>(`/api/v1/analyses/${analysisId}/report`);
+  }
+
+  listCases(params: { limit?: number; offset?: number; search?: string } = {}): Promise<CaseListResponse> {
+    const query = new URLSearchParams({
+      limit: String(Math.max(1, Math.min(100, Math.trunc(params.limit ?? 50)))),
+      offset: String(Math.max(0, Math.min(10_000, Math.trunc(params.offset ?? 0)))),
+    });
+    if (params.search?.trim()) query.set("search", params.search.trim().slice(0, 120));
+    return this.requestJson<CaseListResponse>(`/api/v1/cases?${query.toString()}`);
+  }
+
+  getCase(caseId: string): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}`);
+  }
+
+  createCase(payload: CaseCreatePayload): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>("/api/v1/cases", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  updateCase(caseId: string, payload: CaseUpdatePayload): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  deleteCase(caseId: string): Promise<void> {
+    return this.requestJson<void>(`/api/v1/cases/${encodeURIComponent(caseId)}`, { method: "DELETE" });
+  }
+
+  linkCaseAnalysis(caseId: string, analysisId: string): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}/analyses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ analysis_id: analysisId }),
+    });
+  }
+
+  unlinkCaseAnalysis(caseId: string, analysisId: string): Promise<void> {
+    return this.requestJson<void>(
+      `/api/v1/cases/${encodeURIComponent(caseId)}/analyses/${encodeURIComponent(analysisId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  addCaseNote(caseId: string, note: string): Promise<InvestigationCase> {
+    return this.requestJson<InvestigationCase>(`/api/v1/cases/${encodeURIComponent(caseId)}/notes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    });
+  }
+
+  deleteCaseNote(caseId: string, noteId: string): Promise<void> {
+    return this.requestJson<void>(
+      `/api/v1/cases/${encodeURIComponent(caseId)}/notes/${encodeURIComponent(noteId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  getOSINTCapabilities(): Promise<OSINTCapabilities> {
+    return this.requestJson<OSINTCapabilities>("/api/v1/osint/capabilities");
+  }
+
+  getOSINTCandidates(analysisId: string): Promise<OSINTCandidatesResponse> {
+    return this.requestJson<OSINTCandidatesResponse>(`/api/v1/analyses/${analysisId}/osint/candidates`);
+  }
+
+  async runOSINTLookup(analysisId: string, payload: OSINTLookupPayload): Promise<OSINTLookupResponse> {
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort("osint_client_timeout"), 40_000);
+    try {
+      return await this.requestJson<OSINTLookupResponse>(`/api/v1/analyses/${analysisId}/osint`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
+  }
+
+  askGroundedQuestion(
+    analysisId: string,
+    question: string,
+    consent: boolean,
+    options?: { timeout_seconds?: number; max_output_tokens?: number },
+  ): Promise<GroundedChatResponse> {
+    const body: Record<string, unknown> = { question, consent };
+    if (options?.timeout_seconds !== undefined) body.timeout_seconds = options.timeout_seconds;
+    if (options?.max_output_tokens !== undefined) body.max_output_tokens = options.max_output_tokens;
+    return this.requestJson<GroundedChatResponse>(`/api/v1/analyses/${analysisId}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  generateAnalysisSummary(
+    analysisId: string,
+    options?: { timeout_seconds?: number; max_output_tokens?: number },
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {};
+    if (options?.timeout_seconds !== undefined) body.timeout_seconds = options.timeout_seconds;
+    if (options?.max_output_tokens !== undefined) body.max_output_tokens = options.max_output_tokens;
+    const hasBody = Object.keys(body).length > 0;
+    return this.requestJson<Record<string, unknown>>(`/api/v1/analyses/${encodeURIComponent(analysisId)}/summary`, {
+      method: "POST",
+      ...(hasBody ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+    });
+  }
+
+  async getStixJson(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.stix.json${q}`), {
+      headers: this.authHeaders({ Accept: "application/stix+json" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
   }
 
   async getTriageJsonl(analysisId: string): Promise<string> {
@@ -752,5 +1310,65 @@ export class PcapApiClient {
     });
     if (!response.ok) await this.throwProblem(response);
     return response.text();
+  }
+
+  createSnapshot(analysisId: string): Promise<Record<string, unknown>> {
+    return this.requestJson<Record<string, unknown>>(`/api/v1/analyses/${analysisId}/snapshot`, {
+      method: "POST",
+    });
+  }
+
+  async getExportCsv(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.csv${q}`), {
+      headers: this.authHeaders({ Accept: "text/csv" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
+  }
+
+  async getExportCef(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.cef${q}`), {
+      headers: this.authHeaders({ Accept: "text/plain" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
+  }
+
+  async getExportNavigatorJson(analysisId: string, options: { redact?: boolean } = {}): Promise<string> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.navigator.json${q}`), {
+      headers: this.authHeaders({ Accept: "application/json" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.text();
+  }
+
+  async getExportPdfBlob(analysisId: string, options: { redact?: boolean } = {}): Promise<Blob> {
+    const q = options.redact ? "?redact=true" : "";
+    const response = await fetch(this.url(`/api/v1/analyses/${analysisId}/export.pdf${q}`), {
+      headers: this.authHeaders({ Accept: "application/pdf" }),
+    });
+    if (!response.ok) await this.throwProblem(response);
+    return response.blob();
+  }
+
+  listArtifacts(analysisId: string): Promise<{ analysis_id: string; items: ArtifactRecord[]; total: number }> {
+    return this.requestJson(`/api/v1/analyses/${analysisId}/artifacts`);
+  }
+
+  listOSINTCache(limit = 50): Promise<{ items: Record<string, unknown>[]; total: number }> {
+    return this.requestJson(`/api/v1/osint/cache?limit=${limit}`);
+  }
+
+  clearOSINTCache(provider?: string): Promise<{ deleted_count: number }> {
+    const q = provider ? `?provider=${encodeURIComponent(provider)}` : "";
+    return this.requestJson(`/api/v1/osint/cache${q}`, { method: "DELETE" });
+  }
+
+  searchLocalIOCs(query = "", limit = 50): Promise<{ items: Record<string, unknown>[]; total: number }> {
+    const q = new URLSearchParams({ query, limit: String(limit) });
+    return this.requestJson(`/api/v1/iocs/search?${q.toString()}`);
   }
 }

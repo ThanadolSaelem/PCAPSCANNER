@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import errno
+import ipaddress
 import os
 import re
 import shutil
@@ -11,8 +12,9 @@ import sqlite3
 import stat
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .models import AIResult, utcnow
 
@@ -89,6 +91,7 @@ class Store:
               cancel_requested INTEGER NOT NULL DEFAULT 0,
               evidence TEXT,
               ai_result TEXT,
+              osint_result TEXT,
               error_code TEXT,
               idempotency_key TEXT UNIQUE,
               resource_mode TEXT NOT NULL DEFAULT 'auto',
@@ -96,6 +99,18 @@ class Store:
               triage_endpoint_consent INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, created_at);
+            CREATE TABLE IF NOT EXISTS osint_audit (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              analysis_id TEXT NOT NULL,
+              operation_id TEXT,
+              request_fingerprint TEXT,
+              requested_at TEXT NOT NULL,
+              providers TEXT NOT NULL,
+              indicator_count INTEGER NOT NULL,
+              outcome TEXT NOT NULL,
+              consent INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS osint_audit_analysis ON osint_audit(analysis_id, id);
             CREATE TABLE IF NOT EXISTS batches (
               id TEXT PRIMARY KEY,
               request_sha256 TEXT NOT NULL,
@@ -116,6 +131,102 @@ class Store:
               PRIMARY KEY(batch_id, item_index)
             );
             CREATE INDEX IF NOT EXISTS batch_items_job ON batch_items(job_id);
+            CREATE TABLE IF NOT EXISTS cases (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL,
+              severity TEXT NOT NULL,
+              tags TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS case_analyses (
+              case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              analysis_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              linked_at TEXT NOT NULL,
+              PRIMARY KEY(case_id, analysis_id)
+            );
+            CREATE INDEX IF NOT EXISTS case_analyses_analysis ON case_analyses(analysis_id);
+            CREATE TABLE IF NOT EXISTS case_notes (
+              id TEXT PRIMARY KEY,
+              case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              note TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS case_notes_case ON case_notes(case_id, created_at, id);
+            CREATE TABLE IF NOT EXISTS analysis_snapshots (
+              snapshot_id TEXT PRIMARY KEY,
+              analysis_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              created_at TEXT NOT NULL,
+              capture_sha256 TEXT NOT NULL,
+              parser_version TEXT NOT NULL,
+              rule_set_version TEXT NOT NULL,
+              policy_hash TEXT NOT NULL,
+              manifest_json TEXT NOT NULL,
+              bundle_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS analysis_snapshots_job ON analysis_snapshots(analysis_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS analysis_artifacts (
+              artifact_id TEXT NOT NULL,
+              analysis_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              filename TEXT NOT NULL,
+              content_type TEXT NOT NULL,
+              size_bytes INTEGER NOT NULL,
+              sha256 TEXT NOT NULL,
+              md5 TEXT,
+              sha1 TEXT,
+              source_protocol TEXT NOT NULL DEFAULT 'http',
+              packet_refs TEXT NOT NULL DEFAULT '[]',
+              matched_rules TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(analysis_id, artifact_id)
+            );
+            CREATE TABLE IF NOT EXISTS api_keys (
+              key_id TEXT PRIMARY KEY,
+              label TEXT NOT NULL,
+              token_prefix TEXT NOT NULL,
+              token_sha256 TEXT NOT NULL UNIQUE,
+              scopes TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              expires_at TEXT,
+              revoked_at TEXT,
+              last_used_at TEXT,
+              rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
+              quota_limit INTEGER NOT NULL DEFAULT 1000,
+              window_epoch_minute INTEGER NOT NULL DEFAULT 0,
+              window_request_count INTEGER NOT NULL DEFAULT 0,
+              total_requests INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS api_key_audit (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              key_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              endpoint TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS osint_cache (
+              cache_id TEXT PRIMARY KEY,
+              provider TEXT NOT NULL,
+              indicator_type TEXT NOT NULL,
+              indicator_hash TEXT NOT NULL,
+              state TEXT NOT NULL,
+              summary_json TEXT NOT NULL,
+              cached_at TEXT NOT NULL,
+              expires_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS osint_cache_exp ON osint_cache(expires_at);
+            CREATE TABLE IF NOT EXISTS case_iocs (
+              ioc_id TEXT PRIMARY KEY,
+              case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+              indicator_type TEXT NOT NULL,
+              indicator TEXT NOT NULL,
+              severity TEXT NOT NULL DEFAULT 'medium',
+              tags TEXT NOT NULL DEFAULT '[]',
+              notes TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS case_iocs_case ON case_iocs(case_id);
             """)
             self._migrate_columns(db)
         os.chmod(self.path, 0o600)
@@ -142,10 +253,25 @@ class Store:
             "resource_mode": "TEXT NOT NULL DEFAULT 'auto'",
             "triage_enabled": "INTEGER NOT NULL DEFAULT 1",
             "triage_endpoint_consent": "INTEGER NOT NULL DEFAULT 0",
+            "osint_result": "TEXT",
         }
         for col, ddl in job_migrations.items():
             if col not in job_cols:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+
+        key_cols = {r[1] for r in db.execute("PRAGMA table_info(api_keys)").fetchall()}
+        if "quota_limit" not in key_cols:
+            db.execute("ALTER TABLE api_keys ADD COLUMN quota_limit INTEGER NOT NULL DEFAULT 1000")
+
+        audit_cols = {r[1] for r in db.execute("PRAGMA table_info(osint_audit)").fetchall()}
+        if "operation_id" not in audit_cols:
+            db.execute("ALTER TABLE osint_audit ADD COLUMN operation_id TEXT")
+        if "request_fingerprint" not in audit_cols:
+            db.execute("ALTER TABLE osint_audit ADD COLUMN request_fingerprint TEXT")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS osint_audit_operation "
+            "ON osint_audit(analysis_id, operation_id) WHERE operation_id IS NOT NULL"
+        )
 
     @contextmanager
     def _file_lock(self, path: Path, *, blocking: bool = True):
@@ -677,7 +803,7 @@ class Store:
                 raise StoreError("batch_staging_unavailable", 507) from exc
             if not path.is_relative_to(staging_root) or not stat.S_ISREG(info.st_mode):
                 raise StoreError("batch_staging_unavailable", 507)
-            if size_bytes < 1 or info.st_size != size_bytes or fmt not in ("pcap", "pcapng"):
+            if size_bytes < 1 or info.st_size != size_bytes or fmt not in ("pcap", "pcapng", "csv", "tsv"):
                 raise StoreError("batch_staging_integrity_error", 400)
             digest = hashlib.sha256()
             try:
@@ -739,7 +865,7 @@ class Store:
                     )
                     for index, item in enumerate(normalized):
                         capture_id, job_id = uuid.uuid4().hex, uuid.uuid4().hex
-                        destination = self.capture_path(capture_id, "pcap")
+                        destination = self.capture_path(capture_id, "csv" if item["format"] in ("csv", "tsv") else "pcap")
                         if destination.exists():
                             raise StoreError("batch_id_collision", 503)
                         os.replace(item["path"], destination)
@@ -906,16 +1032,115 @@ class Store:
             raise StoreError("job_not_found", 404)
         return dict(row) if internal else self._public(row)
 
-    def jobs(self, limit=50) -> list[dict]:
+    def jobs(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        bounded_limit = max(1, min(int(limit), 200))
+        bounded_offset = max(0, int(offset))
         with self.connection() as db:
             rows = db.execute(
                 """SELECT j.*, c.filename AS capture_filename, c.size AS capture_size_bytes,
                           c.format AS capture_format, c.source_kind AS capture_source_kind
                    FROM jobs j LEFT JOIN captures c ON c.id = j.capture_id
-                   ORDER BY j.created_at DESC LIMIT ?""",
-                (limit,),
+                   ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?""",
+                (bounded_limit, bounded_offset),
             ).fetchall()
             return [self._public(r) for r in rows]
+
+    def jobs_count(self) -> int:
+        with self.connection() as db:
+            return int(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+
+    def delete_job(self, jid: str) -> dict:
+        unlink_cid: str | None = None
+        capture_deleted = False
+        with self.connection(write=True) as db:
+            row = db.execute(
+                """SELECT j.id, j.state, j.capture_id, c.source_kind
+                   FROM jobs j LEFT JOIN captures c ON c.id = j.capture_id
+                   WHERE j.id=?""",
+                (jid,),
+            ).fetchone()
+            if not row:
+                raise StoreError("job_not_found", 404)
+            if str(row["state"]) in ACTIVE:
+                raise StoreError("job_active_cannot_delete", 409)
+            capture_id = str(row["capture_id"])
+            source_kind = str(row["source_kind"] or "upload")
+            db.execute("DELETE FROM osint_audit WHERE analysis_id=?", (jid,))
+            db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+            ref_count = int(db.execute("SELECT COUNT(*) FROM jobs WHERE capture_id=?", (capture_id,)).fetchone()[0])
+            if ref_count == 0:
+                db.execute("DELETE FROM captures WHERE id=?", (capture_id,))
+                capture_deleted = True
+                if source_kind != "local":
+                    unlink_cid = capture_id
+        if unlink_cid:
+            for ext in ("pcap", "csv", "part"):
+                try:
+                    self.capture_path(unlink_cid, ext).unlink(missing_ok=True)
+                except StoreError:
+                    pass
+        return {
+            "deleted": True,
+            "analysis_id": jid,
+            "capture_deleted": capture_deleted,
+        }
+
+    def prune_jobs(self, *, keep_latest: int = 20, max_age_hours: int | None = None) -> dict:
+        keep = max(0, int(keep_latest))
+        cutoff_dt: datetime | None = None
+        if max_age_hours is not None:
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=max(0, int(max_age_hours)))
+        unlink_targets: list[str] = []
+        deleted_ids: list[str] = []
+        captures_deleted = 0
+        remaining_count = 0
+        with self.connection(write=True) as db:
+            rows = db.execute(
+                """SELECT j.id, j.state, j.created_at, j.capture_id, c.source_kind
+                   FROM jobs j LEFT JOIN captures c ON c.id = j.capture_id
+                   ORDER BY j.created_at DESC, j.id DESC"""
+            ).fetchall()
+            protected_ids = {str(r["id"]) for r in rows[:keep]}
+            case_linked_ids = {
+                str(row[0]) for row in db.execute("SELECT DISTINCT analysis_id FROM case_analyses").fetchall()
+            }
+            for r in rows:
+                jid = str(r["id"])
+                if jid in protected_ids or jid in case_linked_ids or str(r["state"]) in ACTIVE:
+                    continue
+                if cutoff_dt is not None:
+                    try:
+                        created_dt = datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00"))
+                        if created_dt.tzinfo is None:
+                            created_dt = created_dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        continue
+                    if created_dt >= cutoff_dt:
+                        continue
+                capture_id = str(r["capture_id"])
+                source_kind = str(r["source_kind"] or "upload")
+                db.execute("DELETE FROM osint_audit WHERE analysis_id=?", (jid,))
+                db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+                deleted_ids.append(jid)
+                ref_count = int(db.execute("SELECT COUNT(*) FROM jobs WHERE capture_id=?", (capture_id,)).fetchone()[0])
+                if ref_count == 0:
+                    db.execute("DELETE FROM captures WHERE id=?", (capture_id,))
+                    captures_deleted += 1
+                    if source_kind != "local":
+                        unlink_targets.append(capture_id)
+            remaining_count = int(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+        for cid in unlink_targets:
+            for ext in ("pcap", "csv", "part"):
+                try:
+                    self.capture_path(cid, ext).unlink(missing_ok=True)
+                except StoreError:
+                    pass
+        return {
+            "deleted_count": len(deleted_ids),
+            "deleted_ids": deleted_ids,
+            "captures_deleted": captures_deleted,
+            "remaining_count": remaining_count,
+        }
 
     @staticmethod
     def _public(row) -> dict:
@@ -996,6 +1221,157 @@ class Store:
                 db.execute("UPDATE jobs SET cancel_requested=1, state=?, ai_result=COALESCE(?,ai_result), updated_at=? WHERE id=?", (state, result, utcnow(), jid))
         return self.job(jid)
 
+    @contextmanager
+    def osint_operation_lock(self, jid: str):
+        """Prevent concurrent provider-credit use for one analysis across processes."""
+        self._validate_id(jid)
+        try:
+            with self._file_lock(self.batch_lock_dir / f"osint-{jid}.lock", blocking=False):
+                yield
+        except StoreError as exc:
+            if exc.code == "batch_admission_busy":
+                raise StoreError("osint_operation_busy", 429) from exc
+            raise
+
+    def record_osint_audit(
+        self,
+        jid: str,
+        *,
+        requested_at: str,
+        providers: list[str],
+        indicator_count: int,
+        outcome: str,
+        consent: bool,
+        operation_id: str | None = None,
+        request_fingerprint: str | None = None,
+    ) -> None:
+        """Record only operation metadata; never persist the queried IoC values or keys."""
+        self._validate_id(jid)
+        if not 0 <= indicator_count <= 12 or len(providers) > 7:
+            raise StoreError("osint_audit_invalid", 400)
+        if operation_id is not None and not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+            raise StoreError("osint_audit_invalid", 400)
+        if (operation_id is None) != (request_fingerprint is None):
+            raise StoreError("osint_audit_invalid", 400)
+        if request_fingerprint is not None and not re.fullmatch(r"[a-f0-9]{64}", request_fingerprint):
+            raise StoreError("osint_audit_invalid", 400)
+        if any(not re.fullmatch(r"[a-z0-9_-]{1,32}", item) for item in providers):
+            raise StoreError("osint_audit_invalid", 400)
+        if not re.fullmatch(r"[a-z0-9_-]{1,48}", outcome):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection(write=True) as db:
+            exists = db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone()
+            if not exists:
+                raise StoreError("job_not_found", 404)
+            if operation_id is not None:
+                count = db.execute(
+                    "SELECT COUNT(*) FROM osint_audit WHERE analysis_id=? AND operation_id IS NOT NULL", (jid,)
+                ).fetchone()[0]
+                if count >= 100:
+                    raise StoreError("osint_operation_limit", 429)
+            db.execute(
+                "INSERT INTO osint_audit(analysis_id, operation_id, request_fingerprint, requested_at, providers, indicator_count, outcome, consent) VALUES(?,?,?,?,?,?,?,?)",
+                (jid, operation_id, request_fingerprint, requested_at, json.dumps(sorted(set(providers))), indicator_count, outcome, int(consent)),
+            )
+            db.execute(
+                "DELETE FROM osint_audit WHERE analysis_id=? AND operation_id IS NULL AND id NOT IN "
+                "(SELECT id FROM osint_audit WHERE analysis_id=? AND operation_id IS NULL ORDER BY id DESC LIMIT 20)",
+                (jid, jid),
+            )
+
+    def osint_audit_operation(self, jid: str, operation_id: str) -> dict | None:
+        self._validate_id(jid)
+        if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM osint_audit WHERE analysis_id=? AND operation_id=? ORDER BY id DESC LIMIT 1",
+                (jid, operation_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def unresolved_osint_operation(self, jid: str) -> dict | None:
+        """Return metadata for an uncertain started operation, never indicator values."""
+        self._validate_id(jid)
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT a.id, a.operation_id, a.requested_at, a.providers, a.indicator_count, a.outcome, j.osint_result "
+                "FROM osint_audit a JOIN jobs j ON j.id=a.analysis_id "
+                "WHERE a.analysis_id=? AND a.outcome IN ('started','uncertain') ORDER BY a.id DESC LIMIT 1",
+                (jid,),
+            ).fetchone()
+            if row is not None and row["osint_result"]:
+                try:
+                    saved_result = json.loads(row["osint_result"])
+                except (TypeError, json.JSONDecodeError):
+                    saved_result = None
+                if (row["outcome"] == "started" and isinstance(saved_result, dict)
+                        and saved_result.get("operation_id") == row["operation_id"]):
+                    return None
+        if row is None:
+            return None
+        return {
+            "operation_id": row["operation_id"],
+            "requested_at": row["requested_at"],
+            "providers": json.loads(row["providers"]),
+            "indicator_count": row["indicator_count"],
+            "state": "uncertain",
+        }
+
+    def resolve_uncertain_osint_operation(self, jid: str, operation_id: str) -> None:
+        """Record explicit operator acceptance of duplicate-charge risk; retain the tombstone."""
+        self._validate_id(jid)
+        if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE osint_audit SET outcome='operator_override' "
+                "WHERE analysis_id=? AND operation_id=? AND outcome IN ('started','uncertain')",
+                (jid, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("osint_audit_not_found", 404)
+
+    def finish_osint_audit(self, jid: str, operation_id: str, outcome: str) -> None:
+        self._validate_id(jid)
+        if not re.fullmatch(r"[a-f0-9]{32}", operation_id) or not re.fullmatch(r"[a-z0-9_-]{1,48}", outcome):
+            raise StoreError("osint_audit_invalid", 400)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE osint_audit SET outcome=? WHERE analysis_id=? AND operation_id=?",
+                (outcome, jid, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("osint_audit_not_found", 404)
+
+    def save_osint_result(self, jid: str, result_json: str) -> None:
+        """Store only the sanitized, bounded OSINT result; normal job retention purges it."""
+        self._validate_id(jid)
+        if not isinstance(result_json, str) or len(result_json.encode("utf-8")) > 1024 * 1024:
+            raise StoreError("osint_result_too_large", 413)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE jobs SET osint_result=?, updated_at=? WHERE id=? AND evidence IS NOT NULL",
+                (result_json, utcnow(), jid),
+            )
+            if cursor.rowcount != 1:
+                if not db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone():
+                    raise StoreError("job_not_found", 404)
+                raise StoreError("evidence_not_ready", 409)
+
+    def save_ai_result(self, jid: str, result_json: str) -> None:
+        """Store or update the bounded AI summary result on an analysis with ready evidence."""
+        self._validate_id(jid)
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE jobs SET ai_result=?, updated_at=? WHERE id=? AND evidence IS NOT NULL",
+                (result_json, utcnow(), jid),
+            )
+            if cursor.rowcount != 1:
+                if not db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone():
+                    raise StoreError("job_not_found", 404)
+                raise StoreError("evidence_not_ready", 409)
+
     def recover_stale(self, stale_seconds=600) -> int:
         cutoff = time.time() - stale_seconds
         timestamp = datetime.fromtimestamp(cutoff, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1022,6 +1398,10 @@ class Store:
               AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.capture_id=c.id AND j.state IN ('queued','parsing','awaiting_ai','generating'))""",
               (cutoff, time.time() - 3600)).fetchall()
             for row in rows:
+                db.execute(
+                    "DELETE FROM osint_audit WHERE analysis_id IN (SELECT id FROM jobs WHERE capture_id=?)",
+                    (row["id"],),
+                )
                 # Never unlink user-owned files referenced via local_ingest_roots
                 if row["source_kind"] != "local":
                     for ext in ("pcap", "csv", "part"):
@@ -1038,3 +1418,849 @@ class Store:
             )
             db.execute("PRAGMA incremental_vacuum(100)")
         return count
+
+    CASE_TOTAL_LIMIT = 5000
+    CASE_ANALYSIS_LIMIT = 100
+    CASE_NOTE_LIMIT = 100
+    CASE_STATUSES = {"open", "in_progress", "resolved", "closed"}
+    CASE_SEVERITIES = {"info", "low", "medium", "high", "critical"}
+
+    @staticmethod
+    def _validate_case_id(case_id: str, *, field: str = "case_id") -> None:
+        if not isinstance(case_id, str) or re.fullmatch(r"[0-9a-f]{32}", case_id) is None:
+            raise StoreError("invalid_" + field, 400)
+
+    @classmethod
+    def _validate_case_fields(cls, values: dict, *, require_title: bool = True) -> dict:
+        title = values.get("title")
+        description = values.get("description", "")
+        status = values.get("status", "open")
+        severity = values.get("severity", "info")
+        tags = values.get("tags", [])
+        if require_title and (not isinstance(title, str) or not title.strip() or len(title.strip()) > 160):
+            raise StoreError("invalid_case_title", 400)
+        if title is not None and (not isinstance(title, str) or not title.strip() or len(title.strip()) > 160):
+            raise StoreError("invalid_case_title", 400)
+        if not isinstance(description, str) or len(description.strip()) > 4000:
+            raise StoreError("invalid_case_description", 400)
+        if status not in cls.CASE_STATUSES:
+            raise StoreError("invalid_case_status", 400)
+        if severity not in cls.CASE_SEVERITIES:
+            raise StoreError("invalid_case_severity", 400)
+        if not isinstance(tags, list) or len(tags) > 20:
+            raise StoreError("invalid_case_tags", 400)
+        normalized = []
+        for tag in tags:
+            if not isinstance(tag, str) or not tag.strip() or len(tag.strip()) > 64:
+                raise StoreError("invalid_case_tags", 400)
+            normalized.append(tag.strip())
+        if len({tag.casefold() for tag in normalized}) != len(normalized):
+            raise StoreError("invalid_case_tags", 400)
+        return {
+            "title": title.strip() if isinstance(title, str) else title,
+            "description": description.strip(),
+            "status": status,
+            "severity": severity,
+            "tags": normalized,
+        }
+
+    @staticmethod
+    def _case_summary(row) -> dict:
+        try:
+            tags = json.loads(row["tags"])
+        except (TypeError, ValueError):
+            tags = []
+        if not isinstance(tags, list):
+            tags = []
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "description": row["description"],
+            "status": row["status"],
+            "severity": row["severity"],
+            "tags": tags[:20],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "analysis_count": int(row["analysis_count"]),
+            "note_count": int(row["note_count"]),
+        }
+
+    @staticmethod
+    def _case_summary_query():
+        return """SELECT c.*,
+                    (SELECT COUNT(*) FROM case_analyses ca WHERE ca.case_id=c.id) AS analysis_count,
+                    (SELECT COUNT(*) FROM case_notes cn WHERE cn.case_id=c.id) AS note_count
+                  FROM cases c"""
+
+    def cases(self, *, limit: int = 20, offset: int = 0, search: str = "") -> dict:
+        if not isinstance(limit, int) or not 1 <= limit <= 100 or not isinstance(offset, int) or not 0 <= offset <= 1_000_000:
+            raise StoreError("invalid_case_pagination", 400)
+        if not isinstance(search, str) or len(search) > 120:
+            raise StoreError("invalid_case_search", 400)
+        needle = search.strip()
+        where = " WHERE (?='' OR instr(lower(c.title),lower(?))>0 OR instr(lower(c.description),lower(?))>0 OR instr(lower(c.tags),lower(?))>0)"
+        search_params = (needle, needle, needle, needle)
+        with self.connection() as db:
+            total = int(db.execute("SELECT COUNT(*) FROM cases c" + where, search_params).fetchone()[0])
+            rows = db.execute(
+                self._case_summary_query() + where + " ORDER BY c.created_at DESC, c.id ASC LIMIT ? OFFSET ?",
+                (*search_params, limit, offset),
+            ).fetchall()
+        return {"items": [self._case_summary(row) for row in rows], "total": total}
+
+    def case(self, case_id: str) -> dict:
+        self._validate_case_id(case_id)
+        with self.connection() as db:
+            row = db.execute(self._case_summary_query() + " WHERE c.id=?", (case_id,)).fetchone()
+            if row is None:
+                raise StoreError("case_not_found", 404)
+            summary = self._case_summary(row)
+            analyses = db.execute(
+                """SELECT ca.analysis_id, c.filename AS capture_filename, j.state, ca.linked_at
+                   FROM case_analyses ca JOIN jobs j ON j.id=ca.analysis_id
+                   LEFT JOIN captures c ON c.id=j.capture_id
+                   WHERE ca.case_id=? ORDER BY ca.linked_at ASC, ca.analysis_id ASC LIMIT ?""",
+                (case_id, self.CASE_ANALYSIS_LIMIT),
+            ).fetchall()
+            notes = db.execute(
+                "SELECT id,note,created_at FROM case_notes WHERE case_id=? ORDER BY created_at ASC,id ASC LIMIT ?",
+                (case_id, self.CASE_NOTE_LIMIT),
+            ).fetchall()
+        summary["analyses"] = [dict(item) for item in analyses]
+        summary["notes"] = [dict(item) for item in notes]
+        return summary
+
+    def create_case(self, values: dict) -> dict:
+        fields = self._validate_case_fields(values)
+        case_id, now = uuid.uuid4().hex, utcnow()
+        with self.connection(write=True) as db:
+            if int(db.execute("SELECT COUNT(*) FROM cases").fetchone()[0]) >= self.CASE_TOTAL_LIMIT:
+                raise StoreError("case_storage_limit", 429)
+            db.execute(
+                "INSERT INTO cases(id,title,description,status,severity,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (case_id, fields["title"], fields["description"], fields["status"], fields["severity"],
+                 json.dumps(fields["tags"], ensure_ascii=False, separators=(",", ":")), now, now),
+            )
+        return self.case(case_id)
+
+    def update_case(self, case_id: str, values: dict) -> dict:
+        self._validate_case_id(case_id)
+        if not isinstance(values, dict) or not values or set(values) - {"title", "description", "status", "severity", "tags"}:
+            raise StoreError("invalid_case_update", 400)
+        if any(value is None for value in values.values()):
+            raise StoreError("invalid_case_update", 400)
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+            if row is None:
+                raise StoreError("case_not_found", 404)
+            try:
+                existing_tags = json.loads(row["tags"])
+            except (TypeError, ValueError):
+                existing_tags = []
+            merged = {
+                "title": row["title"], "description": row["description"], "status": row["status"],
+                "severity": row["severity"], "tags": existing_tags,
+            }
+            merged.update(values)
+            fields = self._validate_case_fields(merged)
+            db.execute(
+                "UPDATE cases SET title=?,description=?,status=?,severity=?,tags=?,updated_at=? WHERE id=?",
+                (fields["title"], fields["description"], fields["status"], fields["severity"],
+                 json.dumps(fields["tags"], ensure_ascii=False, separators=(",", ":")), utcnow(), case_id),
+            )
+        return self.case(case_id)
+
+    def delete_case(self, case_id: str) -> None:
+        self._validate_case_id(case_id)
+        with self.connection(write=True) as db:
+            cursor = db.execute("DELETE FROM cases WHERE id=?", (case_id,))
+            if cursor.rowcount != 1:
+                raise StoreError("case_not_found", 404)
+
+    def link_case_analysis(self, case_id: str, analysis_id: str) -> dict:
+        self._validate_case_id(case_id)
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            if not db.execute("SELECT 1 FROM jobs WHERE id=?", (analysis_id,)).fetchone():
+                raise StoreError("job_not_found", 404)
+            if db.execute("SELECT 1 FROM case_analyses WHERE case_id=? AND analysis_id=?", (case_id, analysis_id)).fetchone():
+                raise StoreError("case_analysis_exists", 409)
+            count = int(db.execute("SELECT COUNT(*) FROM case_analyses WHERE case_id=?", (case_id,)).fetchone()[0])
+            if count >= self.CASE_ANALYSIS_LIMIT:
+                raise StoreError("case_analysis_limit", 429)
+            db.execute("INSERT INTO case_analyses(case_id,analysis_id,linked_at) VALUES(?,?,?)", (case_id, analysis_id, utcnow()))
+        return self.case(case_id)
+
+    def unlink_case_analysis(self, case_id: str, analysis_id: str) -> None:
+        self._validate_case_id(case_id)
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            cursor = db.execute("DELETE FROM case_analyses WHERE case_id=? AND analysis_id=?", (case_id, analysis_id))
+            if cursor.rowcount != 1:
+                raise StoreError("case_analysis_not_found", 404)
+
+    def create_case_note(self, case_id: str, note: str) -> dict:
+        self._validate_case_id(case_id)
+        if not isinstance(note, str) or not note.strip() or len(note.strip()) > 4000:
+            raise StoreError("invalid_case_note", 400)
+        note_id, now = uuid.uuid4().hex, utcnow()
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            count = int(db.execute("SELECT COUNT(*) FROM case_notes WHERE case_id=?", (case_id,)).fetchone()[0])
+            if count >= self.CASE_NOTE_LIMIT:
+                raise StoreError("case_note_limit", 429)
+            db.execute("INSERT INTO case_notes(id,case_id,note,created_at) VALUES(?,?,?,?)", (note_id, case_id, note.strip(), now))
+        return self.case(case_id)
+
+    def delete_case_note(self, case_id: str, note_id: str) -> None:
+        self._validate_case_id(case_id)
+        self._validate_case_id(note_id, field="note_id")
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            cursor = db.execute("DELETE FROM case_notes WHERE case_id=? AND id=?", (case_id, note_id))
+            if cursor.rowcount != 1:
+                raise StoreError("case_note_not_found", 404)
+
+    # --- Immutable Export Snapshots (M6) ---
+
+    def create_snapshot(
+        self,
+        analysis_id: str,
+        *,
+        parser_version: str = "pcapscanner-3.1.0",
+        rule_set_version: str = "default_threats-2026.11",
+    ) -> dict:
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (analysis_id,)).fetchone()
+            if row is None:
+                raise StoreError("job_not_found", 404)
+            if not row["evidence"]:
+                raise StoreError("evidence_not_ready", 409)
+            bundle_obj = json.loads(row["evidence"])
+            capture_sha256 = str(bundle_obj.get("capture_sha256") or "")
+            policy_hash = str(row["policy_hash"] or "")
+            created_at = utcnow()
+            snapshot_seed = json.dumps(
+                {
+                    "analysis_id": analysis_id,
+                    "capture_sha256": capture_sha256,
+                    "policy_hash": policy_hash,
+                    "parser_version": parser_version,
+                    "rule_set_version": rule_set_version,
+                    "evidence_sha256": hashlib.sha256(str(row["evidence"]).encode("utf-8")).hexdigest(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            snapshot_id = "SNAP-" + hashlib.sha256(snapshot_seed.encode("utf-8")).hexdigest()[:24]
+            existing = db.execute(
+                "SELECT * FROM analysis_snapshots WHERE snapshot_id=?",
+                (snapshot_id,),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["manifest_json"])
+            evidence_ids = [
+                str(ev.get("evidence_id"))
+                for ev in (bundle_obj.get("evidence") or [])
+                if isinstance(ev, dict) and ev.get("evidence_id")
+            ]
+            finding_ids = [
+                str(f.get("finding_id"))
+                for f in (bundle_obj.get("findings") or [])
+                if isinstance(f, dict) and f.get("finding_id")
+            ]
+            manifest = {
+                "snapshot_id": snapshot_id,
+                "analysis_id": analysis_id,
+                "created_at": created_at,
+                "immutable": True,
+                "capture_sha256": capture_sha256,
+                "parser_version": parser_version,
+                "rule_set_version": rule_set_version,
+                "policy_hash": policy_hash,
+                "coverage": bundle_obj.get("coverage") or {},
+                "evidence_count": len(evidence_ids),
+                "finding_count": len(finding_ids),
+                "evidence_ids": evidence_ids[:500],
+                "finding_ids": finding_ids[:200],
+            }
+            db.execute(
+                """INSERT INTO analysis_snapshots(
+                     snapshot_id, analysis_id, created_at, capture_sha256,
+                     parser_version, rule_set_version, policy_hash, manifest_json, bundle_json
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    analysis_id,
+                    created_at,
+                    capture_sha256,
+                    parser_version,
+                    rule_set_version,
+                    policy_hash,
+                    json.dumps(manifest, separators=(",", ":")),
+                    str(row["evidence"]),
+                ),
+            )
+            return manifest
+
+    def get_snapshot(self, analysis_id: str, snapshot_id: str | None = None) -> dict | None:
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection() as db:
+            if snapshot_id:
+                row = db.execute(
+                    "SELECT * FROM analysis_snapshots WHERE analysis_id=? AND snapshot_id=?",
+                    (analysis_id, snapshot_id),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT * FROM analysis_snapshots WHERE analysis_id=? ORDER BY created_at DESC LIMIT 1",
+                    (analysis_id,),
+                ).fetchone()
+        if row is None:
+            return None
+        manifest = json.loads(row["manifest_json"])
+        manifest["_bundle_json"] = row["bundle_json"]
+        return manifest
+
+    def get_or_create_snapshot(self, analysis_id: str, snapshot_id: str | None = None) -> dict:
+        existing = self.get_snapshot(analysis_id, snapshot_id=snapshot_id)
+        if existing is not None:
+            return existing
+        if snapshot_id is not None:
+            raise StoreError("snapshot_not_found", 404)
+        self.create_snapshot(analysis_id)
+        created = self.get_snapshot(analysis_id)
+        if created is None:
+            raise StoreError("snapshot_not_found", 404)
+        return created
+
+    # --- YARA & Carved Artifact Inventory (M4) ---
+
+    def list_artifacts(self, analysis_id: str) -> list[dict]:
+        self._validate_case_id(analysis_id, field="analysis_id")
+        with self.connection() as db:
+            job_row = db.execute("SELECT evidence FROM jobs WHERE id=?", (analysis_id,)).fetchone()
+            if job_row is None:
+                raise StoreError("job_not_found", 404)
+            if not job_row["evidence"]:
+                raise StoreError("evidence_not_ready", 409)
+            rows = db.execute(
+                "SELECT * FROM analysis_artifacts WHERE analysis_id=? ORDER BY artifact_id ASC",
+                (analysis_id,),
+            ).fetchall()
+        if rows:
+            return [
+                {
+                    "artifact_id": r["artifact_id"],
+                    "filename": r["filename"],
+                    "content_type": r["content_type"],
+                    "size_bytes": int(r["size_bytes"]),
+                    "sha256": r["sha256"],
+                    "md5": r["md5"],
+                    "sha1": r["sha1"],
+                    "source_protocol": r["source_protocol"],
+                    "packet_refs": json.loads(r["packet_refs"]),
+                    "matched_rules": json.loads(r["matched_rules"]),
+                }
+                for r in rows
+            ]
+        bundle_obj = json.loads(job_row["evidence"])
+        artifacts = bundle_obj.get("artifacts")
+        if isinstance(artifacts, list) and artifacts:
+            return artifacts
+        synthesized: list[dict] = []
+        for idx, ev in enumerate(bundle_obj.get("evidence") or [], 1):
+            if not isinstance(ev, dict) or ev.get("kind") != "yara":
+                continue
+            attrs = ev.get("attributes") or {}
+            sha = str(attrs.get("object_sha256") or attrs.get("artifact_sha256") or "")
+            if len(sha) != 64:
+                continue
+            rule_val = attrs.get("rule_id") or attrs.get("rule")
+            synthesized.append(
+                {
+                    "artifact_id": f"ART-{idx:04d}-{sha[:8]}",
+                    "filename": str(attrs.get("filename") or f"carved-{idx:04d}.bin"),
+                    "content_type": str(attrs.get("content_type") or "application/octet-stream"),
+                    "size_bytes": int(attrs.get("object_size_bytes") or attrs.get("size_bytes") or 0),
+                    "sha256": sha,
+                    "md5": attrs.get("artifact_md5"),
+                    "sha1": attrs.get("artifact_sha1"),
+                    "source_protocol": "http",
+                    "packet_refs": list(ev.get("packet_refs") or []),
+                    "matched_rules": [str(rule_val)] if rule_val else [],
+                }
+            )
+        return synthesized
+
+    def get_artifact(self, analysis_id: str, artifact_id: str) -> dict:
+        items = self.list_artifacts(analysis_id)
+        for item in items:
+            if item.get("artifact_id") == artifact_id:
+                return item
+        raise StoreError("artifact_not_found", 404)
+
+    # --- Scoped API Credentials & Audit (M7) ---
+
+    def create_scoped_api_key(
+        self,
+        *,
+        label: str,
+        scopes: list[str],
+        expires_in_days: int | None = 30,
+        rate_limit_per_minute: int = 60,
+        quota_limit: int = 1000,
+    ) -> dict:
+        clean_label = (label or "").strip()
+        if not clean_label or len(clean_label) > 120:
+            raise StoreError("invalid_api_key_label", 400)
+        if not scopes:
+            raise StoreError("invalid_api_key_scopes", 400)
+        eff_rate = max(1, int(rate_limit_per_minute))
+        eff_quota = max(1, int(quota_limit))
+        raw_secret = "phk_" + uuid.uuid4().hex + uuid.uuid4().hex[:8]
+        token_prefix = raw_secret[:12]
+        token_sha256 = hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
+        key_id = "KEY-" + uuid.uuid4().hex[:16]
+        now_dt = datetime.now(timezone.utc)
+        created_at = now_dt.isoformat().replace("+00:00", "Z")
+        expires_at = None
+        if expires_in_days is not None:
+            exp_ts = now_dt.timestamp() + int(expires_in_days) * 86400
+            expires_at = datetime.fromtimestamp(exp_ts, timezone.utc).isoformat().replace("+00:00", "Z")
+        normalized_scopes = sorted(set(scopes))
+        with self.connection(write=True) as db:
+            db.execute(
+                """INSERT INTO api_keys(
+                     key_id, label, token_prefix, token_sha256, scopes,
+                     created_at, expires_at, rate_limit_per_minute, quota_limit
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    key_id,
+                    clean_label,
+                    token_prefix,
+                    token_sha256,
+                    json.dumps(normalized_scopes),
+                    created_at,
+                    expires_at,
+                    eff_rate,
+                    eff_quota,
+                ),
+            )
+            db.execute(
+                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                (key_id, "created", "/api/v1/auth/keys", created_at),
+            )
+        return {
+            "key_id": key_id,
+            "name": clean_label,
+            "label": clean_label,
+            "token": raw_secret,
+            "token_prefix": token_prefix,
+            "scopes": normalized_scopes,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "revoked_at": None,
+            "rate_limit_per_minute": eff_rate,
+            "rate_limit_rpm": eff_rate,
+            "quota_limit": eff_quota,
+            "total_requests": 0,
+        }
+
+    def list_scoped_api_keys(self) -> list[dict]:
+        with self.connection() as db:
+            rows = db.execute("SELECT * FROM api_keys ORDER BY created_at DESC, key_id DESC").fetchall()
+        return [
+            {
+                "key_id": r["key_id"],
+                "name": r["label"],
+                "label": r["label"],
+                "token_prefix": r["token_prefix"],
+                "scopes": json.loads(r["scopes"]),
+                "created_at": r["created_at"],
+                "expires_at": r["expires_at"],
+                "revoked_at": r["revoked_at"],
+                "last_used_at": r["last_used_at"],
+                "rate_limit_per_minute": int(r["rate_limit_per_minute"]),
+                "rate_limit_rpm": int(r["rate_limit_per_minute"]),
+                "quota_limit": int(r["quota_limit"]) if "quota_limit" in r.keys() and r["quota_limit"] is not None else 1000,
+                "total_requests": int(r["total_requests"]),
+            }
+            for r in rows
+        ]
+
+    def revoke_scoped_api_key(self, key_id: str) -> dict:
+        now = utcnow()
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM api_keys WHERE key_id=?", (key_id,)).fetchone()
+            if row is None:
+                raise StoreError("api_key_not_found", 404)
+            db.execute("UPDATE api_keys SET revoked_at=? WHERE key_id=?", (now, key_id))
+            db.execute(
+                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                (key_id, "revoked", f"/api/v1/auth/keys/{key_id}", now),
+            )
+            updated = db.execute("SELECT * FROM api_keys WHERE key_id=?", (key_id,)).fetchone()
+        return {
+            "key_id": updated["key_id"],
+            "name": updated["label"],
+            "label": updated["label"],
+            "token_prefix": updated["token_prefix"],
+            "scopes": json.loads(updated["scopes"]),
+            "created_at": updated["created_at"],
+            "expires_at": updated["expires_at"],
+            "revoked_at": updated["revoked_at"],
+            "rate_limit_per_minute": int(updated["rate_limit_per_minute"]),
+            "rate_limit_rpm": int(updated["rate_limit_per_minute"]),
+            "quota_limit": int(updated["quota_limit"]) if "quota_limit" in updated.keys() and updated["quota_limit"] is not None else 1000,
+            "total_requests": int(updated["total_requests"]),
+        }
+
+    def verify_scoped_api_key(self, raw_token: str, *, required_scope: str | Sequence[str], endpoint: str = "") -> dict:
+        if not raw_token or not raw_token.startswith("phk_"):
+            raise StoreError("unauthorized", 401)
+        token_sha256 = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        now_dt = datetime.now(timezone.utc)
+        now_iso = now_dt.isoformat().replace("+00:00", "Z")
+        current_minute = int(now_dt.timestamp() // 60)
+        required_options = [required_scope] if isinstance(required_scope, str) else list(required_scope)
+        denied: tuple[str, int] | None = None
+        result: dict | None = None
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM api_keys WHERE token_sha256=?", (token_sha256,)).fetchone()
+            if row is None:
+                denied = ("unauthorized", 401)
+            elif row["revoked_at"]:
+                db.execute(
+                    "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                    (row["key_id"], "denied_revoked", endpoint, now_iso),
+                )
+                denied = ("api_key_revoked", 401)
+            elif row["expires_at"] and str(row["expires_at"]) <= now_iso:
+                db.execute(
+                    "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                    (row["key_id"], "denied_expired", endpoint, now_iso),
+                )
+                denied = ("api_key_expired", 401)
+            else:
+                scopes = set(json.loads(row["scopes"]))
+                is_admin_keys_endpoint = "admin:keys" in scopes and (
+                    endpoint == "/api/v1/auth/keys" or endpoint.startswith("/api/v1/auth/keys/")
+                )
+                if not any(req in scopes for req in required_options) and not is_admin_keys_endpoint:
+                    first_req = required_options[0] if required_options else ""
+                    db.execute(
+                        "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                        (row["key_id"], f"denied_scope:{first_req}", endpoint, now_iso),
+                    )
+                    denied = ("insufficient_scope", 403)
+                else:
+                    quota_lim = int(row["quota_limit"]) if "quota_limit" in row.keys() and row["quota_limit"] is not None else 1000
+                    if int(row["total_requests"]) >= quota_lim:
+                        db.execute(
+                            "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                            (row["key_id"], "quota_exceeded", endpoint, now_iso),
+                        )
+                        denied = ("api_key_quota_exceeded", 429)
+                    else:
+                        win_min = int(row["window_epoch_minute"])
+                        win_cnt = int(row["window_request_count"]) if win_min == current_minute else 0
+                        limit = int(row["rate_limit_per_minute"])
+                        if win_cnt >= limit:
+                            db.execute(
+                                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                                (row["key_id"], "rate_limited", endpoint, now_iso),
+                            )
+                            denied = ("api_key_rate_limited", 429)
+                        else:
+                            db.execute(
+                                """UPDATE api_keys
+                                   SET last_used_at=?, window_epoch_minute=?, window_request_count=?, total_requests=total_requests+1
+                                   WHERE key_id=?""",
+                                (now_iso, current_minute, win_cnt + 1, row["key_id"]),
+                            )
+                            db.execute(
+                                "INSERT INTO api_key_audit(key_id, action, endpoint, created_at) VALUES(?,?,?,?)",
+                                (row["key_id"], "authorized", endpoint, now_iso),
+                            )
+                            result = {
+                                "key_id": row["key_id"],
+                                "scopes": sorted(scopes),
+                                "rate_limit_per_minute": limit,
+                                "quota_limit": quota_lim,
+                            }
+        if denied is not None:
+            raise StoreError(denied[0], denied[1])
+        assert result is not None
+        return result
+
+    def list_api_key_audit(self, limit: int = 100) -> list[dict]:
+        bounded = max(1, min(int(limit), 500))
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT id, key_id, action, endpoint, created_at FROM api_key_audit ORDER BY id DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- OSINT Cache Management (M3) ---
+
+    def put_osint_cache(
+        self,
+        provider: str,
+        indicator_type: str,
+        indicator: str,
+        state: str,
+        summary: dict,
+        ttl_seconds: int = 3600,
+    ) -> dict:
+        indicator_hash = hashlib.sha256(f"{indicator_type}:{indicator}".encode("utf-8")).hexdigest()[:24]
+        cache_id = "OCACHE-" + hashlib.sha256(f"{provider}:{indicator_hash}".encode("utf-8")).hexdigest()[:20]
+        now_iso = utcnow()
+        expires_at = time.time() + max(60, min(int(ttl_seconds), 86400 * 30))
+        with self.connection(write=True) as db:
+            db.execute(
+                """INSERT OR REPLACE INTO osint_cache(
+                     cache_id, provider, indicator_type, indicator_hash, state, summary_json, cached_at, expires_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    cache_id,
+                    provider,
+                    indicator_type,
+                    indicator_hash,
+                    state,
+                    json.dumps(summary, separators=(",", ":")),
+                    now_iso,
+                    expires_at,
+                ),
+            )
+        return {
+            "cache_id": cache_id,
+            "provider": provider,
+            "indicator_type": indicator_type,
+            "indicator_hash": indicator_hash,
+            "state": state,
+            "summary": summary,
+            "cached_at": now_iso,
+            "expires_at": expires_at,
+        }
+
+    def list_osint_cache(self, limit: int = 100) -> list[dict]:
+        now = time.time()
+        with self.connection(write=True) as db:
+            db.execute("DELETE FROM osint_cache WHERE expires_at <= ?", (now,))
+            rows = db.execute(
+                "SELECT * FROM osint_cache ORDER BY cached_at DESC LIMIT ?",
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [
+            {
+                "cache_id": r["cache_id"],
+                "provider": r["provider"],
+                "indicator_type": r["indicator_type"],
+                "indicator_hash": r["indicator_hash"],
+                "state": r["state"],
+                "summary": json.loads(r["summary_json"]),
+                "cached_at": r["cached_at"],
+                "ttl_remaining_seconds": max(0, int(float(r["expires_at"]) - now)),
+            }
+            for r in rows
+        ]
+
+    def clear_osint_cache(self, provider: str | None = None) -> int:
+        with self.connection(write=True) as db:
+            if provider:
+                cur = db.execute("DELETE FROM osint_cache WHERE provider=?", (provider,))
+            else:
+                cur = db.execute("DELETE FROM osint_cache")
+            return int(cur.rowcount)
+
+    def delete_osint_cache_entry(self, cache_id: str) -> None:
+        with self.connection(write=True) as db:
+            cur = db.execute("DELETE FROM osint_cache WHERE cache_id=?", (cache_id,))
+            if cur.rowcount != 1:
+                raise StoreError("osint_cache_entry_not_found", 404)
+
+    # --- Case Custom IOCs & Local Cross-Case IOC Search (M3) ---
+
+    def add_case_ioc(self, case_id: str, values: dict) -> dict:
+        self._validate_case_id(case_id)
+        raw_type = str(values.get("indicator_type") or values.get("ioc_type") or "").strip().lower()
+        indicator = str(values.get("indicator") or values.get("value") or "").strip()
+        severity = str(values.get("severity") or "medium").strip()
+        tags = [str(t).strip() for t in (values.get("tags") or []) if str(t).strip()][:20]
+        notes = str(values.get("notes") or values.get("note") or "").strip()[:1000]
+        if not indicator:
+            raise StoreError("invalid_case_ioc", 400)
+        if raw_type in {"ip", "ipv4", "ipv6"}:
+            try:
+                ip_obj = ipaddress.ip_address(indicator)
+            except ValueError as exc:
+                raise StoreError("invalid_case_ioc", 400) from exc
+            if raw_type == "ipv4" and ip_obj.version != 4:
+                raise StoreError("invalid_case_ioc", 400)
+            if raw_type == "ipv6" and ip_obj.version != 6:
+                raise StoreError("invalid_case_ioc", 400)
+            indicator_type = "ipv4" if ip_obj.version == 4 else "ipv6"
+            indicator = ip_obj.compressed
+        elif raw_type in {"domain", "md5", "sha1", "sha256", "ja3"}:
+            indicator_type = raw_type
+        else:
+            raise StoreError("invalid_case_ioc", 400)
+        ioc_id = "CIOC-" + uuid.uuid4().hex[:16]
+        now = utcnow()
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            db.execute(
+                """INSERT INTO case_iocs(ioc_id, case_id, indicator_type, indicator, severity, tags, notes, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (ioc_id, case_id, indicator_type, indicator, severity, json.dumps(tags), notes, now),
+            )
+        return {
+            "ioc_id": ioc_id,
+            "case_id": case_id,
+            "indicator_type": indicator_type,
+            "ioc_type": indicator_type,
+            "indicator": indicator,
+            "value": indicator,
+            "severity": severity,
+            "tags": tags,
+            "notes": notes,
+            "note": notes,
+            "created_at": now,
+        }
+
+    def list_case_iocs(self, case_id: str) -> list[dict]:
+        self._validate_case_id(case_id)
+        with self.connection() as db:
+            if not db.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
+                raise StoreError("case_not_found", 404)
+            rows = db.execute(
+                "SELECT * FROM case_iocs WHERE case_id=? ORDER BY created_at DESC, ioc_id ASC",
+                (case_id,),
+            ).fetchall()
+        return [
+            {
+                "ioc_id": r["ioc_id"],
+                "case_id": r["case_id"],
+                "indicator_type": r["indicator_type"],
+                "ioc_type": r["indicator_type"],
+                "indicator": r["indicator"],
+                "value": r["indicator"],
+                "severity": r["severity"],
+                "tags": json.loads(r["tags"]),
+                "notes": r["notes"],
+                "note": r["notes"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def delete_case_ioc(self, case_id: str, ioc_id: str) -> None:
+        self._validate_case_id(case_id)
+        with self.connection(write=True) as db:
+            cur = db.execute("DELETE FROM case_iocs WHERE case_id=? AND ioc_id=?", (case_id, ioc_id))
+            if cur.rowcount != 1:
+                raise StoreError("case_ioc_not_found", 404)
+
+    def search_local_iocs(self, query: str = "", limit: int = 50) -> dict:
+        needle = (query or "").strip().lower()
+        bounded = max(1, min(int(limit), 200))
+        aggregated: dict[tuple[str, str], dict] = {}
+        with self.connection() as db:
+            case_rows = db.execute("SELECT * FROM case_iocs ORDER BY created_at DESC LIMIT 500").fetchall()
+            job_rows = db.execute(
+                "SELECT id, evidence FROM jobs WHERE evidence IS NOT NULL ORDER BY created_at DESC LIMIT 100"
+            ).fetchall()
+            links = db.execute("SELECT case_id, analysis_id FROM case_analyses").fetchall()
+
+        analysis_to_cases: dict[str, set[str]] = {}
+        for link in links:
+            analysis_to_cases.setdefault(str(link["analysis_id"]), set()).add(str(link["case_id"]))
+
+        for row in case_rows:
+            ind = str(row["indicator"])
+            ind_type = str(row["indicator_type"])
+            row_tags = " ".join(str(t) for t in json.loads(row["tags"] or "[]")).lower()
+            row_notes = str(row["notes"] or "").lower()
+            if (
+                needle
+                and needle not in ind.lower()
+                and needle not in ind_type.lower()
+                and needle not in row_tags
+                and needle not in row_notes
+            ):
+                continue
+            key = (ind_type, ind)
+            entry = aggregated.setdefault(
+                key,
+                {
+                    "indicator_type": ind_type,
+                    "indicator": ind,
+                    "severity": str(row["severity"]),
+                    "case_ids": set(),
+                    "analysis_ids": set(),
+                    "sources": set(),
+                },
+            )
+            entry["case_ids"].add(str(row["case_id"]))
+            entry["sources"].add("case_ioc")
+
+        for jrow in job_rows:
+            jid = str(jrow["id"])
+            try:
+                bundle_obj = json.loads(jrow["evidence"])
+            except Exception:
+                continue
+            for ioc in bundle_obj.get("iocs") or []:
+                if not isinstance(ioc, dict):
+                    continue
+                ind = str(ioc.get("indicator") or ioc.get("value") or "")
+                ind_type = str(ioc.get("indicator_type") or ioc.get("type") or "")
+                ctx = str(ioc.get("context") or "").lower()
+                if not ind or (
+                    needle
+                    and needle not in ind.lower()
+                    and needle not in ind_type.lower()
+                    and needle not in ctx
+                ):
+                    continue
+                key = (ind_type, ind)
+                entry = aggregated.setdefault(
+                    key,
+                    {
+                        "indicator_type": ind_type,
+                        "indicator": ind,
+                        "severity": str(ioc.get("priority") or ioc.get("priority_label") or "info"),
+                        "case_ids": set(),
+                        "analysis_ids": set(),
+                        "sources": set(),
+                    },
+                )
+                entry["analysis_ids"].add(jid)
+                entry["case_ids"].update(analysis_to_cases.get(jid, set()))
+                entry["sources"].add("analysis_bundle")
+
+        items = [
+            {
+                "indicator_type": val["indicator_type"],
+                "ioc_type": val["indicator_type"],
+                "indicator": val["indicator"],
+                "value": val["indicator"],
+                "severity": val["severity"],
+                "case_ids": sorted(val["case_ids"]),
+                "analysis_ids": sorted(val["analysis_ids"]),
+                "sources": sorted(val["sources"]),
+            }
+            for val in aggregated.values()
+        ]
+        items.sort(key=lambda x: (-len(x["case_ids"]), -len(x["analysis_ids"]), x["indicator"]))
+        return {"items": items[:bounded], "total": len(items)}

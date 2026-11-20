@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import { ApiProblemError, type BatchItemSummary, type BatchSummary, PcapApiClient } from "../api/client";
 import { formatBytes } from "../utils/adapters";
+import { inspectCaptureFile } from "../utils/localAnalyzer";
+import type { PrivacyRedactor } from "../utils/privacy";
 
 const TERMINAL_BATCH_STATES = new Set<BatchSummary["state"]>(["partial", "completed", "failed", "cancelled"]);
-const ALLOWED_EXTENSIONS = new Set(["pcap", "pcapng", "cap"]);
+const ALLOWED_EXTENSIONS = new Set(["pcap", "pcapng", "cap", "csv", "tsv"]);
 
 function isActiveBatch(batch: BatchSummary): boolean {
   return !TERMINAL_BATCH_STATES.has(batch.state);
@@ -43,6 +45,7 @@ export default function BatchIntakePanel({
   maxFiles,
   maxTotalBytes,
   maxFileBytes,
+  privacyRedactor,
   onOpenJob,
 }: {
   api: PcapApiClient;
@@ -50,6 +53,7 @@ export default function BatchIntakePanel({
   maxFiles: number | null;
   maxTotalBytes: number | null;
   maxFileBytes: number | null;
+  privacyRedactor?: PrivacyRedactor;
   onOpenJob: (analysisId: string) => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -57,6 +61,7 @@ export default function BatchIntakePanel({
   const idempotencyKeyRef = useRef<string | null>(null);
   const [files, setFiles] = useState<File[]>([]);
   const [submittedFiles, setSubmittedFiles] = useState<File[]>([]);
+  const [nameByAnalysisId, setNameByAnalysisId] = useState<Record<string, string>>({});
   const [batch, setBatch] = useState<BatchSummary | null>(null);
   const [recentBatches, setRecentBatches] = useState<BatchSummary[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -67,9 +72,11 @@ export default function BatchIntakePanel({
 
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
   const batchActive = Boolean(batch && isActiveBatch(batch));
+  const hasActiveRecentBatches = recentBatches.some(isActiveBatch);
   const limitsReady = maxFiles !== null && maxTotalBytes !== null && maxFileBytes !== null;
+  const maskFilename = (value: string) => (privacyRedactor ? privacyRedactor.redactFilename(value) : value);
 
-  const chooseFiles = (picked: File[]) => {
+  const chooseFiles = async (picked: File[]) => {
     setError("");
     if (picked.length === 0) return;
     if (batchActive || submitting) {
@@ -86,7 +93,7 @@ export default function BatchIntakePanel({
     }
     const unsupported = picked.find((file) => !ALLOWED_EXTENSIONS.has(file.name.toLowerCase().split(".").pop() ?? ""));
     if (unsupported) {
-      setError("รองรับเฉพาะไฟล์ .pcap, .pcapng และ .cap; Backend จะตรวจ signature ของทุกไฟล์อีกครั้ง");
+      setError("รองรับเฉพาะไฟล์ .pcap, .pcapng, .cap, .csv และ .tsv; Backend จะตรวจ signature ของทุกไฟล์อีกครั้ง");
       return;
     }
     const tooLarge = picked.find((file) => file.size <= 0 || file.size > maxFileBytes);
@@ -97,6 +104,20 @@ export default function BatchIntakePanel({
     const aggregate = picked.reduce((sum, file) => sum + file.size, 0);
     if (aggregate > maxTotalBytes) {
       setError(`ขนาดรวมต้องไม่เกิน ${formatBytes(maxTotalBytes)}`);
+      return;
+    }
+    try {
+      const inspected = await Promise.all(
+        picked.map(async (file) => ({ file, inspection: await inspectCaptureFile(file) })),
+      );
+      const invalidHeader = inspected.find((entry) => !entry.inspection.valid);
+      if (invalidHeader) {
+        const displayBadName = maskFilename(invalidHeader.file.name);
+        setError(`Header ของ ${displayBadName} ไม่ตรงกับ PCAP, PCAPNG หรือ Wireshark CSV/TSV (${invalidHeader.inspection.label})`);
+        return;
+      }
+    } catch {
+      setError("ไม่สามารถอ่าน header 512 bytes แรกของไฟล์ที่เลือกได้");
       return;
     }
     setFiles(picked);
@@ -125,6 +146,12 @@ export default function BatchIntakePanel({
     idempotencyKeyRef.current = key;
     try {
       const accepted = await api.uploadBatch(items, { idempotencyKey: key, signal: controller.signal });
+      const mappedNames: Record<string, string> = {};
+      for (const item of accepted.items) {
+        const matchedFile = items[item.index];
+        if (matchedFile) mappedNames[item.analysis_id] = matchedFile.name;
+      }
+      setNameByAnalysisId((current) => ({ ...current, ...mappedNames }));
       setSubmittedFiles(items);
       setBatch(accepted);
       setRecentBatches((current) => upsertBatch(current, accepted));
@@ -138,14 +165,11 @@ export default function BatchIntakePanel({
     }
   };
 
-  useEffect(() => {
-    if (!connected) return;
-    const controller = new AbortController();
-    let stopped = false;
-    const refresh = async () => {
+  const refreshBatches = useCallback(
+    async (signal: AbortSignal, isStopped: () => boolean) => {
       try {
-        const loaded = await api.listBatches(20, controller.signal);
-        if (stopped) return;
+        const loaded = await api.listBatches(20, signal);
+        if (isStopped()) return;
         setRecentBatches(loaded);
         setBatch((current) => {
           if (current) return loaded.find((item) => item.batch_id === current.batch_id) ?? current;
@@ -153,18 +177,35 @@ export default function BatchIntakePanel({
         });
         setPollError("");
       } catch (listFailure) {
-        if (stopped || controller.signal.aborted) return;
+        if (isStopped() || signal.aborted) return;
         setPollError(safeError(listFailure));
       }
+    },
+    [api],
+  );
+
+  useEffect(() => {
+    if (!connected) return;
+    const controller = new AbortController();
+    let stopped = false;
+    void refreshBatches(controller.signal, () => stopped);
+    return () => {
+      stopped = true;
+      controller.abort();
     };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
+  }, [connected, refreshBatches]);
+
+  useEffect(() => {
+    if (!connected || (!hasActiveRecentBatches && !batchActive && !submitting)) return;
+    const controller = new AbortController();
+    let stopped = false;
+    const timer = window.setInterval(() => void refreshBatches(controller.signal, () => stopped), 5000);
     return () => {
       stopped = true;
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [api, connected]);
+  }, [connected, hasActiveRecentBatches, batchActive, submitting, refreshBatches]);
 
   useEffect(() => {
     if (!batch || TERMINAL_BATCH_STATES.has(batch.state)) return;
@@ -245,13 +286,13 @@ export default function BatchIntakePanel({
       onDrop={(event: DragEvent<HTMLElement>) => {
         event.preventDefault();
         setDragging(false);
-        chooseFiles(Array.from(event.dataTransfer.files));
+        void chooseFiles(Array.from(event.dataTransfer.files));
       }}
     >
       <div className="panel-title batch-panel-title">
         <div>
           <div className="section-kicker">BATCH / SAFE INTAKE</div>
-          <h2 id="batch-intake-title">นำเข้า PCAP หลายไฟล์</h2>
+          <h2 id="batch-intake-title">นำเข้า PCAP / CSV หลายไฟล์</h2>
           <p>แต่ละไฟล์สร้าง capture และ analysis job แยกกัน; API ตรวจ signature และทรัพยากรอีกครั้งก่อนรับงาน</p>
         </div>
         <span className="step-tag">{limitsReady ? `${maxFiles} FILES MAX` : "LIMITS PENDING"}</span>
@@ -272,11 +313,11 @@ export default function BatchIntakePanel({
         className="sr-only"
         type="file"
         multiple
-        accept=".pcap,.pcapng,.cap"
-        aria-label="เลือกไฟล์ PCAP หลายรายการ"
+        accept=".pcap,.pcapng,.cap,.csv,.tsv"
+        aria-label="เลือกไฟล์ PCAP หรือ CSV/TSV หลายรายการ"
         disabled={!limitsReady || submitting || batchActive}
         onChange={(event) => {
-          chooseFiles(Array.from(event.currentTarget.files ?? []));
+          void chooseFiles(Array.from(event.currentTarget.files ?? []));
           event.currentTarget.value = "";
         }}
       />
@@ -288,7 +329,7 @@ export default function BatchIntakePanel({
           disabled={!limitsReady || submitting || batchActive}
           onClick={() => inputRef.current?.click()}
         >
-          เลือก PCAP/PCAPNG หลายไฟล์
+          เลือก PCAP / PCAPNG / CSV หลายไฟล์
         </button>
         <span className="batch-limit-text mono">
           {limitsReady
@@ -299,18 +340,21 @@ export default function BatchIntakePanel({
 
       {files.length > 0 && (
         <ul className="batch-file-list" aria-label="ไฟล์ที่เลือกสำหรับ batch">
-          {files.map((file, index) => (
-            <li key={`${file.name}-${file.size}-${index}`}>
-              <span className="batch-file-index mono">{String(index + 1).padStart(2, "0")}</span>
-              <span className="batch-file-name" title={file.name}>{file.name}</span>
-              <span className="batch-file-size mono">{formatBytes(file.size)}</span>
-            </li>
-          ))}
+          {files.map((file, index) => {
+            const displayName = maskFilename(file.name);
+            return (
+              <li key={`${file.name}-${file.size}-${index}`}>
+                <span className="batch-file-index mono">{String(index + 1).padStart(2, "0")}</span>
+                <span className="batch-file-name" title={displayName}>{displayName}</span>
+                <span className="batch-file-size mono">{formatBytes(file.size)}</span>
+              </li>
+            );
+          })}
         </ul>
       )}
 
       {files.length === 0 && !batch && (
-        <div className="batch-empty-state">เลือกไฟล์ capture ที่ต้องการวิเคราะห์พร้อมกัน; ไม่แตก archive และไม่ส่ง packet ไปยังเป้าหมาย</div>
+        <div className="batch-empty-state">เลือกไฟล์ .pcap, .pcapng, .cap หรือ Wireshark .csv/.tsv ที่ต้องการวิเคราะห์พร้อมกัน; ไม่แตก archive</div>
       )}
 
       {error && <div className="batch-error" role="alert">{error}</div>}
@@ -365,7 +409,8 @@ export default function BatchIntakePanel({
           )}
           <ul className="batch-item-list">
             {batch.items.map((item) => {
-              const displayName = submittedFiles[item.index]?.name ?? `${item.format} · ${item.capture_id.slice(0, 8)}`;
+              const rawName = submittedFiles[item.index]?.name ?? nameByAnalysisId[item.analysis_id];
+              const displayName = rawName ? maskFilename(rawName) : `${item.format} · ${item.capture_id.slice(0, 8)}`;
               return (
                 <li key={item.analysis_id}>
                   <span className="batch-file-index mono">{String(item.index + 1).padStart(2, "0")}</span>

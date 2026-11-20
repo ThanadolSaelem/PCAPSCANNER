@@ -167,6 +167,223 @@ class LauncherUnitTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_discover_local_ollama_model_and_autoconfigure_respect_opt_out(self) -> None:
+        class _OllamaHandler(BaseHTTPRequestHandler):
+            mode = "tags"
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.mode == "tags" and self.path == "/api/tags":
+                    body = json.dumps(
+                        {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:7b"}]}
+                    ).encode("utf-8")
+                    self.send_response(200)
+                elif self.mode == "v1" and self.path == "/v1/models":
+                    body = json.dumps({"data": [{"id": "llama3.2:latest"}]}).encode("utf-8")
+                    self.send_response(200)
+                else:
+                    body = b"{}"
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        # Reject non-loopback endpoint without attempting remote network call
+        self.assertIsNone(launcher.discover_local_ollama_model("http://8.8.8.8:11434", timeout=0.2))
+
+        server = HTTPServer(("127.0.0.1", 0), _OllamaHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            self.assertEqual(launcher.discover_local_ollama_model(base, timeout=1.0), "qwen2.5:7b")
+
+            _OllamaHandler.mode = "v1"
+            self.assertEqual(launcher.discover_local_ollama_model(base, timeout=1.0), "llama3.2:latest")
+
+            with tempfile.TemporaryDirectory() as tmp:
+                ws_path = Path(tmp) / "workspace.json"
+                with mock.patch.object(
+                    launcher,
+                    "discover_local_ollama_model",
+                    return_value="qwen2.5:7b",
+                ):
+                    env: dict[str, str] = {}
+                    picked = launcher.maybe_autoconfigure_local_ai(env, ws_path)
+                    self.assertEqual(picked, "qwen2.5:7b")
+                    self.assertEqual(env["PCAP_AI_MODEL"], "qwen2.5:7b")
+                    self.assertEqual(env["PCAP_AI_ENABLED"], "1")
+
+                    # Respect operator opt-out via PCAP_AI_ENABLED=0
+                    env_off = {"PCAP_AI_ENABLED": "0"}
+                    self.assertIsNone(launcher.maybe_autoconfigure_local_ai(env_off, ws_path))
+                    self.assertNotIn("PCAP_AI_MODEL", env_off)
+
+                    # Respect explicit PCAP_AI_MODEL
+                    env_set = {"PCAP_AI_MODEL": "custom-model"}
+                    self.assertIsNone(launcher.maybe_autoconfigure_local_ai(env_set, ws_path))
+                    self.assertEqual(env_set["PCAP_AI_MODEL"], "custom-model")
+
+                    # Respect workspace.json ai.enabled=false
+                    ws_path.write_text(json.dumps({"ai": {"enabled": False}}), encoding="utf-8")
+                    env_ws_off: dict[str, str] = {}
+                    self.assertIsNone(launcher.maybe_autoconfigure_local_ai(env_ws_off, ws_path))
+                    self.assertNotIn("PCAP_AI_MODEL", env_ws_off)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Closed loopback port returns None cleanly
+        self.assertIsNone(launcher.discover_local_ollama_model(f"http://127.0.0.1:{port}", timeout=0.2))
+
+    def test_standalone_tier1_discovery_without_trainer_and_allowed_origins(self) -> None:
+        self.assertIsNotNone(launcher.discover_tier1_inference_root(ROOT))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_repo = Path(tmp) / "repo"
+            fake_home = Path(tmp) / "home"
+            (fake_repo / "tier1-inference" / "tier1_inference").mkdir(parents=True)
+            (fake_repo / "tier1-inference" / "tier1_inference" / "server.py").write_text("# stub\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                # Without checkpoints, Trainer-Pipeline, or --with-tier1, do not spawn unnecessary daemon
+                self.assertIsNone(
+                    launcher.resolve_tier1_launch_plan(
+                        repo_root=fake_repo,
+                        home_dir=fake_home,
+                        port=9123,
+                    )
+                )
+
+                # Explicit --with-tier1 selects standalone tier1_inference even without Trainer-Pipeline
+                plan_fallback = launcher.resolve_tier1_launch_plan(
+                    repo_root=fake_repo,
+                    home_dir=fake_home,
+                    port=9123,
+                    with_tier1=True,
+                )
+                self.assertIsNotNone(plan_fallback)
+                assert plan_fallback is not None
+                cmd_fb, cwd_fb = plan_fallback
+                self.assertEqual(cwd_fb, (fake_repo / "tier1-inference").resolve())
+                self.assertIn("tier1_inference", cmd_fb)
+                self.assertNotIn("traffic_tier1.serve_tier1", cmd_fb)
+
+                # Placing trained checkpoints in standalone models/ auto-enables sidecar without --with-tier1
+                oj_ckpt = fake_repo / "tier1-inference" / "models" / "openjev-tier1"
+                et_ckpt = fake_home / "models" / "etbert-l7"
+                oj_ckpt.mkdir(parents=True)
+                et_ckpt.mkdir(parents=True)
+                plan_weights = launcher.resolve_tier1_launch_plan(
+                    repo_root=fake_repo,
+                    home_dir=fake_home,
+                    port=9123,
+                )
+                self.assertIsNotNone(plan_weights)
+                assert plan_weights is not None
+                cmd_w, _ = plan_weights
+                self.assertIn("--openjev-checkpoint", cmd_w)
+                self.assertIn(str(oj_ckpt.resolve()), cmd_w)
+                self.assertIn("--etbert-checkpoint", cmd_w)
+                self.assertIn(str(et_ckpt.resolve()), cmd_w)
+
+                # --no-tier1 always suppresses auto-start
+                self.assertIsNone(
+                    launcher.resolve_tier1_launch_plan(
+                        repo_root=fake_repo,
+                        home_dir=fake_home,
+                        port=9123,
+                        no_tier1=True,
+                        with_tier1=True,
+                    )
+                )
+
+        if HAS_PYDANTIC_V2:
+            from backend.app import config
+
+            origin = "http://127.0.0.1:9123"
+            origins = launcher._append_allowed_origin("", origin)
+            origins = launcher._append_allowed_origin(origins, origin)
+            self.assertEqual(origins, origin)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PCAP_TRIAGE_ENABLED": "1",
+                    "PCAP_TRIAGE_MODE": "etbert_openjev",
+                    "PCAP_TRIAGE_ALLOWED_ORIGINS": origins,
+                    "PCAP_TRIAGE_ENDPOINT_URL": f"{origin}/v1/systemone",
+                    "PCAP_TRIAGE_ETBERT_ENABLED": "1",
+                    "PCAP_TRIAGE_ETBERT_ENDPOINT_URL": f"{origin}/etbert/score",
+                },
+                clear=True,
+            ):
+                loaded = config.load_settings()
+                self.assertEqual(loaded.triage.endpoint_url, f"{origin}/v1/systemone")
+                self.assertEqual(loaded.triage.allowed_origins, [origin])
+
+    def test_probe_tier1_health_and_wire_tier1_env_reuses_running_sidecar(self) -> None:
+        class _Tier1Handler(BaseHTTPRequestHandler):
+            payload: dict[str, object] = {
+                "status": "ok",
+                "service": "pcapscanner-tier1-inference",
+                "device": "mps",
+                "openjev_loaded": False,
+                "openjev_mode": "state_fallback",
+                "etbert_loaded": True,
+                "etbert_mode": "neural_hf",
+                "auth_required": False,
+            }
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps(self.payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), _Tier1Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            health = launcher.probe_tier1_health(port)
+            self.assertIsNotNone(health)
+            assert health is not None
+            self.assertEqual(health["device"], "mps")
+            self.assertEqual(health["etbert_mode"], "neural_hf")
+
+            # Unrelated HTTP 200 service is ignored
+            _Tier1Handler.payload = {"status": "ok", "api_version": "1"}
+            self.assertIsNone(launcher.probe_tier1_health(port))
+
+            # Wire env for open-loopback sidecar (no token invented)
+            env: dict[str, str] = {}
+            origin = launcher.wire_tier1_env(env, port=port, token=None)
+            self.assertEqual(origin, f"http://127.0.0.1:{port}")
+            self.assertEqual(env["PCAP_TRIAGE_ENDPOINT_URL"], f"{origin}/v1/systemone")
+            self.assertEqual(env["PCAP_TRIAGE_ETBERT_ENDPOINT_URL"], f"{origin}/etbert/score")
+            self.assertEqual(env["PCAP_TRIAGE_ETBERT_ENABLED"], "1")
+            self.assertEqual(env["PCAP_TRIAGE_ALLOWED_ORIGINS"], origin)
+            self.assertNotIn("PCAP_TIER1_API_TOKEN", env)
+
+            # Wire env with explicit bearer token
+            launcher.wire_tier1_env(env, port=port, token="shared-secret-token")
+            self.assertEqual(env["PCAP_TIER1_API_TOKEN"], "shared-secret-token")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Closed port returns None
+        self.assertIsNone(launcher.probe_tier1_health(port))
+
 
 @unittest.skipUnless(HAS_PYDANTIC_V2, "requires pydantic>=2 + fastapi TestClient")
 class WorkspaceApiAndSpaTests(unittest.TestCase):

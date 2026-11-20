@@ -362,13 +362,28 @@ def build_capabilities_payload(settings: object) -> dict[str, object]:
         native_picker_available = False
     resolved_data_dir = str(data_dir.expanduser().resolve())
     triage_cfg = getattr(settings, "triage", None)
+    etbert_ckpt_path = getattr(triage_cfg, "etbert_checkpoint_path", None)
+    try:
+        from .etbert_bridge import inspect_etbert_checkpoint, is_etbert_effectively_enabled
+
+        etbert_ckpt_status = inspect_etbert_checkpoint(etbert_ckpt_path)
+        etbert_effective = is_etbert_effectively_enabled(
+            triage_cfg, ckpt_ready=bool(etbert_ckpt_status.get("ready"))
+        )
+    except Exception:
+        etbert_ckpt_status = {"configured": bool(etbert_ckpt_path), "ready": False}
+        etbert_effective = bool(getattr(triage_cfg, "etbert_enabled", False))
     triage_info = {
         "enabled": bool(getattr(triage_cfg, "enabled", True)),
         "mode": str(getattr(triage_cfg, "mode", "heuristic_calibrated")),
         "model_name": str(getattr(triage_cfg, "model_name", "openjev-cal-tier1")),
         "endpoint_configured": bool(getattr(triage_cfg, "endpoint_url", None)),
-        "etbert_enabled": bool(getattr(triage_cfg, "etbert_enabled", False)),
+        "etbert_enabled": etbert_effective,
         "etbert_endpoint_configured": bool(getattr(triage_cfg, "etbert_endpoint_url", None)),
+        "etbert_checkpoint_configured": bool(etbert_ckpt_path),
+        "etbert_checkpoint_path": str(etbert_ckpt_path) if etbert_ckpt_path else None,
+        "etbert_checkpoint_info": etbert_ckpt_status,
+        "etbert_checkpoint_status": etbert_ckpt_status,
         "etbert_model_name": str(getattr(triage_cfg, "etbert_model_name", "etbert-l7-datagram")),
         "high_confidence_threshold": float(getattr(triage_cfg, "high_confidence_threshold", 0.90)),
         "low_confidence_threshold": float(getattr(triage_cfg, "low_confidence_threshold", 0.35)),
@@ -404,11 +419,14 @@ def build_capabilities_payload(settings: object) -> dict[str, object]:
             "batch_max_total_bytes": int(getattr(settings, "batch_max_total_bytes", 2 * 1024 * 1024 * 1024)),
             "batch_admission_concurrency": int(getattr(settings, "batch_admission_concurrency", 2)),
             "zeek_enabled": bool(getattr(settings, "zeek_enabled", False)),
+            "osint_enabled": bool(getattr(settings, "osint_enabled", False)),
             "zeek_max_rows": int(getattr(settings, "zeek_max_rows", 2_000)),
             "zeek_max_output_bytes": int(getattr(settings, "zeek_max_output_bytes", 32 * 1024 * 1024)),
             "zeek_timeout_seconds": int(getattr(settings, "zeek_timeout_seconds", 45)),
             "zeek_memory_mb": int(getattr(settings, "zeek_memory_mb", 256)),
             "yara_enabled": bool(getattr(settings, "yara_enabled", False)),
+            # This reports only that a path is configured. The network-capable API
+            # deliberately cannot inspect the parser's read-only rule mount.
             "yara_rules_configured": bool(getattr(settings, "yara_rules_dir", None)),
             "yara_max_rules_files": int(getattr(settings, "yara_max_rules_files", 64)),
             "yara_max_rules_bytes": int(getattr(settings, "yara_max_rules_bytes", 16 * 1024 * 1024)),

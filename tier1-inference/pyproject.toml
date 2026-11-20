@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcapscanner-tier1-inference"
+version = "1.0.0"
+description = "Standalone inference-only ET-BERT + OpenJev Tier-1 traffic classifier API (no training dependencies)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn>=0.32.0,<1.0.0",
+    "pydantic>=2.9.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+neural = [
+    "torch>=2.3.0",
+    "transformers>=4.44.0",
+    "peft>=0.12.0",
+    "accelerate>=0.33.0",
+    "safetensors>=0.4.3",
+]
+dev = [
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+pcapscanner-tier1 = "tier1_inference.cli:main"
+pcapscanner-tier1-convert = "tier1_inference.convert_uer:main"
+
+[tool.setuptools.packages.find]
+include = ["tier1_inference*"]

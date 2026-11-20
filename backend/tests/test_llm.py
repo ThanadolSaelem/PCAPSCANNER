@@ -8,7 +8,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from backend.app.config import AIConfig, AppSettings, load_settings
-from backend.app.llm import generate_summary, list_models
+from backend.app.llm import generate_chat_completion, generate_summary, list_models
 from backend.app.models import (
     AISummary,
     Confidence,
@@ -116,11 +116,71 @@ async def test_disabled_never_calls_transport():
         called = True
         return httpx.Response(500)
 
-    disabled = AppSettings()
+    disabled = AppSettings(ai=AIConfig(enabled=False))
     result = await generate_summary(bundle(), disabled, transport=httpx.MockTransport(handler))
     assert result.state == "disabled"
     assert result.report is None
     assert called is False
+
+
+def test_ai_enabled_by_default_with_local_ollama_defaults_and_opt_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = AIConfig()
+    assert cfg.enabled is True
+    assert cfg.provider == "openai_compatible"
+    assert cfg.data_boundary == "local"
+    assert cfg.allowed_origins == [ORIGIN]
+    assert cfg.model is None
+
+    with_model = AIConfig(model="qwen2.5:7b")
+    assert with_model.enabled is True
+    assert with_model.data_boundary == "local"
+    assert with_model.allowed_origins == [ORIGIN]
+
+    monkeypatch.delenv("PCAP_AI_CONFIG", raising=False)
+    monkeypatch.delenv("PCAP_AI_ENABLED", raising=False)
+    monkeypatch.delenv("PCAP_WORKSPACE_CONFIG", raising=False)
+    monkeypatch.delenv("PCAP_ENABLE_NATIVE_PICKER", raising=False)
+    monkeypatch.delenv("PCAP_USE_WORKSPACE_CONFIG", raising=False)
+    monkeypatch.setenv("PCAP_DATA_DIR", str(tmp_path / "data"))
+    loaded_default = load_settings()
+    assert loaded_default.ai.enabled is True
+    assert loaded_default.ai.data_boundary == "local"
+    assert loaded_default.ai.allowed_origins == [ORIGIN]
+
+    monkeypatch.setenv("PCAP_AI_ENABLED", "0")
+    loaded_opt_out = load_settings()
+    assert loaded_opt_out.ai.enabled is False
+
+    # Custom endpoint still fails closed without explicit allowed_origins.
+    with pytest.raises(ValidationError):
+        AIConfig(base_url="https://api.example/v1")
+
+
+@pytest.mark.asyncio
+async def test_grounded_chat_completion_uses_strict_schema_and_bounded_output():
+    requests = []
+    answer = {"claims": [{"claim": "The cited flow is present.", "evidence_ids": ["EV-000001"]}]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(answer)}, "finish_reason": "stop"}]},
+        )
+
+    raw = await generate_chat_completion(
+        "Return one evidence-cited claim.",
+        settings(max_output_tokens=8_000),
+        transport=httpx.MockTransport(handler),
+    )
+    assert json.loads(raw) == answer
+    assert len(requests) == 1
+    request = requests[0]
+    assert request["max_tokens"] == 4_096
+    assert request["response_format"]["json_schema"]["strict"] is True
+    assert request["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
+    assert request["messages"][-1]["content"] == "Return one evidence-cited claim."
 
 
 def test_settings_defaults_secret_and_nonsecret_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -229,10 +289,16 @@ async def test_uri_paths_and_uri_derived_metrics_are_not_sent_to_ai():
             "http_host_ip_hits": 15,
         }
     )
+    evidence_bundle.coverage.warnings = ["diagnostic at /private/capture.pcap for sensor.example"]
+    evidence_bundle.coverage.stages[0].detail = "input /Users/operator/secret.pcap from host.example"
     result = await generate_summary(evidence_bundle, settings(), transport=httpx.MockTransport(handler))
     assert result.state == "completed"
     prompt = json.dumps(seen[0])
     assert "AI-URI-SENTINEL" not in prompt
+    assert "/private/capture.pcap" not in prompt
+    assert "/Users/operator/secret.pcap" not in prompt
+    assert "sensor.example" not in prompt
+    assert "host.example" not in prompt
     assert "http_uri_max_len" not in prompt
     assert "http_uri_max_entropy" not in prompt
     for marker in (
@@ -428,6 +494,8 @@ async def test_real_parser_attribute_names_and_v1_paths():
     attrs = context["evidence"][0]["attributes"]
     assert attrs["packets"] == 3 and attrs["bytes"] == 240
     assert attrs["src"].startswith("id_") and "192.0.2.1" not in json.dumps(context)
+    assert context["capture_ref"].startswith("id_")
+    assert b.capture_sha256 not in json.dumps(context)
     assert context["coverage"]["warnings"] == ["untrusted warning"]
     paths = []
     async def handler(request):
@@ -459,3 +527,217 @@ async def test_output_reserve_prevents_context_overflow():
         return httpx.Response(200, json={})
     result = await generate_summary(bundle(), settings(context_window_tokens=2048, max_output_tokens=2048), transport=httpx.MockTransport(handler))
     assert result.state == "budget_exceeded" and not called
+
+
+@pytest.mark.asyncio
+async def test_manus_v2_probe_summary_and_chat_lifecycle(monkeypatch: pytest.MonkeyPatch):
+    from backend.app.llm import clear_runtime_api_key, probe_models, set_runtime_api_key
+
+    monkeypatch.delenv("MANUS_API_URL", raising=False)
+    monkeypatch.delenv("MANUS_API_KEY", raising=False)
+    set_runtime_api_key("manus", "sk-manus-v2-key-123456")
+
+    seen: list[tuple[str, str, dict]] = []
+    detail_polls = 0
+    chat_answer = {"claims": [{"claim": "Observed suspicious TCP flow.", "evidence_ids": ["EV-000001"]}]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_polls
+        assert request.headers.get("x-manus-api-key") == "sk-manus-v2-key-123456"
+        assert "authorization" not in request.headers
+        body = json.loads(request.content) if request.content else {}
+        seen.append((request.method, f"{request.url.path}?{request.url.query.decode()}" if request.url.query else request.url.path, body))
+
+        if request.url.path == "/v2/task.list":
+            return httpx.Response(200, json={"ok": True, "data": [], "has_more": False})
+        if request.url.path == "/v2/task.create":
+            # Verify Manus v2 strict schema rules: no unsupported keywords like pattern/minLength/maxItems/title
+            schema_text = json.dumps(body.get("structured_output_schema", {}))
+            for forbidden in ('"pattern"', '"minLength"', '"maxLength"', '"minItems"', '"maxItems"', '"title"'):
+                assert forbidden not in schema_text
+            assert body.get("hide_in_task_list") is True
+            assert body.get("interactive_mode") is False
+            assert body.get("clear_connectors") is True
+            task_id = "task_chat_01" if "Return one evidence-cited claim" in body["message"]["content"] else "task_sum_01"
+            return httpx.Response(200, json={"ok": True, "task_id": task_id})
+        if request.url.path == "/v2/task.detail":
+            task_id = request.url.params.get("task_id")
+            if task_id == "task_sum_01" and detail_polls == 0:
+                detail_polls += 1
+                return httpx.Response(200, json={"ok": True, "task": {"id": task_id, "status": "running"}})
+            return httpx.Response(200, json={"ok": True, "task": {"id": task_id, "status": "stopped"}})
+        if request.url.path == "/v2/task.listMessages":
+            task_id = request.url.params.get("task_id")
+            if task_id == "task_sum_01":
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "task_id": task_id,
+                        "messages": [
+                            {"id": "m1", "type": "assistant_message", "assistant_message": {"content": "Summary ready."}},
+                            {
+                                "id": "m2",
+                                "type": "structured_output_result",
+                                "structured_output_result": {"success": True, "value": summary_payload()},
+                            },
+                        ],
+                        "has_more": False,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "task_id": task_id,
+                    "messages": [
+                        {
+                            "id": "m3",
+                            "type": "assistant_message",
+                            "assistant_message": {"content": f"Here is the grounded answer:\n```json\n{json.dumps(chat_answer)}\n```"},
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(404, json={"ok": False})
+
+    try:
+        # Note: user can paste https://api.manus.ai/v2/task.create or https://api.manus.ai, and omit model!
+        manus_cfg = AIConfig(
+            enabled=True,
+            provider="manus",
+            base_url="https://api.manus.ai/v2/task.create",
+            allowed_origins=["https://api.manus.ai"],
+            data_boundary="remote",
+            model=None,
+            timeout_seconds=5,
+        )
+        items, warning = await probe_models(manus_cfg, transport=httpx.MockTransport(handler))
+        assert warning is None
+        assert any(item["id"] == "standard" for item in items)
+        assert any(item["id"] == "max" for item in items)
+
+        manus_settings = AppSettings(ai=manus_cfg)
+        result = await generate_summary(bundle(), manus_settings, transport=httpx.MockTransport(handler))
+        assert result.state == "completed", result
+        assert result.model == "standard"
+        assert result.report is not None
+        assert result.report.assessments[0].finding_id == "F-0001"
+
+        raw_chat = await generate_chat_completion(
+            "Return one evidence-cited claim.",
+            manus_settings,
+            transport=httpx.MockTransport(handler),
+        )
+        assert json.loads(raw_chat) == chat_answer
+    finally:
+        clear_runtime_api_key("manus")
+
+
+@pytest.mark.asyncio
+async def test_reasoning_tags_and_fenced_json_in_summary():
+    payload = summary_payload()
+    raw_content = (
+        "<think>\n"
+        "Let's review the evidence and findings.\n"
+        "All references are grounded.\n"
+        "</think>\n"
+        "```json\n"
+        f"{json.dumps(payload)}\n"
+        "```\n"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": raw_content}}]})
+
+    result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    assert result.report is not None
+    assert len(result.report.summary) == 1
+    assert result.report.summary[0].evidence_ids == ["EV-000001"]
+
+
+@pytest.mark.asyncio
+async def test_schema_400_retries_without_response_format():
+    calls: list[httpx.Request] = []
+    payload = summary_payload()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        body = json.loads(request.read())
+        # Simulate llama.cpp rejecting response_format with 400 Bad Request
+        if "response_format" in body:
+            return httpx.Response(400, json={"error": {"message": "failed to parse schema into grammar"}})
+        # On retry without response_format, return successful JSON
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    result = await generate_summary(bundle(), settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    assert len(calls) == 2
+    assert "response_format" in json.loads(calls[0].read())
+    assert "response_format" not in json.loads(calls[1].read())
+
+
+@pytest.mark.asyncio
+async def test_unassessed_findings_retained_in_summary():
+    # Bundle with 2 findings
+    b = bundle()
+    finding_2 = Finding(
+        finding_id="F-0002",
+        detector="fixture2",
+        title="Second finding",
+        severity="medium",
+        confidence="medium",
+        evidence_ids=["EV-000001"],
+    )
+    b.findings.append(finding_2)
+
+    # LLM summary payload only assesses F-0001
+    payload = summary_payload()
+    assert len(payload["assessments"]) == 1
+    assert payload["assessments"][0]["finding_id"] == "F-0001"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    result = await generate_summary(b, settings(), transport=httpx.MockTransport(handler))
+    assert result.state == "completed"
+    assert result.report is not None
+    # Verify F-0002 was auto-retained deterministically rather than failing with missing_finding
+    assessed_ids = {a.finding_id for a in result.report.assessments}
+    assert assessed_ids == {"F-0001", "F-0002"}
+
+
+@pytest.mark.asyncio
+async def test_local_output_length_retries_with_thinking_disabled():
+    calls: list[dict] = []
+    answer = {"claims": [{"claim": "Recovered after disabling thinking.", "evidence_ids": ["EV-000001"]}]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        calls.append(body)
+        if body.get("chat_template_kwargs", {}).get("enable_thinking") is False:
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": json.dumps(answer)}, "finish_reason": "stop"}]},
+            )
+        # First call simulates llama.cpp Qwen thinking model hitting max_tokens inside <think>
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "<think>long reasoning..."}, "finish_reason": "length"}]},
+        )
+
+    raw = await generate_chat_completion(
+        "Summarize what happened.",
+        settings(max_output_tokens=2048),
+        transport=httpx.MockTransport(handler),
+    )
+    assert json.loads(raw) == answer
+    assert len(calls) == 2
+    assert "chat_template_kwargs" not in calls[0]
+    assert calls[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert calls[1]["max_tokens"] >= 4096
+
+
+

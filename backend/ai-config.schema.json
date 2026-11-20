@@ -20,7 +20,7 @@
       "type": "string"
     },
     "enabled": {
-      "default": false,
+      "default": true,
       "title": "Enabled",
       "type": "boolean"
     },

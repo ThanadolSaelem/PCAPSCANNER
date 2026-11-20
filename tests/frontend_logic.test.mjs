@@ -4,12 +4,16 @@ import { PcapApiClient } from "../src/api/client.ts";
 import { resolveBatchLimits } from "../src/utils/batchLimits.ts";
 import {
   adaptBackendReport,
+  describeEtbertExecution,
   exportReportJson,
   exportReportMarkdown,
   exportTriageJsonlFallback,
   extractLaunchHashCredentials,
   formatBytes,
   packetCoverageSummary,
+  resolveLayer1Status,
+  resolveLayer2DraftStatus,
+  resolveRunConsentState,
 } from "../src/utils/adapters.ts";
 import {
   WiresharkCsvStreamAnalyzer,
@@ -17,6 +21,19 @@ import {
   inspectCaptureHeaderBytes,
   parseCsvRow,
 } from "../src/utils/localAnalyzer.ts";
+import {
+  FALLBACK_PRESETS,
+  buildProbePayload,
+  buildSavePayload,
+  draftFromPreset,
+  groupPresets,
+  resolveActivePreset,
+  resolveKeyState,
+  validateDraft,
+} from "../src/utils/modelPresets.ts";
+import { PrivacyRedactor } from "../src/utils/privacy.ts";
+import { computeScrollDuration, easeInOutQuint } from "../src/utils/smoothScroll.ts";
+import { buildTimelineBucketDetails, parseComparableTime } from "../src/utils/timelineEvents.ts";
 
 test("batch upload uses repeated multipart file parts and stable request headers", async () => {
   const previousFetch = globalThis.fetch;
@@ -246,4 +263,1144 @@ test("extractLaunchHashCredentials parses loopback launcher tokens and rejects r
   assert.equal(rejectedRemote.hasLaunchParams, true);
   assert.equal(rejectedRemote.token, "tok_xyz");
   assert.equal(rejectedRemote.backendUrl, undefined);
+});
+
+test("PcapApiClient updateAiConfig and probeAiModels send expected non-secret requests", async () => {
+  const previousFetch = globalThis.fetch;
+  const client = new PcapApiClient("http://127.0.0.1:8000/", "op-token");
+  const seenCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    seenCalls.push({ url: String(input), method: init.method, headers: init.headers, body: init.body });
+    if (String(input).endsWith("/api/v1/ai/models/probe")) {
+      return new Response(
+        JSON.stringify({ state: "completed", items: [{ id: "qwen2.5:7b" }], warning: null }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        configuration: {
+          schema_version: "1.0",
+          enabled: true,
+          provider: "openai_compatible",
+          base_url: "http://127.0.0.1:11434",
+          allowed_origins: ["http://127.0.0.1:11434"],
+          model: "qwen2.5:7b",
+          api_key_env: null,
+          data_boundary: "local",
+          timeout_seconds: 60,
+          input_max_bytes: 65536,
+          max_output_tokens: 1200,
+          context_window_tokens: 32768,
+        },
+        policy_hash: "abc123",
+        editable: "runtime_non_secret_fields_via_put",
+        api_key_env_set: false,
+        manus_env_set: false,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  try {
+    const probed = await client.probeAiModels({
+      provider: "openai_compatible",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: ["http://127.0.0.1:11434"],
+      data_boundary: "local",
+    });
+    assert.equal(probed.items[0].id, "qwen2.5:7b");
+
+    const updated = await client.updateAiConfig({
+      enabled: true,
+      provider: "openai_compatible",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: ["http://127.0.0.1:11434"],
+      model: "qwen2.5:7b",
+      api_key_env: null,
+      data_boundary: "local",
+    });
+    assert.equal(updated.configuration.enabled, true);
+    assert.equal(updated.configuration.model, "qwen2.5:7b");
+
+    assert.equal(seenCalls.length, 2);
+    assert.equal(seenCalls[0].url, "http://127.0.0.1:8000/api/v1/ai/models/probe");
+    assert.equal(seenCalls[0].method, "POST");
+    assert.equal(seenCalls[0].headers.Authorization, "Bearer op-token");
+    assert.equal(seenCalls[1].url, "http://127.0.0.1:8000/api/v1/ai/config");
+    assert.equal(seenCalls[1].method, "PUT");
+    assert.equal(seenCalls[1].headers.Authorization, "Bearer op-token");
+    const putBody = JSON.parse(seenCalls[1].body);
+    assert.equal(putBody.model, "qwen2.5:7b");
+    assert.equal("api_key" in putBody, false);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("adaptBackendReport distinguishes Layer-1 ET-BERT L2 fallback from Layer-2 LLM states", () => {
+  const baseBundle = {
+    schema_version: "1.0",
+    capture_sha256: "b".repeat(64),
+    created_at: "2026-11-18T00:00:00Z",
+    coverage: {
+      packets_seen: 120,
+      packets_analyzed: 120,
+      truncated: false,
+      parser: "tshark-fields-offline",
+      warnings: [],
+      stages: [{ name: "tshark", state: "completed", detail: "120 packets" }],
+    },
+    triage: {
+      enabled: true,
+      model: "openjev-cal-tier1+etbert",
+      mode: "etbert_local_checkpoint",
+      total_evaluated: 10,
+      benign_filtered: 8,
+      escalated_count: 2,
+      uncertain_count: 0,
+      reduction_ratio: 0.8,
+      mean_confidence: 0.91,
+      mean_ppl: 1.05,
+      etbert_scored_count: 0,
+      top_classes: [],
+      escalated_evidence_ids: [],
+    },
+    evidence: [],
+    findings: [],
+  };
+
+  const disabledL2 = adaptBackendReport({
+    analysis_id: "1111111122222222",
+    status: "completed",
+    evidence: baseBundle,
+    ai: { state: "disabled" },
+    disclaimer: "Detector findings are candidates.",
+  });
+  const tier1Zero = disabledL2.stages.find((s) => s.name === "TIER-1 CLASSIFIER");
+  const aiDisabled = disabledL2.stages.find((s) => s.name === "AI NARRATIVE");
+  assert.match(tier1Zero?.detail ?? "", /ET-BERT: 0 L7 datagrams/);
+  assert.equal(aiDisabled?.status, "skipped");
+  assert.match(aiDisabled?.detail ?? "", /Layer-2 LLM disabled for this run/);
+
+  const scoredAndCompleted = adaptBackendReport({
+    analysis_id: "3333333344444444",
+    status: "completed",
+    evidence: {
+      ...baseBundle,
+      triage: { ...baseBundle.triage, etbert_scored_count: 42 },
+    },
+    ai: {
+      state: "completed",
+      provider: "openai_compatible",
+      model: "qwen2.5:7b",
+      report: { summary: [], assessments: [], limitations: [], recommended_actions: [] },
+    },
+    disclaimer: "Detector findings are candidates.",
+  });
+  assert.match(scoredAndCompleted.stages.find((s) => s.name === "TIER-1 CLASSIFIER")?.detail ?? "", /ET-BERT 42 L7 scored/);
+  const aiDone = scoredAndCompleted.stages.find((s) => s.name === "AI NARRATIVE");
+  assert.equal(aiDone?.status, "done");
+  assert.match(aiDone?.detail ?? "", /Layer-2 LLM \(qwen2\.5:7b\) generated evidence-grounded summary/);
+
+  const fallbackError = adaptBackendReport({
+    analysis_id: "5555555566666666",
+    status: "partial",
+    evidence: baseBundle,
+    ai: { state: "unavailable", error_code: "ai_provider_unreachable" },
+    disclaimer: "Detector findings are candidates.",
+  });
+  const aiFallback = fallbackError.stages.find((s) => s.name === "AI NARRATIVE");
+  assert.equal(aiFallback?.status, "partial");
+  assert.match(aiFallback?.detail ?? "", /Layer-2 Fallback \(ai_provider_unreachable\)/);
+});
+
+test("resolveLayer1Status prioritizes running tier1-inference sidecar and avoids false missing-.bin badge", () => {
+  const capBase = {
+    host: {
+      cpu_count: 16,
+      host_memory_total_mb: 131072,
+      host_memory_available_mb: 65536,
+      cgroup_memory_limit_mb: null,
+      effective_memory_mb: 131072,
+      disk_total_bytes: 1e12,
+      disk_free_bytes: 5e11,
+      tshark_available: true,
+      tshark_version: "4.2",
+      zeek_available: false,
+      zeek_version: null,
+    },
+    runtime: { platform: "darwin", machine: "arm64", device_hint: "mps" },
+    limits: {
+      resource_mode: "auto",
+      upload_max_bytes: 0,
+      storage_max_bytes: 0,
+      disk_reserve_bytes: 0,
+      effective_upload_max_bytes: 0,
+      effective_storage_max_bytes: 0,
+      unlimited_upload_enabled: true,
+      chunk_size_bytes: 1024,
+      supported_formats: ["pcap"],
+      local_ingest_enabled: false,
+      local_ingest_roots: [],
+      batch_max_files: 8,
+      batch_max_total_bytes: 1024,
+      batch_admission_concurrency: 2,
+      zeek_enabled: false,
+      zeek_max_rows: 100,
+      zeek_max_output_bytes: 1024,
+      zeek_timeout_seconds: 30,
+      zeek_memory_mb: 128,
+    },
+    profiles: {},
+    triage: {
+      enabled: true,
+      mode: "etbert_openjev",
+      model_name: "openjev-cal-tier1",
+      endpoint_configured: true,
+      etbert_endpoint_configured: true,
+      etbert_enabled: true,
+      etbert_checkpoint_path: null,
+      etbert_checkpoint_info: { configured: false, exists: false, valid: false, ready: false },
+      high_confidence_threshold: 0.9,
+      low_confidence_threshold: 0.35,
+      compact_for_ai: true,
+    },
+  };
+
+  const sidecarStatus = resolveLayer1Status({ capabilities: capBase });
+  assert.equal(sidecarStatus.kind, "sidecar_ready");
+  assert.equal(sidecarStatus.pillTone, "ok");
+  assert.equal(sidecarStatus.hardwareBadgeOk, true);
+  assert.match(sidecarStatus.hardwareBadgeLabel, /Tier-1 Sidecar Ready \(ET-BERT \+ OpenJev · mps\)/);
+  assert.equal(sidecarStatus.binBound, false);
+  assert.equal(sidecarStatus.binBadgeLabel, "Not bound (Optional)");
+
+  const encoderOnlyStatus = resolveLayer1Status({
+    capabilities: {
+      ...capBase,
+      triage: {
+        ...capBase.triage,
+        mode: "heuristic_calibrated",
+        endpoint_configured: false,
+        etbert_endpoint_configured: false,
+        etbert_checkpoint_path: "/tmp/pre-trained_model.bin",
+        etbert_checkpoint_info: {
+          configured: true,
+          exists: true,
+          valid: true,
+          ready: true,
+          architecture: "uer-etbert-mlm",
+          has_classification_head: false,
+          tensor_count: 197,
+        },
+      },
+    },
+  });
+  assert.equal(encoderOnlyStatus.kind, "bin_encoder_only");
+  assert.equal(encoderOnlyStatus.pillTone, "info");
+  assert.match(encoderOnlyStatus.binBadgeLabel, /Bound Encoder Only/);
+
+  const heuristicStatus = resolveLayer1Status({
+    capabilities: {
+      ...capBase,
+      triage: {
+        ...capBase.triage,
+        mode: "heuristic_calibrated",
+        endpoint_configured: false,
+        etbert_endpoint_configured: false,
+        etbert_checkpoint_path: null,
+        etbert_checkpoint_info: { configured: false, exists: false, valid: false, ready: false },
+      },
+    },
+  });
+  assert.equal(heuristicStatus.kind, "heuristic_only");
+  assert.equal(heuristicStatus.pillTone, "neutral");
+  assert.equal(heuristicStatus.boundBinPath, "");
+
+  const unboundImmediatelyStatus = resolveLayer1Status({
+    capabilities: {
+      ...capBase,
+      triage: {
+        ...capBase.triage,
+        mode: "heuristic_calibrated",
+        endpoint_configured: false,
+        etbert_endpoint_configured: false,
+        etbert_checkpoint_path: "/tmp/pre-trained_model.bin",
+        etbert_checkpoint_info: { configured: true, exists: true, valid: true, ready: true },
+      },
+    },
+    workspaceConfig: {
+      data_dir: "/tmp/data",
+      local_ingest_roots: [],
+      resource_mode: "auto",
+      etbert_checkpoint_path: null,
+      etbert_checkpoint_configured: false,
+      etbert_enabled: false,
+      etbert_checkpoint_info: { configured: false, exists: false, valid: false, ready: false },
+      native_picker_available: false,
+      persisted: true,
+    },
+  });
+  assert.equal(unboundImmediatelyStatus.boundBinPath, "");
+  assert.equal(unboundImmediatelyStatus.binBound, false);
+  assert.equal(unboundImmediatelyStatus.binBadgeLabel, "Not bound (Optional)");
+});
+
+test("resolveLayer2DraftStatus highlights missing model, unsaved edits, and active state cleanly", () => {
+  const baseAiConfig = {
+    configuration: {
+      schema_version: "1.0",
+      enabled: true,
+      provider: "openai_compatible",
+      base_url: null,
+      allowed_origins: ["http://127.0.0.1:11434"],
+      model: null,
+      api_key_env: null,
+      data_boundary: "local",
+      timeout_seconds: 30,
+      input_max_bytes: 100000,
+      max_output_tokens: 2048,
+      context_window_tokens: 16384,
+    },
+    policy_hash: "p1",
+    editable: "loopback_nonsecret_runtime_and_env",
+  };
+
+  const missingModel = resolveLayer2DraftStatus({
+    aiConfig: baseAiConfig,
+    draft: {
+      enabled: true,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "",
+      api_key_env: "",
+    },
+  });
+  assert.equal(missingModel.pillTone, "warn");
+  assert.equal(missingModel.missingModel, true);
+  assert.match(missingModel.badgeLabel, /ยังไม่เลือก Model/);
+
+  const unsavedSelected = resolveLayer2DraftStatus({
+    aiConfig: baseAiConfig,
+    draft: {
+      enabled: true,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "qwen2.5:7b",
+      api_key_env: "",
+    },
+  });
+  assert.equal(unsavedSelected.hasUnsavedChanges, true);
+  assert.equal(unsavedSelected.pillTone, "warn");
+  assert.match(unsavedSelected.badgeLabel, /ยังไม่บันทึก/);
+
+  const savedActive = resolveLayer2DraftStatus({
+    aiConfig: {
+      ...baseAiConfig,
+      configuration: { ...baseAiConfig.configuration, model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434" },
+    },
+    draft: {
+      enabled: true,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "http://127.0.0.1:11434",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "qwen2.5:7b",
+      api_key_env: "",
+    },
+  });
+  assert.equal(savedActive.pillTone, "ok");
+  assert.equal(savedActive.savedActive, true);
+  assert.equal(savedActive.badgeLabel, "Active: openai_compatible/qwen2.5:7b");
+
+  const disabledSaved = resolveLayer2DraftStatus({
+    aiConfig: {
+      ...baseAiConfig,
+      configuration: { ...baseAiConfig.configuration, enabled: false, model: null },
+    },
+    draft: {
+      enabled: false,
+      provider: "openai_compatible",
+      data_boundary: "local",
+      base_url: "",
+      allowed_origins: "http://127.0.0.1:11434",
+      model: "",
+      api_key_env: "",
+    },
+  });
+  assert.equal(disabledSaved.pillTone, "neutral");
+  assert.match(disabledSaved.badgeLabel, /Disabled/);
+});
+
+test("resolveRunConsentState surfaces AI setup, AI consent, and Tier-1 sidecar consent without hidden traps", () => {
+  const aiSetupPending = resolveRunConsentState({
+    connected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: true,
+    triageEndpointConsent: false,
+    layer1Kind: "sidecar_ready",
+    aiEnabled: true,
+    aiConsent: false,
+    canStartBackendAi: false,
+    aiBackendEnabled: true,
+  });
+  assert.equal(aiSetupPending.needsAiSetup, true);
+  assert.equal(aiSetupPending.needsAiConsent, false);
+  assert.equal(aiSetupPending.needsTriageEndpointConsent, true);
+  assert.equal(aiSetupPending.submitBlockedReason, "ai_setup");
+  assert.equal(aiSetupPending.stage04Label, "CONSENT?");
+  assert.equal(aiSetupPending.stage04Tone, "warn");
+  assert.equal(aiSetupPending.stage05Label, "SETUP?");
+  assert.equal(aiSetupPending.stage05Tone, "warn");
+
+  const aiConsentPending = resolveRunConsentState({
+    connected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: true,
+    triageEndpointConsent: true,
+    layer1Kind: "sidecar_ready",
+    aiEnabled: true,
+    aiConsent: false,
+    canStartBackendAi: true,
+    aiBackendEnabled: true,
+  });
+  assert.equal(aiConsentPending.needsAiSetup, false);
+  assert.equal(aiConsentPending.needsAiConsent, true);
+  assert.equal(aiConsentPending.needsTriageEndpointConsent, false);
+  assert.equal(aiConsentPending.submitBlockedReason, "ai_consent");
+  assert.equal(aiConsentPending.stage04Label, "SIDECAR ON");
+  assert.equal(aiConsentPending.stage05Label, "CONSENT?");
+
+  const allReady = resolveRunConsentState({
+    connected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: false,
+    triageEndpointConsent: false,
+    layer1Kind: "bin_classifier_ready",
+    aiEnabled: true,
+    aiConsent: true,
+    canStartBackendAi: true,
+    aiBackendEnabled: true,
+  });
+  assert.equal(allReady.hasAnyConsentPrompt, false);
+  assert.equal(allReady.submitBlockedReason, "none");
+  assert.equal(allReady.stage04Label, "LOCAL .BIN");
+  assert.equal(allReady.stage05Label, "OPT-IN ON");
+  assert.equal(allReady.stage05Tone, "required");
+
+  const csvLocal = resolveRunConsentState({
+    connected: false,
+    isCsvSelected: true,
+    triageEnabled: true,
+    triageEndpointConfigured: true,
+    triageEndpointConsent: false,
+    layer1Kind: "heuristic_only",
+    aiEnabled: true,
+    aiConsent: false,
+    canStartBackendAi: false,
+  });
+  assert.equal(csvLocal.hasAnyConsentPrompt, false);
+  assert.equal(csvLocal.submitBlockedReason, "none");
+  assert.equal(csvLocal.stage05Label, "LOCAL CSV");
+});
+
+test("PrivacyRedactor deterministically redacts identifiers, preserves rule/model suffixes, is idempotent, and redacts exports", () => {
+  const redactor = new PrivacyRedactor(true);
+  const sample = [
+    "IPv4 203.0.113.45 and IPv6 2001:db8::1",
+    "URL https://beacon.evilcorp.net/c2?id=7 email ops@secretcorp.org",
+    "MAC aa:bb:cc:dd:ee:ff secret api_key=sk_live_SUPERSECRET12345678",
+    "Paths /Users/alice/captures/payroll.pcapng and C:\\Users\\alice\\dump.pcap",
+    "Keep rules.yar and model.bin untouched while masking capture_dump.pcapng",
+  ].join(" | ");
+
+  const once = redactor.redactFreeText(sample);
+  const twice = redactor.redactFreeText(once);
+  assert.equal(twice, once, "redactFreeText must be idempotent");
+
+  for (const leaked of [
+    "203.0.113.45",
+    "2001:db8::1",
+    "beacon.evilcorp.net",
+    "ops@secretcorp.org",
+    "aa:bb:cc:dd:ee:ff",
+    "sk_live_SUPERSECRET12345678",
+    "/Users/alice/captures",
+    "C:\\Users\\alice",
+    "payroll.pcapng",
+    "capture_dump.pcapng",
+  ]) {
+    assert.equal(once.includes(leaked), false, `Expected redaction of ${leaked} in: ${once}`);
+  }
+  assert.ok(once.includes("rules.yar"), "Non-domain .yar filename should be preserved");
+  assert.ok(once.includes("model.bin"), "Non-domain .bin filename should be preserved");
+
+  // Full report redaction including flow_analytics, geoip, osint, warnings, and export helpers.
+  const raw = adaptBackendReport({
+    analysis_id: "abcdef0123456789abcdef0123456789",
+    status: "completed",
+    capture_filename: "payroll-export.pcapng",
+    capture_size_bytes: 4096,
+    capture_format: "pcapng",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "f".repeat(64),
+      created_at: "2026-11-18T00:00:00Z",
+      coverage: {
+        packets_seen: 12,
+        packets_analyzed: 12,
+        truncated: false,
+        parser: "tshark",
+        warnings: ["Loaded from /Users/alice/captures/payroll-export.pcapng"],
+        stages: [{ name: "tshark", state: "completed", detail: "Parsed 203.0.113.45" }],
+      },
+      evidence: [
+        {
+          evidence_id: "EV-000001",
+          kind: "http",
+          summary: "HTTP POST https://beacon.evilcorp.net/c2 from 203.0.113.45 by ops@secretcorp.org",
+          packet_refs: [1, 2],
+          attributes: {
+            protocol: "HTTP",
+            src: "203.0.113.45",
+            dst: "2001:db8::1",
+            query: "beacon.evilcorp.net",
+            src_mac: "aa:bb:cc:dd:ee:ff",
+            packets: 6,
+            bytes: 1200,
+          },
+        },
+      ],
+      findings: [
+        {
+          finding_id: "FD-000001",
+          detector: "http_beacon",
+          title: "Beacon to beacon.evilcorp.net from 203.0.113.45",
+          severity: "high",
+          confidence: "high",
+          evidence_ids: ["EV-000001"],
+          limitations: ["Seen in payroll-export.pcapng using rules.yar"],
+        },
+      ],
+      flow_analytics: {
+        top_talkers: [{ ip: "203.0.113.45", packets: 6, bytes: 1200, flows: 1 }],
+        top_public_dst_ips: [{ ip: "198.51.100.99", count: 4 }],
+        top_domains: [{ domain: "beacon.evilcorp.net", count: 3 }],
+        network_graph: {
+          nodes: [{ id: "203.0.113.45", role: "source", packets: 6, bytes: 1200, findings: 1 }],
+          edges: [{ source: "203.0.113.45", target: "2001:db8::1", protocol: "HTTP", packets: 6, bytes: 1200, label: "203.0.113.45 -> beacon.evilcorp.net" }],
+        },
+      },
+      geoip: {
+        points: [{ ip: "198.51.100.99", lat: 37.7, lon: -122.4, country: "US", ptr: "beacon.evilcorp.net", packets: 6, bytes: 1200 }],
+        arcs: [{ src_ip: "203.0.113.45", dst_ip: "198.51.100.99", protocol: "HTTP", packets: 6, bytes: 1200 }],
+      },
+    },
+    osint: {
+      state: "completed",
+      results: [
+        {
+          candidate_id: "IOC-1",
+          provider: "virustotal",
+          state: "completed",
+          summary: { indicator: "beacon.evilcorp.net", note: "Contacted by 203.0.113.45" },
+        },
+      ],
+    },
+    ai: { state: "disabled" },
+    disclaimer: "Candidates only.",
+  });
+
+  const masked = redactor.redactReport(raw);
+  assert.notEqual(masked.fileName, "payroll-export.pcapng");
+  assert.match(masked.fileName, /^capture-\d{2}\.pcapng$/);
+  assert.equal(masked.warnings[0].includes("payroll-export.pcapng"), false);
+  assert.equal(masked.rawBundle?.flow_analytics?.top_public_dst_ips?.[0]?.ip, redactor.redactIp("198.51.100.99"));
+  assert.equal(masked.rawBundle?.flow_analytics?.top_domains?.[0]?.domain, redactor.redactDomain("beacon.evilcorp.net"));
+  assert.equal(masked.rawBundle?.geoip?.points?.[0]?.ptr?.includes("evilcorp.net"), false);
+  assert.equal(JSON.stringify(masked.osint).includes("evilcorp.net"), false);
+
+  const jsonExport = exportReportJson(raw, { redact: true, redactor });
+  const mdExport = exportReportMarkdown(raw, { redact: true, redactor });
+  const jsonlExport = exportTriageJsonlFallback(raw, { redact: true, redactor });
+
+  for (const out of [jsonExport, mdExport, jsonlExport]) {
+    for (const secret of ["203.0.113.45", "2001:db8::1", "beacon.evilcorp.net", "ops@secretcorp.org", "payroll-export.pcapng"]) {
+      assert.equal(out.includes(secret), false, `Export leaked ${secret}`);
+    }
+  }
+  assert.ok(jsonExport.includes("FD-000001"));
+  assert.ok(jsonlExport.includes("EV-000001"));
+});
+
+test("PcapApiClient sends pagination, delete, prune, and ?redact=true export requests accurately", async () => {
+  const previousFetch = globalThis.fetch;
+  const client = new PcapApiClient("http://127.0.0.1:8000/", "op-token-99");
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ url, method: init.method ?? "GET", headers: init.headers, body: init.body });
+    if (url.includes("/export.pdf")) {
+      return new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]), {
+        status: 200,
+        headers: { "Content-Type": "application/pdf" },
+      });
+    }
+    if (url.includes("/export.")) {
+      return new Response("ok-export", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+    if (url.includes("/api/v1/analyses/prune")) {
+      return new Response(
+        JSON.stringify({ deleted_count: 2, deleted_ids: ["a", "b"], captures_deleted: 2, remaining_count: 20 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (init.method === "DELETE") {
+      return new Response(
+        JSON.stringify({ deleted: true, analysis_id: "job123", capture_deleted: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({ items: [], total: 42, limit: 20, offset: 40 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  try {
+    const page = await client.listJobsPage(20, 40);
+    assert.equal(page.total, 42);
+    assert.equal(page.offset, 40);
+
+    const del = await client.deleteJob("job123");
+    assert.equal(del.deleted, true);
+
+    const pruned = await client.pruneJobs({ keep_latest: 20 });
+    assert.equal(pruned.deleted_count, 2);
+
+    await client.getStixJson("job123", { redact: true });
+    await client.getExportCsv("job123", { redact: true });
+    await client.getExportCef("job123", { redact: true });
+    await client.getExportNavigatorJson("job123", { redact: true });
+    const pdfBlob = await client.getExportPdfBlob("job123", { redact: true });
+    assert.equal(pdfBlob.size, 5);
+
+    assert.equal(calls[0].url, "http://127.0.0.1:8000/api/v1/analyses?limit=20&offset=40");
+    assert.equal(calls[1].url, "http://127.0.0.1:8000/api/v1/analyses/job123");
+    assert.equal(calls[1].method, "DELETE");
+    assert.equal(calls[2].url, "http://127.0.0.1:8000/api/v1/analyses/prune");
+    assert.equal(calls[2].method, "POST");
+    assert.deepEqual(JSON.parse(calls[2].body), { keep_latest: 20 });
+    assert.equal(calls[3].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.stix.json?redact=true");
+    assert.equal(calls[4].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.csv?redact=true");
+    assert.equal(calls[5].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.cef?redact=true");
+    assert.equal(calls[6].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.navigator.json?redact=true");
+    assert.equal(calls[7].url, "http://127.0.0.1:8000/api/v1/analyses/job123/export.pdf?redact=true");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("easeInOutQuint delivers monotonic speed-up and slow-down scroll physics", () => {
+  assert.equal(easeInOutQuint(-0.5), 0);
+  assert.equal(easeInOutQuint(0), 0);
+  assert.equal(easeInOutQuint(0.5), 0.5);
+  assert.equal(easeInOutQuint(1), 1);
+  assert.equal(easeInOutQuint(1.5), 1);
+
+  let prev = -1;
+  for (let i = 0; i <= 100; i += 1) {
+    const val = easeInOutQuint(i / 100);
+    assert.ok(val >= prev, `expected monotonic progress at i=${i}`);
+    prev = val;
+  }
+
+  // Instantaneous velocity near midpoint should be much faster than launch & braking phases
+  const dt = 0.01;
+  const vStart = (easeInOutQuint(0.1 + dt) - easeInOutQuint(0.1)) / dt;
+  const vMid = (easeInOutQuint(0.5 + dt) - easeInOutQuint(0.5)) / dt;
+  const vEnd = (easeInOutQuint(0.9 + dt) - easeInOutQuint(0.9)) / dt;
+  assert.ok(vMid > vStart * 10, `expected strong acceleration at midpoint (vMid=${vMid}, vStart=${vStart})`);
+  assert.ok(vMid > vEnd * 10, `expected smooth deceleration at landing (vMid=${vMid}, vEnd=${vEnd})`);
+
+  // Duration scaling stays bounded and skips tiny hops
+  assert.equal(computeScrollDuration(3), 0);
+  assert.ok(computeScrollDuration(150) >= 540);
+  assert.ok(computeScrollDuration(2500) <= 960);
+  assert.ok(computeScrollDuration(1200) > computeScrollDuration(120));
+});
+
+test("buildTimelineBucketDetails maps packets, flows, and findings per bucket while honoring Privacy Mode", () => {
+  assert.deepEqual(parseComparableTime("12.5s"), { kind: "seconds", value: 12.5, scale: "relative" });
+  assert.deepEqual(parseComparableTime("250ms"), { kind: "seconds", value: 0.25, scale: "relative" });
+  assert.deepEqual(parseComparableTime("14:22:01.250"), { kind: "seconds", value: 14 * 3600 + 22 * 60 + 1.25, scale: "clock" });
+  assert.deepEqual(parseComparableTime("frame #42"), { kind: "frame", value: 42 });
+  assert.deepEqual(parseComparableTime("#42"), { kind: "frame", value: 42 });
+
+  const live = adaptBackendReport({
+    analysis_id: "tl-test-0001",
+    status: "completed",
+    capture_filename: "sample.pcap",
+    capture_size_bytes: 2048,
+    capture_format: "pcap",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "b".repeat(64),
+      created_at: "2026-11-16T00:00:00Z",
+      coverage: {
+        packets_seen: 120,
+        packets_analyzed: 120,
+        truncated: false,
+        parser: "tshark",
+        warnings: [],
+        stages: [{ name: "tshark", state: "completed", detail: "ok" }],
+      },
+      evidence: [
+        {
+          evidence_id: "ev-1",
+          kind: "dns",
+          summary: "DNS burst to 203.0.113.55",
+          packet_refs: [10],
+          attributes: { protocol: "DNS", src: "192.168.1.10", dst: "203.0.113.55", packets: 12, bytes: 960 },
+        },
+        {
+          evidence_id: "ev-2",
+          kind: "flow",
+          summary: "TLS flow to 198.51.100.77",
+          packet_refs: [90],
+          attributes: { protocol: "TLS", src: "192.168.1.10", dst: "198.51.100.77", packets: 45, bytes: 18400 },
+        },
+      ],
+      findings: [
+        {
+          finding_id: "F-1",
+          detector: "dns_entropy",
+          title: "Suspicious DNS query burst to 203.0.113.55",
+          severity: "high",
+          confidence: "high",
+          evidence_ids: ["ev-1"],
+          limitations: [],
+          summary: "High-entropy queries observed",
+        },
+      ],
+      telemetry: {
+        duration_seconds: 10,
+        start_epoch: null,
+        end_epoch: null,
+        total_bytes: 19360,
+        protocol_counts: { TLS: 80, DNS: 40 },
+        timeline: [
+          { index: 0, label: "0.0s", packets: 20, bytes: 1200, anomalies: 1 },
+          { index: 1, label: "3.3s", packets: 10, bytes: 800, anomalies: 0 },
+          { index: 2, label: "6.6s", packets: 5, bytes: 400, anomalies: 0 },
+          { index: 3, label: "10.0s", packets: 85, bytes: 16960, anomalies: 0 },
+        ],
+        sample_packets: [
+          {
+            no: 10,
+            time: "0.50",
+            source: "192.168.1.10",
+            destination: "203.0.113.55",
+            protocol: "DNS",
+            length: 92,
+            info: "Standard query A suspicious.example.com",
+            evidence_id: "ev-1",
+          },
+          {
+            no: 90,
+            time: "9.40",
+            source: "192.168.1.10",
+            destination: "198.51.100.77",
+            protocol: "TLS",
+            length: 1420,
+            info: "Application Data",
+            evidence_id: "ev-2",
+          },
+        ],
+      },
+    },
+    ai: { state: "disabled" },
+    disclaimer: "test",
+  });
+
+  const buckets = buildTimelineBucketDetails(live);
+  assert.equal(buckets.length, 4);
+
+  // Bucket 0 matched DNS packet + high finding
+  assert.equal(buckets[0].label, "0.0s");
+  assert.equal(buckets[0].packetCount, 20);
+  assert.equal(buckets[0].dominantProtocol, "DNS");
+  assert.equal(buckets[0].targetKind, "packet");
+  assert.equal(buckets[0].targetPacketNo, 10);
+  assert.equal(buckets[0].matchingFinding?.id, "F-1");
+  assert.equal(buckets[0].isPeak, true);
+
+  // Middle bucket without direct sample still falls back to nearest sampled frame so click always jumps
+  assert.equal(buckets[1].isApproximateTarget, true);
+  assert.equal(buckets[1].targetKind, "packet");
+  assert.ok(buckets[1].targetPacketNo === 10 || buckets[1].targetPacketNo === 90);
+
+  // Last bucket matched TLS peak packet
+  assert.equal(buckets[3].dominantProtocol, "TLS");
+  assert.equal(buckets[3].targetPacketNo, 90);
+  assert.equal(buckets[3].isPeak, true);
+
+  // Privacy Mode: redacted report must never leak raw IPs or domains into tooltip headlines/sublines
+  const redactor = new PrivacyRedactor(true);
+  const redacted = redactor.redactReport(live);
+  const redactedBuckets = buildTimelineBucketDetails(redacted);
+  const combinedText = redactedBuckets.map((b) => `${b.headline} ${b.subline}`).join(" ");
+  assert.equal(combinedText.includes("203.0.113.55"), false);
+  assert.equal(combinedText.includes("198.51.100.77"), false);
+  assert.equal(combinedText.includes("suspicious.example.com"), false);
+});
+
+test("describeEtbertExecution truthfully distinguishes neural weights from fallbacks and shows top L7 classes", () => {
+  const baseTriage = {
+    enabled: true,
+    model: "openjev-cal-tier1",
+    mode: "etbert_openjev",
+    total_evaluated: 50,
+    benign_filtered: 48,
+    escalated_count: 2,
+    uncertain_count: 0,
+    reduction_ratio: 0.96,
+    mean_confidence: 0.95,
+    mean_ppl: 1.12,
+    top_classes: [{ label: "Benign", count: 48, avg_confidence: 0.96, escalated: 0 }],
+    escalated_evidence_ids: [],
+  };
+
+  const neural = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 14,
+    etbert_backend: "neural_hf",
+    etbert_device: "mps",
+    etbert_top_classes: [
+      { label: "Youtube", count: 9, avg_confidence: 0.94, escalated: 0 },
+      { label: "Google", count: 5, avg_confidence: 0.91, escalated: 0 },
+    ],
+  });
+  assert.equal(neural.tone, "neural");
+  assert.equal(neural.badge, "ET-BERT Neural (mps)");
+  assert.match(neural.stageNote, /ET-BERT Neural \(mps\): 14 L7 scored/);
+  assert.match(neural.stageNote, /Youtube \(9\)/);
+
+  const localBin = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 12,
+    etbert_backend: "local_bin_fallback",
+    etbert_device: "cpu",
+  });
+  assert.equal(localBin.tone, "fallback");
+  assert.equal(localBin.badge, "Local .bin Heuristic Fallback");
+  assert.match(localBin.stageNote, /ไม่ใช่ Neural Transformer Weights/);
+
+  const featureFb = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 8,
+    etbert_backend: "feature_fallback",
+    etbert_device: "cpu",
+  });
+  assert.equal(featureFb.tone, "fallback");
+  assert.equal(featureFb.badge, "ET-BERT Feature Fallback");
+  assert.match(featureFb.stageNote, /ยังไม่ได้โหลด Neural Weights/);
+
+  const standby = describeEtbertExecution({
+    ...baseTriage,
+    etbert_scored_count: 0,
+    etbert_backend: "none",
+  });
+  assert.equal(standby.tone, "idle");
+  assert.match(standby.badge, /Standby/);
+});
+
+test("buildTimelineBucketDetails maps UTC HH:MM:SS.fff packets, midnight rollover, and #frame flows without collapsing to row 1", () => {
+  // 2026-11-18T14:22:00.000Z .. 2026-11-18T14:23:40.000Z (100 seconds, 36 buckets)
+  const startEpoch = Date.UTC(2026, 10, 18, 14, 22, 0) / 1000;
+  const endEpoch = startEpoch + 100;
+  const timeline = Array.from({ length: 36 }, (_, idx) => {
+    const t = new Date((startEpoch + (100 * idx) / 35) * 1000);
+    const label = t.toISOString().slice(11, 23);
+    return { index: idx, label, packets: 500, bytes: 32000, anomalies: idx === 18 ? 2 : 0 };
+  });
+
+  const live = adaptBackendReport({
+    analysis_id: "utcclock12345678",
+    status: "completed",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "e".repeat(64),
+      coverage: {
+        packets_seen: 18893,
+        packets_analyzed: 18893,
+        flows_analyzed: 4,
+        truncated: false,
+        warnings: [],
+        stages: [{ name: "tshark", state: "completed", detail: "ok" }],
+      },
+      evidence: [
+        {
+          evidence_id: "EV-000001",
+          kind: "flow",
+          summary: "Early burst",
+          packet_refs: [1],
+          attributes: { protocol: "802.11", src: "aa:bb:cc:dd:ee:01", dst: "ff:ff:ff:ff:ff:ff", packets: 120, bytes: 9600, first_seen: startEpoch + 0.5 },
+        },
+        {
+          evidence_id: "EV-000002",
+          kind: "flow",
+          summary: "Mid-capture flow without sampled packet",
+          packet_refs: [9500],
+          attributes: { protocol: "TLS", src: "10.0.0.5", dst: "198.51.100.20", packets: 85, bytes: 42000 },
+        },
+        {
+          evidence_id: "EV-000003",
+          kind: "flow",
+          summary: "Late capture burst",
+          packet_refs: [18890],
+          attributes: { protocol: "DNS", src: "10.0.0.5", dst: "203.0.113.53", packets: 40, bytes: 4800, first_seen: endEpoch - 0.5 },
+        },
+      ],
+      findings: [],
+      telemetry: {
+        duration_seconds: 100,
+        start_epoch: startEpoch,
+        end_epoch: endEpoch,
+        total_bytes: 56400,
+        protocol_counts: { "802.11": 15000, TLS: 3000, DNS: 893 },
+        timeline,
+        sample_packets: [
+          { no: 1, time: "14:22:00.100", source: "aa:bb:cc:dd:ee:01", destination: "ff:ff:ff:ff:ff:ff", protocol: "802.11", length: 64, info: "Deauth", evidence_id: "EV-000001" },
+          { no: 5500, time: "14:22:30.000", source: "10.0.0.5", destination: "198.51.100.10", protocol: "TLS", length: 512, info: "Client Hello", evidence_id: null },
+          { no: 14500, time: "14:23:18.000", source: "10.0.0.5", destination: "198.51.100.30", protocol: "TCP", length: 128, info: "ACK", evidence_id: null },
+          { no: 18890, time: "14:23:39.900", source: "10.0.0.5", destination: "203.0.113.53", protocol: "DNS", length: 88, info: "Query", evidence_id: "EV-000003" },
+        ],
+      },
+    },
+    ai: { state: "disabled" },
+    disclaimer: "test",
+  });
+
+  const buckets = buildTimelineBucketDetails(live);
+  assert.equal(buckets.length, 36);
+
+  // Distinct buckets map to distinct real frames (never stuck on frame #1!)
+  assert.equal(buckets[0].targetPacketNo, 1);
+  assert.equal(buckets[0].isApproximateTarget, false);
+
+  // ~30% into 100s => bucket ~10-11 should match frame 5500
+  const bucket30 = buckets[Math.round(0.3 * 35)];
+  assert.equal(bucket30.targetPacketNo, 5500);
+  assert.equal(bucket30.isApproximateTarget, false);
+
+  // ~50% into capture: EV-000002 has packet_refs=[9500] (rendered as firstSeen "#9500") with no direct packet sample -> targets flow directly!
+  const midFlowBucket = buckets[Math.round(((9500 - 1) / (18893 - 1)) * 35)];
+  assert.equal(midFlowBucket.targetKind, "flow");
+  assert.equal(midFlowBucket.targetFlowId, "FLOW-000002");
+  assert.equal(midFlowBucket.targetEvidenceId, "EV-000002");
+  assert.equal(midFlowBucket.isApproximateTarget, false);
+
+  // ~78% into 100s => bucket ~27 should match frame 14500
+  const bucket78 = buckets[Math.round(0.78 * 35)];
+  assert.equal(bucket78.targetPacketNo, 14500);
+  assert.equal(bucket78.isApproximateTarget, false);
+
+  // Final bucket maps to frame 18890
+  assert.equal(buckets[35].targetPacketNo, 18890);
+  assert.equal(buckets[35].isApproximateTarget, false);
+
+  // Intermediate empty bucket near 90% picks closest chronological frame (14500 or 18890), never Row 1!
+  assert.notEqual(buckets[31].targetPacketNo, 1);
+  assert.ok(buckets[31].targetPacketNo === 14500 || buckets[31].targetPacketNo === 18890);
+
+  // Midnight rollover (23:59:50.000 -> 00:00:20.000) maps cleanly across start & end buckets
+  const midStart = Date.UTC(2026, 10, 18, 23, 59, 50) / 1000;
+  const midEnd = midStart + 30;
+  const rollover = adaptBackendReport({
+    analysis_id: "rollover12345678",
+    status: "completed",
+    evidence: {
+      schema_version: "1.0",
+      capture_sha256: "f".repeat(64),
+      coverage: { packets_seen: 100, packets_analyzed: 100, flows_analyzed: 0, truncated: false, warnings: [], stages: [] },
+      evidence: [],
+      findings: [],
+      telemetry: {
+        duration_seconds: 30,
+        start_epoch: midStart,
+        end_epoch: midEnd,
+        total_bytes: 200,
+        protocol_counts: { TCP: 100 },
+        timeline: Array.from({ length: 6 }, (_, i) => ({ index: i, label: "", packets: 10, bytes: 100, anomalies: 0 })),
+        sample_packets: [
+          { no: 1, time: "23:59:50.000", source: "10.0.0.1", destination: "10.0.0.2", protocol: "TCP", length: 60, info: "SYN" },
+          { no: 100, time: "00:00:20.000", source: "10.0.0.1", destination: "10.0.0.2", protocol: "TCP", length: 60, info: "FIN" },
+        ],
+      },
+    },
+    ai: { state: "disabled" },
+    disclaimer: "test",
+  });
+  const rolloverBuckets = buildTimelineBucketDetails(rollover);
+  assert.equal(rolloverBuckets[0].targetPacketNo, 1);
+  assert.equal(rolloverBuckets[5].targetPacketNo, 100);
+});
+
+test("PcapApiClient setAiCredentials and clearAiCredentials call loopback /api/v1/ai/credentials cleanly", async () => {
+  const seen = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    seen.push({ url: String(url), method: init.method ?? "GET", body: init.body ? String(init.body) : "" });
+    return new Response(
+      JSON.stringify({
+        configuration: {
+          schema_version: "1.0",
+          enabled: true,
+          provider: "manus",
+          base_url: "https://api.manus.im",
+          allowed_origins: ["https://api.manus.im"],
+          model: "manus-1",
+          api_key_env: null,
+          data_boundary: "remote",
+          timeout_seconds: 30,
+          input_max_bytes: 100000,
+          max_output_tokens: 2048,
+          context_window_tokens: 16384,
+        },
+        policy_hash: "h1",
+        editable: "loopback_nonsecret_runtime_and_env",
+        runtime_key_set: init.method === "PUT",
+        runtime_keys: { manus: init.method === "PUT", openai_compatible: false, anthropic: false },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+  try {
+    const client = new PcapApiClient("http://127.0.0.1:8000", "tok123");
+    const saved = await client.setAiCredentials("manus", "sk-test-key-123456");
+    assert.equal(saved.runtime_key_set, true);
+    assert.equal(seen[0].url, "http://127.0.0.1:8000/api/v1/ai/credentials");
+    assert.equal(seen[0].method, "PUT");
+    assert.deepEqual(JSON.parse(seen[0].body), { provider: "manus", api_key: "sk-test-key-123456" });
+
+    const cleared = await client.clearAiCredentials("manus");
+    assert.equal(cleared.runtime_key_set, false);
+    assert.equal(seen[1].url, "http://127.0.0.1:8000/api/v1/ai/credentials?provider=manus");
+    assert.equal(seen[1].method, "DELETE");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("resolveLayer2DraftStatus treats Manus default standard profile as ready without requiring a model name", () => {
+  const status = resolveLayer2DraftStatus({
+    aiConfig: {
+      configuration: {
+        schema_version: "1.0",
+        enabled: true,
+        provider: "manus",
+        base_url: "https://api.manus.ai",
+        allowed_origins: ["https://api.manus.ai"],
+        model: null,
+        api_key_env: null,
+        data_boundary: "remote",
+        timeout_seconds: 120,
+        input_max_bytes: 100000,
+        max_output_tokens: 2048,
+        context_window_tokens: 16384,
+      },
+      policy_hash: "h2",
+      editable: "loopback_nonsecret_runtime_and_env",
+      manus_ready: true,
+    },
+    draft: {
+      enabled: true,
+      provider: "manus",
+      data_boundary: "remote",
+      base_url: "https://api.manus.ai",
+      allowed_origins: "https://api.manus.ai",
+      model: "",
+      api_key_env: "",
+    },
+  });
+  assert.equal(status.missingModel, false);
+  assert.equal(status.savedActive, true);
+  assert.equal(status.pillTone, "ok");
+  assert.match(status.badgeLabel, /manus\/standard/);
+});
+
+
+test("model presets: draft, validation and payloads keep the security policy for every card", () => {
+  const byId = Object.fromEntries(FALLBACK_PRESETS.map((p) => [p.id, p]));
+
+  const openai = draftFromPreset(byId.openai);
+  assert.equal(openai.baseUrl, "https://api.openai.com/v1");
+  assert.equal(openai.model, "gpt-4.1-mini");
+  assert.equal(openai.tokenParameter, "max_completion_tokens");
+  const okOpenai = validateDraft(openai, byId.openai, { requireModel: true });
+  assert.equal(okOpenai.ok, true);
+  const savePayload = buildSavePayload(openai, byId.openai, okOpenai);
+  assert.deepEqual(savePayload.allowed_origins, ["https://api.openai.com"]);
+  assert.equal(savePayload.preset, "openai");
+  assert.equal(savePayload.provider, "openai_compatible");
+  assert.equal(savePayload.data_boundary, "remote");
+  assert.equal("api_key" in savePayload, false);
+  assert.equal(buildProbePayload(openai, byId.openai, okOpenai).preset, "openai");
+
+  // Local cards only accept loopback; remote cards require https.
+  const badLocal = { ...draftFromPreset(byId.ollama), baseUrl: "http://192.168.1.9:11434" };
+  assert.equal(validateDraft(badLocal, byId.ollama, { requireModel: false }).ok, false);
+  const badRemote = { ...draftFromPreset(byId.custom), baseUrl: "http://api.example.com/v1", boundary: "remote" };
+  assert.equal(validateDraft(badRemote, byId.custom, { requireModel: false }).ok, false);
+  const badEnv = { ...openai, apiKeyEnv: "sk-live-secret-value" };
+  assert.equal(validateDraft(badEnv, byId.openai, { requireModel: true }).ok, false);
+
+  // Ollama needs a model name, Manus never does.
+  const ollama = draftFromPreset(byId.ollama);
+  assert.equal(validateDraft(ollama, byId.ollama, { requireModel: true }).ok, false);
+  const manus = draftFromPreset(byId.manus);
+  const okManus = validateDraft(manus, byId.manus, { requireModel: true });
+  assert.equal(okManus.ok, true);
+  assert.equal(okManus.model, "standard");
+
+  // Custom endpoint keeps its own boundary choice.
+  const custom = { ...draftFromPreset(byId.custom), baseUrl: "http://127.0.0.1:8080/v1", boundary: "local", model: "m" };
+  const okCustom = validateDraft(custom, byId.custom, { requireModel: true });
+  assert.equal(okCustom.ok, true);
+  assert.equal(buildSavePayload(custom, byId.custom, okCustom).data_boundary, "local");
+});
+
+test("model presets: legacy configs are mapped to a card and key state is per vendor", () => {
+  const cfg = (over) => ({
+    configuration: {
+      schema_version: "1.0", enabled: true, provider: "openai_compatible", base_url: null, allowed_origins: [],
+      model: "m", api_key_env: null, data_boundary: "local", timeout_seconds: 30, input_max_bytes: 1, max_output_tokens: 1,
+      context_window_tokens: 1, ...over,
+    },
+    policy_hash: "x", editable: "x", runtime_keys: { groq: true }, runtime_key_fingerprints: { groq: "abc123" },
+  });
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({})).id, "ollama");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ base_url: "https://api.openai.com/v1", data_boundary: "remote" })).id, "openai");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ base_url: "https://llm.corp.example/v1", data_boundary: "remote" })).id, "custom");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ provider: "manus" })).id, "manus");
+  assert.equal(resolveActivePreset(FALLBACK_PRESETS, cfg({ preset: "openai", base_url: "https://api.openai.com/v1" })).id, "openai");
+
+  const groups = groupPresets(FALLBACK_PRESETS).map((g) => g.category);
+  assert.deepEqual(groups, ["local", "cloud", "agent", "custom"]);
+
+  const groq = { ...FALLBACK_PRESETS.find((p) => p.id === "openai"), id: "groq" };
+  assert.equal(resolveKeyState(groq, cfg({}), null).state, "ready_runtime");
+  assert.equal(resolveKeyState(groq, cfg({}), null).fingerprint, "abc123");
+  const openai = FALLBACK_PRESETS.find((p) => p.id === "openai");
+  assert.equal(resolveKeyState(openai, cfg({}), null).state, "missing");
+  assert.equal(resolveKeyState(openai, cfg({}), { ...openai, env_key_set: true }).state, "ready_env");
+  assert.equal(resolveKeyState(FALLBACK_PRESETS[0], null, null).state, "not_required");
 });

@@ -18,16 +18,30 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import Request
 
-from .etbert_bridge import score_with_etbert_http
+from .etbert_bridge import (
+    is_etbert_explicitly_disabled,
+    score_with_etbert_http,
+    score_with_etbert_local_bin,
+)
 from .http_transport import post_json_bounded
+from .picker import is_loopback_client
+
+
+def _loopback_tier1_token(endpoint_url: str) -> str | None:
+    if not endpoint_url or not is_loopback_client(urlsplit(endpoint_url).hostname):
+        return None
+    token = (os.environ.get("PCAP_TIER1_API_TOKEN") or os.environ.get("TIER1_API_TOKEN") or "").strip()
+    return token or None
 
 
 class _BoundedJsonResponse:
@@ -56,12 +70,20 @@ def urlopen(
     """Compatibility adapter backed by a no-proxy, no-redirect bounded client."""
     raw = request.data or b"{}"
     payload = json.loads(raw.decode("utf-8"))
+    call_kwargs: dict[str, Any] = {
+        "timeout_seconds": timeout,
+        "deadline_monotonic": deadline_monotonic,
+        "cancellation_check": cancellation_check,
+    }
+    auth_hdr = request.get_header("Authorization")
+    if isinstance(auth_hdr, str) and auth_hdr.startswith("Bearer "):
+        token = auth_hdr[7:].strip()
+        if token and is_loopback_client(urlsplit(request.full_url).hostname):
+            call_kwargs["bearer_token"] = token
     result = post_json_bounded(
         request.full_url,
         payload,
-        timeout_seconds=timeout,
-        deadline_monotonic=deadline_monotonic,
-        cancellation_check=cancellation_check,
+        **call_kwargs,
     )
     if result is None:
         raise OSError("provider_unavailable")
@@ -139,6 +161,10 @@ class TriageReport:
     escalated_evidence_ids: list[str]
     decisions: list[TriageDecision] = field(default_factory=list)
     etbert_scored_count: int = 0
+    etbert_backend: str | None = None
+    etbert_device: str | None = None
+    etbert_model: str | None = None
+    etbert_top_classes: list[ClassStat] = field(default_factory=list)
 
     def to_summary_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +179,10 @@ class TriageReport:
             "mean_confidence": round(self.mean_confidence, 4),
             "mean_ppl": round(self.mean_ppl, 4),
             "etbert_scored_count": self.etbert_scored_count,
+            "etbert_backend": self.etbert_backend,
+            "etbert_device": self.etbert_device,
+            "etbert_model": self.etbert_model,
+            "etbert_top_classes": [asdict(item) for item in self.etbert_top_classes],
             "top_classes": [asdict(item) for item in self.top_classes],
             "escalated_evidence_ids": list(self.escalated_evidence_ids[:200]),
         }
@@ -513,6 +543,18 @@ def score_evidence_deterministic(
         logits["Benign"] -= 0.7
         signals.append(f"nonstd_port_bulk={dst_port}")
 
+    # 7a. 802.11 WLAN Deauth / Management Flood signals
+    wlan_deauth = _attr_int(attrs, "wlan_deauth_count", 0)
+    wlan_auth = _attr_int(attrs, "wlan_auth_count", 0)
+    if (
+        "wlan_deauth_flood" in detectors
+        or wlan_deauth >= 5
+        or wlan_auth >= 25
+    ):
+        logits["WiFi_Attack"] += 5.4
+        logits["Benign"] -= 2.1
+        signals.append(f"wlan_deauth={wlan_deauth}" if wlan_deauth > 0 else f"wlan_auth={wlan_auth}")
+
     # 8. Optional ET-BERT L7 sidecar prediction fusion (when ET-BERT microservice scored this item)
     etbert_label: str | None = None
     etbert_conf: float | None = None
@@ -644,10 +686,14 @@ def _call_openjev_systemone_http(
                 }
             },
         }
+        req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        bearer_token = _loopback_tier1_token(endpoint_url)
+        if bearer_token:
+            req_headers["Authorization"] = f"Bearer {bearer_token}"
         request = Request(
             endpoint_url,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=req_headers,
             method="POST",
         )
         try:
@@ -761,10 +807,14 @@ def _call_openjev_http(
         for d in decisions[:256]
     ]
     req_body = json.dumps({"model": model_name, "items": payload_items}).encode("utf-8")
+    req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    bearer_token = _loopback_tier1_token(endpoint_url)
+    if bearer_token:
+        req_headers["Authorization"] = f"Bearer {bearer_token}"
     request = Request(
         endpoint_url,
         data=req_body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=req_headers,
         method="POST",
     )
     try:
@@ -837,6 +887,7 @@ def classify_bundle(
     timeout_s = float(getattr(triage_cfg, "timeout_seconds", 10.0)) if triage_cfg is not None else 10.0
     etbert_enabled = bool(getattr(triage_cfg, "etbert_enabled", False)) if triage_cfg is not None else False
     etbert_url = getattr(triage_cfg, "etbert_endpoint_url", None) if triage_cfg is not None else None
+    etbert_ckpt = getattr(triage_cfg, "etbert_checkpoint_path", None) if triage_cfg is not None else None
     etbert_model = str(getattr(triage_cfg, "etbert_model_name", "etbert-l7-datagram")) if triage_cfg is not None else "etbert-l7-datagram"
     etbert_timeout = float(getattr(triage_cfg, "etbert_timeout_seconds", 8.0)) if triage_cfg is not None else 8.0
     network_requested = bool(
@@ -883,6 +934,22 @@ def classify_bundle(
             allow_network=allow_network,
             deadline_monotonic=network_deadline,
             cancellation_check=cancellation_check,
+        )
+    if (
+        not etbert_scores
+        and not _cancel_requested(cancellation_check)
+        and enabled
+        and etbert_ckpt
+        and evidence_list
+        and (
+            etbert_enabled or mode == "etbert_openjev" or not is_etbert_explicitly_disabled(triage_cfg)
+        )
+    ):
+        # Local offline ET-BERT .bin checkpoint acts as offline primary or HTTP-failure fallback
+        etbert_scores = score_with_etbert_local_bin(
+            evidence_list,
+            checkpoint_path=etbert_ckpt,
+            model_name=etbert_model,
         )
 
     decisions: list[TriageDecision] = []
@@ -944,6 +1011,45 @@ def classify_bundle(
         for label, rows in sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     ]
 
+    etbert_backend: str | None = "none"
+    etbert_device: str | None = None
+    etbert_model_used: str | None = None
+    etbert_top_classes: list[ClassStat] = []
+    if etbert_scores:
+        dec_by_id = {d.evidence_id: d for d in decisions}
+        backends = [str(row.get("backend") or "").strip() for row in etbert_scores.values() if row.get("backend")]
+        if "neural_hf" in backends:
+            etbert_backend = "neural_hf"
+        elif backends:
+            etbert_backend = backends[0]
+        else:
+            etbert_backend = "feature_fallback"
+        devices = [str(row.get("device") or "").strip() for row in etbert_scores.values() if row.get("device")]
+        etbert_device = devices[0] if devices else None
+        models_seen = [str(row.get("model") or "").strip() for row in etbert_scores.values() if row.get("model")]
+        etbert_model_used = models_seen[0] if models_seen else etbert_model
+
+        et_grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for ev_id, row in etbert_scores.items():
+            lbl = str(row.get("label") or "Benign")[:64]
+            et_grouped.setdefault(lbl, []).append((ev_id, row))
+        etbert_top_classes = [
+            ClassStat(
+                label=lbl,
+                count=len(entries),
+                avg_confidence=round(
+                    sum(float(r.get("confidence", 0.0)) for _, r in entries) / len(entries),
+                    4,
+                ),
+                escalated=sum(
+                    1
+                    for eid, _ in entries
+                    if eid in dec_by_id and dec_by_id[eid].decision != "fast_benign"
+                ),
+            )
+            for lbl, entries in sorted(et_grouped.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:12]
+        ]
+
     return TriageReport(
         enabled=enabled,
         model=model_name,
@@ -959,6 +1065,10 @@ def classify_bundle(
         escalated_evidence_ids=escalated_ids,
         decisions=decisions,
         etbert_scored_count=len(etbert_scores),
+        etbert_backend=etbert_backend,
+        etbert_device=etbert_device,
+        etbert_model=etbert_model_used,
+        etbert_top_classes=etbert_top_classes,
     )
 
 

@@ -148,3 +148,129 @@ def snapshot_ruleset(
         rule_count=rule_count,
         source_bytes=total_bytes,
     )
+
+
+def default_rules_dir() -> Path | None:
+    """Return bundled offline YARA rules directory (`backend/rules`) if present."""
+    candidate = Path(__file__).resolve().parent.parent / "rules"
+    if candidate.is_dir():
+        return candidate
+    return None
+
+
+def detect_carved_content_type(head: bytes) -> str:
+    """Classify a carved HTTP object's content type from magic bytes without executing it."""
+    if not head:
+        return "application/octet-stream"
+    if head.startswith(b"MZ"):
+        return "application/x-dosexec"
+    if head.startswith(b"\x7fELF"):
+        return "application/x-executable"
+    if head.startswith(b"PK\x03\x04"):
+        return "application/zip"
+    if head.startswith(b"%PDF-"):
+        return "application/pdf"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image/gif"
+    if head.startswith(b"\x1f\x8b"):
+        return "application/gzip"
+    lower = head[:256].lstrip().lower()
+    if lower.startswith(b"<!doctype html") or lower.startswith(b"<html") or b"<script" in lower:
+        return "text/html"
+    if lower.startswith(b"{") or lower.startswith(b"["):
+        return "application/json"
+    if all(b in b"\t\r\n" or 32 <= b <= 126 for b in head[:128]):
+        return "text/plain"
+    return "application/octet-stream"
+
+
+def inspect_yara_rules(
+    source_dir: Path | str | None,
+    *,
+    max_files: int = 64,
+    max_bytes: int = 16 * 1024 * 1024,
+) -> dict[str, object]:
+    """Return safe, metadata-only YARA ruleset status without exposing host paths."""
+    candidates_dirs: list[Path] = []
+    if source_dir:
+        candidates_dirs.append(Path(source_dir).expanduser())
+    bundled = default_rules_dir()
+    if bundled is not None and bundled not in candidates_dirs:
+        candidates_dirs.append(bundled)
+
+    active_dir: Path | None = None
+    for d in candidates_dirs:
+        try:
+            st = d.lstat()
+            if not stat.S_ISLNK(st.st_mode) and stat.S_ISDIR(st.st_mode):
+                has_yar = any(
+                    Path(entry.name).suffix.lower() in {".yar", ".yara"}
+                    for entry in os.scandir(d)
+                )
+                if has_yar:
+                    active_dir = d
+                    break
+        except OSError:
+            continue
+
+    if active_dir is None:
+        return {
+            "configured": bool(source_dir),
+            "available": False,
+            "rule_file_count": 0,
+            "rule_count": 0,
+            "source_bytes": 0,
+            "ruleset_sha256": None,
+            "rule_names": [],
+        }
+
+    digest = hashlib.sha256()
+    rule_names: list[str] = []
+    file_count = 0
+    total_bytes = 0
+    try:
+        for entry in sorted(os.scandir(active_dir), key=lambda e: e.name):
+            if Path(entry.name).suffix.lower() not in {".yar", ".yara"}:
+                continue
+            if not _SAFE_RULE_FILENAME_RE.fullmatch(entry.name) or entry.is_symlink():
+                continue
+            p = Path(entry.path)
+            before = p.stat(follow_symlinks=False)
+            if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > max_bytes:
+                continue
+            if total_bytes + before.st_size > max_bytes:
+                continue
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(p, flags)
+            with os.fdopen(fd, "rb") as rule_fh:
+                opened = os.fstat(rule_fh.fileno())
+                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                    continue
+                raw = rule_fh.read(max_bytes - total_bytes + 1)
+            if len(raw) <= 0 or len(raw) != before.st_size or total_bytes + len(raw) > max_bytes or _INCLUDE_RE.search(raw):
+                continue
+            file_count += 1
+            if file_count > max_files:
+                break
+            total_bytes += len(raw)
+            digest.update(entry.name.encode("ascii") + b"\0" + raw)
+            for match in _RULE_NAME_RE.findall(raw):
+                name = match.decode("ascii", errors="ignore")
+                if name and name not in rule_names and len(rule_names) < 200:
+                    rule_names.append(name)
+    except OSError:
+        pass
+
+    return {
+        "configured": True,
+        "available": file_count > 0 and len(rule_names) > 0,
+        "rule_file_count": file_count,
+        "rule_count": len(rule_names),
+        "source_bytes": total_bytes,
+        "ruleset_sha256": digest.hexdigest() if file_count > 0 else None,
+        "rule_names": sorted(rule_names),
+    }

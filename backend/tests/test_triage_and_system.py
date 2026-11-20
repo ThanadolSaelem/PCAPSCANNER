@@ -803,6 +803,219 @@ class BackendPipelineAndChunkedUploadTests(unittest.TestCase):
             self.assertIsNotNone(bundle.telemetry)
             self.assertEqual(len(bundle.telemetry.timeline), 36)
 
+    def test_pcapscanner_triage_connects_to_standalone_tier1_inference_asgi(self) -> None:
+        from urllib.parse import urlsplit
+        from fastapi.testclient import TestClient
+
+        tier1_root = ROOT / "tier1-inference"
+        if str(tier1_root) not in sys.path:
+            sys.path.insert(0, str(tier1_root))
+        from tier1_inference import create_app as create_tier1_app
+
+        tier1_app = create_tier1_app(device="cpu")
+        tier1_client = TestClient(tier1_app)
+
+        ev_arp = _StubEvidence(
+            "EV-INT-1",
+            "arp",
+            "ARP conflict",
+            [1],
+            {"protocol": "ARP", "src": "192.168.10.1", "dst": "aa:bb:cc:11:22:33", "arp_conflicts": 2, "packets": 10},
+        )
+        ev_dns = _StubEvidence(
+            "EV-INT-2",
+            "dns",
+            "High entropy NXDOMAIN query",
+            [2],
+            {
+                "protocol": "DNS",
+                "src": "192.0.2.25",
+                "dst": "198.51.100.40",
+                "dst_port": 53,
+                "query": "xk9q2m8z7p4v1w6n3c5b8r2t7y9k4m1q.evil.example",
+                "rcode": 3,
+                "packets": 6,
+                "bytes": 780,
+                "data_len_sum": 420,
+            },
+        )
+        ev_benign = _StubEvidence(
+            "EV-INT-3",
+            "flow",
+            "HTTPS normal flow",
+            [3],
+            {
+                "protocol": "TCP",
+                "src": "192.0.2.30",
+                "dst": "203.0.113.80",
+                "src_port": 51000,
+                "dst_port": 443,
+                "packets": 6,
+                "bytes": 1800,
+            },
+        )
+        bundle = _StubBundle(evidence=[ev_arp, ev_dns, ev_benign], findings=[])
+
+        called_paths: list[str] = []
+        sent_bodies: list[str] = []
+
+        def _asgi_post(url: str, payload: object, **kwargs):  # noqa: ARG001
+            path = urlsplit(url).path
+            called_paths.append(path)
+            sent_bodies.append(json.dumps(payload))
+            resp = tier1_client.post(path, json=payload)
+            return resp.json() if resp.status_code == 200 else None
+
+        def _asgi_urlopen(req, **_kwargs):  # noqa: ANN001
+            path = urlsplit(req.full_url).path
+            payload = json.loads((req.data or b"{}").decode("utf-8"))
+            called_paths.append(path)
+            sent_bodies.append(json.dumps(payload))
+            resp = tier1_client.post(path, json=payload)
+            data = json.dumps(resp.json()).encode("utf-8")
+
+            class _Resp:
+                status = resp.status_code
+
+                def read(self, _n: int = -1) -> bytes:
+                    return data
+
+                def __enter__(self) -> "_Resp":
+                    return self
+
+                def __exit__(self, *_a: object) -> None:
+                    return None
+
+            return _Resp()
+
+        cfg = SimpleNamespace(
+            enabled=True,
+            mode="etbert_openjev",
+            model_name="openjev-cal-tier1",
+            endpoint_url="http://127.0.0.1:9000/v1/systemone",
+            etbert_enabled=True,
+            etbert_endpoint_url="http://127.0.0.1:9000/etbert/score",
+            etbert_model_name="etbert-l7-datagram",
+            etbert_timeout_seconds=5,
+            high_confidence_threshold=0.90,
+            low_confidence_threshold=0.35,
+            timeout_seconds=5,
+        )
+
+        orig_et_post = etbert_bridge.post_json_bounded
+        orig_tr_open = triage.urlopen
+        etbert_bridge.post_json_bounded = _asgi_post  # type: ignore[assignment]
+        triage.urlopen = _asgi_urlopen  # type: ignore[assignment]
+        try:
+            report = triage.classify_bundle(bundle, cfg, allow_network=True)
+        finally:
+            etbert_bridge.post_json_bounded = orig_et_post  # type: ignore[assignment]
+            triage.urlopen = orig_tr_open  # type: ignore[assignment]
+
+        self.assertIn("/etbert/score", called_paths)
+        self.assertIn("/v1/systemone", called_paths)
+        self.assertGreaterEqual(report.etbert_scored_count, 1)
+        by_id = {d.evidence_id: d for d in report.decisions}
+        self.assertEqual(by_id["EV-INT-1"].predicted_class, "ARP_Spoofing")
+        self.assertEqual(by_id["EV-INT-2"].predicted_class, "DNS_Tunnel_DGA")
+        self.assertEqual(by_id["EV-INT-2"].etbert_label, "DNS_Tunnel_DGA")
+        self.assertEqual(by_id["EV-INT-3"].predicted_class, "Benign")
+        self.assertEqual(by_id["EV-INT-3"].decision, "fast_benign")
+
+        all_sent = "\n".join(sent_bodies)
+        self.assertNotIn("192.168.10.1", all_sent)
+        self.assertNotIn("aa:bb:cc:11:22:33", all_sent)
+        self.assertNotIn("evil.example", all_sent)
+
+    def test_etbert_request_items_include_valid_bigram_tokens_and_preserve_neural_app_classes(self) -> None:
+        ev_tls = _StubEvidence(
+            evidence_id="EV-APP-1",
+            kind="tls",
+            summary="TLS 1.3 flow to 142.250.190.78:443",
+            packet_refs=[1, 2, 3, 4],
+            attributes={
+                "protocol": "TLS",
+                "src": "192.168.1.25",
+                "dst": "142.250.190.78",
+                "src_port": 54321,
+                "dst_port": 443,
+                "packets": 14,
+                "bytes": 18200,
+                "data_len_sum": 16800,
+                "tls_client_hello_count": 1,
+                "tls_handshake_types": "1,2",
+                "server_name": "www.youtube.com",
+            },
+        )
+        items, ev_ids = etbert_bridge.build_etbert_request_items([ev_tls], salt="fixed-test-salt")
+        self.assertEqual(ev_ids, ["EV-APP-1"])
+        self.assertEqual(len(items), 1)
+        bigrams = items[0].get("bigram_tokens")
+        self.assertIsInstance(bigrams, list)
+        self.assertGreaterEqual(len(bigrams), 20)
+        for tok in bigrams:
+            self.assertEqual(len(tok), 4)
+            self.assertTrue(all(ch in "0123456789abcdef" for ch in tok), tok)
+        serialized = json.dumps(items)
+        self.assertNotIn("192.168.1.25", serialized)
+        self.assertNotIn("142.250.190.78", serialized)
+        self.assertNotIn("youtube.com", serialized)
+
+        # Mock a neural_hf ET-BERT sidecar on Apple MPS returning a 120-class app label ("Youtube")
+        def _fake_neural_post(_url: str, payload: dict, **_kwargs):
+            return {
+                "model": "etbert-l7-datagram",
+                "device": "mps",
+                "etbert_loaded": True,
+                "etbert_mode": "neural_hf",
+                "results": [
+                    {
+                        "item_id": item["item_id"],
+                        "label": "Youtube",
+                        "score": 0.08,
+                        "confidence": 0.942,
+                        "entropy": 0.21,
+                        "model": "etbert-l7-datagram",
+                        "backend": "neural_hf",
+                        "device": "mps",
+                    }
+                    for item in payload["items"]
+                ],
+            }
+
+        bundle = _StubBundle(evidence=[ev_tls], findings=[])
+        cfg = SimpleNamespace(
+            enabled=True,
+            mode="heuristic_calibrated",
+            model_name="openjev-cal-tier1",
+            endpoint_url=None,
+            etbert_enabled=True,
+            etbert_endpoint_url="http://127.0.0.1:9000/etbert/score",
+            etbert_model_name="etbert-l7-datagram",
+            etbert_timeout_seconds=5,
+            high_confidence_threshold=0.90,
+            low_confidence_threshold=0.35,
+            timeout_seconds=5,
+        )
+        orig_post = etbert_bridge.post_json_bounded
+        etbert_bridge.post_json_bounded = _fake_neural_post  # type: ignore[assignment]
+        try:
+            report = triage.classify_bundle(bundle, cfg, allow_network=True)
+        finally:
+            etbert_bridge.post_json_bounded = orig_post  # type: ignore[assignment]
+
+        self.assertEqual(report.etbert_scored_count, 1)
+        self.assertEqual(report.etbert_backend, "neural_hf")
+        self.assertEqual(report.etbert_device, "mps")
+        self.assertEqual(report.etbert_model, "etbert-l7-datagram")
+        self.assertEqual(len(report.etbert_top_classes), 1)
+        self.assertEqual(report.etbert_top_classes[0].label, "Youtube")
+        self.assertEqual(report.etbert_top_classes[0].count, 1)
+        self.assertAlmostEqual(report.etbert_top_classes[0].avg_confidence, 0.942, places=3)
+        # 120-class app label does NOT falsely trigger security escalation
+        self.assertEqual(report.decisions[0].predicted_class, "Benign")
+        self.assertEqual(report.decisions[0].etbert_label, "Youtube")
+
 
 if __name__ == "__main__":
     unittest.main()
