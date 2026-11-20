@@ -5862,9 +5862,9 @@ function ReportsPage({
                   <div className="triage-model-info">
                     <span className="triage-model-tag">
                       <Icon name="filter" size={13} />
-                      {redactor.redactFreeText(\`Tier-1 · \${report.triage.model}\`)}
+                      {redactor.redactFreeText(`Tier-1 · ${report.triage.model}`)}
                     </span>
-                    <span className={\`triage-model-tag triage-model-\${etInfo.tone}\`}>
+                    <span className={`triage-model-tag triage-model-${etInfo.tone}`}>
                       {redactor.redactFreeText(etInfo.badge)}
                     </span>
                   </div>
@@ -5894,8 +5894,8 @@ function ReportsPage({
                 { label: "BENIGN FILTERED", value: formatCount(triage.benign_filtered), tone: "benign" },
                 { label: "ESCALATED", value: formatCount(triage.escalated_count), tone: "escalated" },
                 { label: "UNCERTAIN", value: formatCount(triage.uncertain_count), tone: "uncertain" },
-                { label: "REDUCTION", value: display(\`\${Math.round(triage.reduction_ratio * 100)}%\`), tone: "reduction" },
-                { label: "MEAN CONFIDENCE", value: display(\`\${Math.round(triage.mean_confidence * 100)}%\`), tone: "confidence" },
+                { label: "REDUCTION", value: display(`${Math.round(triage.reduction_ratio * 100)}%`), tone: "reduction" },
+                { label: "MEAN CONFIDENCE", value: display(`${Math.round(triage.mean_confidence * 100)}%`), tone: "confidence" },
                 { label: "MEAN PPL", value: display(triage.mean_ppl.toFixed(2)), tone: "ppl" },
               ];
 
@@ -5903,7 +5903,7 @@ function ReportsPage({
                 <div className="triage-graph-report">
                   <div className="triage-stat-grid">
                     {stats.map((stat) => (
-                      <article className={\`triage-stat-tile triage-stat-\${stat.tone}\`} key={stat.label}>
+                      <article className={`triage-stat-tile triage-stat-${stat.tone}`} key={stat.label}>
                         <span>{stat.label}</span>
                         <strong className="mono">{stat.value}</strong>
                       </article>
@@ -5913,7 +5913,7 @@ function ReportsPage({
                   <div className="triage-funnel-card">
                     <div className="triage-card-head">
                       <span>TRIAGE FUNNEL</span>
-                      <small className="mono">{display(\`\${Math.round(triage.reduction_ratio * 100)}% benign reduction\`)}</small>
+                      <small className="mono">{display(`${Math.round(triage.reduction_ratio * 100)}% benign reduction`)}</small>
                     </div>
                     <div className="triage-funnel" aria-label="Tier-1 triage funnel from evaluated records to escalated records">
                       <div className="triage-funnel-stage triage-funnel-evaluated">
@@ -5924,7 +5924,7 @@ function ReportsPage({
                         <span>Benign filtered</span>
                         <strong className="mono">{formatCount(triage.benign_filtered)}</strong>
                       </div>
-                      <div className="triage-funnel-stage triage-funnel-escalated" style={{ width: \`\${funnelEscalatedWidth}%\` }}>
+                      <div className="triage-funnel-stage triage-funnel-escalated" style={{ width: `${funnelEscalatedWidth}%` }}>
                         <span>Escalated</span>
                         <strong className="mono">{formatCount(triage.escalated_count)}</strong>
                       </div>
@@ -5947,20 +5947,20 @@ function ReportsPage({
                             const width = Math.max(5, Math.round((item.count / maxTier1Count) * 100));
                             return (
                               <button
-                                key={\`tier1-\${item.label}\`}
+                                key={`tier1-${item.label}`}
                                 type="button"
-                                className={\`triage-class-bar \${isEscalated ? "is-escalated" : ""}\`}
+                                className={`triage-class-bar ${isEscalated ? "is-escalated" : ""}`}
                                 disabled={!evidenceId}
                                 onClick={() => evidenceId && onOpenEvidence(null, evidenceId)}
                                 title={evidenceId ? "Open linked evidence" : "No linked evidence reference"}
                               >
                                 <span className="triage-class-label">{display(item.label)}</span>
                                 <span className="triage-class-metrics mono">
-                                  {formatCount(item.count)} · {display(\`\${Math.round(item.avg_confidence * 100)}%\`)}
-                                  {isEscalated && <b>{display(\`\${item.escalated} escalated\`)}</b>}
+                                  {formatCount(item.count)} · {display(`${Math.round(item.avg_confidence * 100)}%`)}
+                                  {isEscalated && <b>{display(`${item.escalated} escalated`)}</b>}
                                 </span>
                                 <span className="triage-class-track" aria-hidden="true">
-                                  <span className="triage-class-fill" style={{ width: \`\${width}%\` }} />
+                                  <span className="triage-class-fill" style={{ width: `${width}%` }} />
                                 </span>
                               </button>
                             );
@@ -5972,7 +5972,7 @@ function ReportsPage({
                     <section className="triage-class-card" aria-labelledby="etbert-class-chart">
                       <div className="triage-card-head">
                         <span id="etbert-class-chart">TOP ET-BERT CLASSES</span>
-                        <small>{display(\`\${triage.etbert_scored_count ?? 0} L7 items scored\`)}</small>
+                        <small>{display(`${triage.etbert_scored_count ?? 0} L7 items scored`)}</small>
                       </div>
                       {etbertClasses.length === 0 ? (
                         <p className="triage-chart-empty">No ET-BERT class distribution was recorded for this run.</p>
@@ -5984,20 +5984,20 @@ function ReportsPage({
                             const width = Math.max(5, Math.round((item.count / maxEtbertCount) * 100));
                             return (
                               <button
-                                key={\`etbert-\${item.label}\`}
+                                key={`etbert-${item.label}`}
                                 type="button"
-                                className={\`triage-class-bar triage-etbert-bar \${isEscalated ? "is-escalated" : ""}\`}
+                                className={`triage-class-bar triage-etbert-bar ${isEscalated ? "is-escalated" : ""}`}
                                 disabled={!evidenceId}
                                 onClick={() => evidenceId && onOpenEvidence(null, evidenceId)}
                                 title={evidenceId ? "Open linked evidence" : "No linked evidence reference"}
                               >
                                 <span className="triage-class-label">{display(item.label)}</span>
                                 <span className="triage-class-metrics mono">
-                                  {formatCount(item.count)} · {display(\`\${Math.round(item.avg_confidence * 100)}%\`)}
-                                  {isEscalated && <b>{display(\`\${item.escalated} escalated\`)}</b>}
+                                  {formatCount(item.count)} · {display(`${Math.round(item.avg_confidence * 100)}%`)}
+                                  {isEscalated && <b>{display(`${item.escalated} escalated`)}</b>}
                                 </span>
                                 <span className="triage-class-track" aria-hidden="true">
-                                  <span className="triage-class-fill" style={{ width: \`\${width}%\` }} />
+                                  <span className="triage-class-fill" style={{ width: `${width}%` }} />
                                 </span>
                               </button>
                             );
